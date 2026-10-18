@@ -288,7 +288,11 @@ tessellates nonsense.
   found again by a `SM_AB_COPY` attribute and offset as usual. Each boss is
   then cut by a box behind the pushed plane and joined back, unless it lies
   wholly beyond the plane. Each hole is cut back out. The result is checked
-  like an offset, except for its face and edge counts.
+  like an offset, except for its face and edge counts, and must have as many
+  shells as before. A boss on a side wall near the pushed face's corner
+  shows why: the round between them moves in, the wall pulls back from under
+  what's left of the boss, and that would come back as a separate lump. It's
+  refused instead.
 - A boss cut flush merges its new face into the pushed face, and a cut
   cylinder's side comes back in two pieces, split where its seam was. Volumes
   match the part without the features plus what's left of them to 1e-11

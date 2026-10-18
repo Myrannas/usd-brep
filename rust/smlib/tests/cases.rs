@@ -14,8 +14,8 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use smlib::{
-    Brep, Continuity, EdgeBlend, EdgeQuery, Error, FaceQuery, FilletOptions, Kernel, Label, Mesh,
-    Surface, SurfaceKind, TessellationParams, Tolerance,
+    Brep, Continuity, EdgeBlend, EdgeQuery, Error, FaceQuery, FilletOptions, Frame, Kernel, Label,
+    Mesh, Surface, SurfaceKind, TessellationParams, Tolerance,
 };
 
 const L: f64 = 100.0;
@@ -1806,6 +1806,32 @@ fn a_pushed_face_refuses_what_it_cannot_set_aside() {
         obstacles[0].iter().all(|r| (r - 8.0).abs() < 1e-6),
         "{obstacles:?}"
     );
+
+    // A boss on the side wall near the front: the round between the front
+    // and the wall moves in with the front, so the wall pulls back from under
+    // the boss's remains, which would come back on their own. Past the new
+    // plane altogether it simply goes.
+    let outcomes = on_kernel(|k| {
+        let mut outcomes = Vec::new();
+        for d in [-30.0, -46.0] {
+            let mut boss = Brep::cylinder(k, [0.0; 3], 8.0, 6.0)?;
+            boss.place(&Frame {
+                origin: [-200.0, -115.0, 0.0],
+                x_axis: UP,
+                y_axis: Y,
+            })?;
+            let part = crate_with(k, &[], &[])?.union(boss)?;
+            let front = part.find_faces(&crate_front(), &Tolerance::default())?;
+            outcomes.push(part.offset_faces(&front, d).map(|b| b.face_count()));
+        }
+        Ok::<_, Error>(outcomes)
+    })
+    .unwrap();
+    let error = outcomes[0]
+        .as_ref()
+        .expect_err("the boss's remains would float");
+    assert_eq!(status_name(error), Some("SHIM_ERR_OBSTRUCTED"), "{error}");
+    assert_eq!(outcomes[1].as_ref().ok(), Some(&10), "gone past the plane");
 }
 
 #[test]

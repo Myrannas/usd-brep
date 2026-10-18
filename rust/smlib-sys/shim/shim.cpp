@@ -51,6 +51,7 @@
 #include <SmPlane.h>
 #include <SmPoly.h>
 #include <SmPrimitiveCreation.h>
+#include <SmShell.h>
 #include <SmSphere.h>
 #include <SmSurfOfRevolution.h>
 #include <SmSurfTypes.h>
@@ -2543,6 +2544,12 @@ sm_status check_solid(SmBrep& brep) {
     return agrees ? SM_SUCCESS : SM_SHIM_ERR_BROKE_SOLID;
 }
 
+ULONG shell_count(const SmBrep& brep) {
+    SmTArray<SmShell*> shells;
+    brep.GetShells(shells);
+    return shells.GetSize();
+}
+
 // Offsets the picked faces through `obstacles` (see find_obstacles), in place.
 sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance,
                        const std::vector<Obstacle>& obstacles) {
@@ -2637,6 +2644,9 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
     unmark_all(*work);
     if ((status = check_solid(*work)) != SM_SUCCESS) return status;
+    // A boss whose face pulled back from under it (behind a round that moved
+    // with the pushed face) would come back on its own.
+    if (shell_count(*work) != shell_count(brep)) return SM_SHIM_ERR_OBSTRUCTED;
 
     SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
     SmTArray<SmFace*> old_faces;
