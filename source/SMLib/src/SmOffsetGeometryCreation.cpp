@@ -1170,6 +1170,21 @@ SmBoolean bDebugMe3 = FALSE;
           // If we didn't find a 3D vertex from the offset close enough then
           // we need to do UV curve extension and intersections to solve for
           // this tangency case.
+          // A tangent neighbour not mated yet is found through its old UV
+          // curve, which in a local operation can still be at the old
+          // corner. A base vertex the caller has already placed on the new
+          // curve is the better trim point, so offer it too.
+          if (   ! bFound3DVertex
+              && cpOffsetExecutive->GetOffsetOperation() == SM_OO_LOCAL_OPERATION)
+            {
+              SmSolution      sVertexData[4];
+              SmSolutionArray sVertexSolutions(4, sVertexData);
+              double d3DTol = pBaseEdgeuse->GetEdge()->GetBrep()->GetTolerance();
+              if (p3DCurve->GlobalPointSolve(p3DCurve->GetNaturalInterval(), SM_SO_MINIMIZE, pBaseVertex->GetPoint(),
+                                             d3DTol, &d3DTol, NULL, SM_SR_ALL, sVertexSolutions) == SM_SUCCESS)
+                { sSolutions.Append(sVertexSolutions); }
+            }
+
           if ( ! bFound3DVertex  &&  pTanUV != NULL ) 
             {
               // get a temporary copy of the pTanEU->UVTrimCurve
