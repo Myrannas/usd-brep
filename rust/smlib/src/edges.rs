@@ -23,8 +23,6 @@ pub struct EdgeGeometry {
     /// Points on the edge, evenly spaced in its curve parameter from one end
     /// to the other.
     pub samples: [[f64; 3]; EDGE_SAMPLES],
-    /// The edge's arc length.
-    pub length: f64,
     /// The outward unit normals of the two faces the edge joins, at its
     /// midpoint. A seam joins a face to itself, so both come from one face.
     /// `None` when the edge has fewer than two faces or the kernel couldn't
@@ -51,7 +49,6 @@ impl EdgeGeometry {
             label: Label::from_raw(&raw.label),
             face_labels: [Label::from_raw(&raw.label_a), Label::from_raw(&raw.label_b)],
             samples: raw.points,
-            length: raw.length,
             normals: [
                 if has(raw.face_a) {
                     normal(raw.normal_a)

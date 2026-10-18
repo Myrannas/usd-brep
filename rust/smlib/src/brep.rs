@@ -17,6 +17,9 @@ use crate::mesh::{Mesh, TessellationParams};
 /// centroid is then exact to a tenth of a micron on a metre-sized part.
 const CENTROID_ACCURACY: f64 = 1e-7;
 
+/// Relative accuracy of [`Brep::edge_length`].
+const EDGE_LENGTH_ACCURACY: f64 = 1e-7;
+
 /// A B-rep solid owned by the kernel. It is freed on drop.
 ///
 /// A `Brep` is neither `Send` nor `Sync`: it stays on the kernel's thread.
@@ -309,6 +312,19 @@ impl Brep {
             .enumerate()
             .map(|(index, raw)| EdgeGeometry::from_raw(index, raw))
             .collect())
+    }
+
+    /// The arc length of the edge at `edge` in [`edges`](Brep::edges)
+    /// (`SmApiEdgeComputeLength`), integrated to a relative accuracy of 1e-7.
+    /// This costs far more than [`edges`](Brep::edges), which leaves it out.
+    pub fn edge_length(&self, edge: usize) -> Result<f64, Error> {
+        let mut length = 0.0;
+        // SAFETY: self is a live brep on the kernel thread.
+        let status = unsafe {
+            sys::sm_brep_edge_length(self.raw.as_ptr(), edge, EDGE_LENGTH_ACCURACY, &mut length)
+        };
+        Error::check("SmApiEdgeComputeLength", status)?;
+        Ok(length)
     }
 
     /// The geometry of every face, in the brep's face order: surface, label,
@@ -744,7 +760,6 @@ fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
 
 const EMPTY_EDGE: sys::sm_edge_geometry = sys::sm_edge_geometry {
     points: [[0.0; 3]; EDGE_SAMPLES],
-    length: 0.0,
     face_a: -1,
     face_b: -1,
     use_count: 0,

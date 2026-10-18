@@ -432,8 +432,6 @@ sm_status describe_edge(const SmEdge* edge, const FaceIndex& face_index, sm_edge
         if (status != SM_SUCCESS) return status;
         put3(info.points[k], point);
     }
-    status = SmApiEdgeComputeLength(edge, 1e-7, info.length);
-    if (status != SM_SUCCESS) return status;
 
     const EdgeFaces faces = faces_of(edge);
     info.use_count = faces.use_count;
@@ -1883,6 +1881,22 @@ sm_status sm_brep_edge_geometry(const sm_brep* brep, sm_edge_geometry* out, size
             if (status != SM_SUCCESS) return status;
         }
         *count = edges.GetSize();
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_edge_length(const sm_brep* brep, size_t edge, double relative_accuracy, double* out) {
+    if (!brep || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!std::isfinite(relative_accuracy)) return SM_ERR_INVALID_INPUT;
+    const double accuracy = std::min(1e-1, std::max(1e-10, relative_accuracy));
+    return guarded([&] {
+        SmTArray<SmEdge*> edges;
+        brep_of(brep)->GetEdges(edges);
+        if (edge >= edges.GetSize()) return SM_SHIM_ERR_BAD_EDGE;
+        double length = 0.0;
+        const SmApiStatus status = SmApiEdgeComputeLength(edges[static_cast<ULONG>(edge)], accuracy, length);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        *out = length;
         return SM_SUCCESS;
     });
 }

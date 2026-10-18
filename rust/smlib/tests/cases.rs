@@ -413,6 +413,9 @@ fn edge_queries_pick_by_geometry() {
 
         let part = hole(k, 10.0).unwrap();
         let edges = part.edges().unwrap();
+        let lengths: Vec<f64> = (0..edges.len())
+            .map(|edge| part.edge_length(edge).unwrap())
+            .collect();
         let seams = edges
             .iter()
             .filter(|e| e.bend_deg().is_some_and(|b| b < 1.0))
@@ -432,9 +435,10 @@ fn edge_queries_pick_by_geometry() {
                 radius: 10.0,
             }),
         ];
-        (box_counts, hole_counts, edges)
+        (box_counts, hole_counts, edges, lengths)
     });
-    let (box_counts, [hole_edges, seams, sharp, rim, wrong_rim, bottom_rim], edges) = counts;
+    let (box_counts, [hole_edges, seams, sharp, rim, wrong_rim, bottom_rim], edges, lengths) =
+        counts;
     println!(
         "box picks {box_counts:?}; hole: {hole_edges} edges, {seams} seams, {sharp} sharp, rim {rim}"
     );
@@ -444,9 +448,18 @@ fn edge_queries_pick_by_geometry() {
     assert!(rim >= 1, "the top rim");
     assert_eq!(wrong_rim, 0, "a circle 0.5 mm too wide picks nothing");
     assert_eq!(bottom_rim, rim, "top and bottom rims split alike");
-    for edge in &edges {
+    let rim_length: f64 = edges
+        .iter()
+        .filter(|e| top_rim(0.0, 0.0, 10.0).matches(e, &tol))
+        .map(|e| lengths[e.index])
+        .sum();
+    assert!(
+        (rim_length - 20.0 * std::f64::consts::PI).abs() < 1e-6,
+        "the rim is {rim_length} long"
+    );
+    for (edge, length) in edges.iter().zip(&lengths) {
         assert_eq!(edge.use_count, 2);
-        assert!(edge.length > 0.0);
+        assert!(*length > 0.0);
         for n in edge.normals.iter().flatten() {
             assert!(
                 (dot(*n, *n).sqrt() - 1.0).abs() < 1e-9,

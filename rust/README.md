@@ -12,12 +12,14 @@
 ## Fillets and chamfers
 
 Edges are picked by query, since indices change with every operation. An
-`EdgeQuery` tests each edge's `EdgeGeometry` (sample points, length, the
-adjacent faces and their labels, and their outward normals at its midpoint):
+`EdgeQuery` tests each edge's `EdgeGeometry` (sample points, the adjacent
+faces and their labels, and their outward normals at its midpoint):
 `MidpointOnPlane`, `InPlane`, `OnCircle`, `ParallelTo` (straight edges along a
 direction), `BetweenFaces` (by normals), `Between` (by the faces' labels),
 `Sharp` (by the angle between normals), `Indices` (positions a caller found in
 `Brep::edges`, valid until the brep changes), and `And` / `Or` / `Not`.
+`Brep::edge_length` integrates one edge's exact length, which costs more than
+reading every edge's geometry.
 
 - `Brep::fillet` wraps `SmApiFilletEdgesPerEdge`: each `EdgeBlend` gives its
   edges a radius and a circular, linear or blend cross-section;

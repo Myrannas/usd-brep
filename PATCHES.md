@@ -179,3 +179,14 @@ is a B-spline surface whose control points share a plane, which
 `SmSurface::IsPlanar` can't confirm below about 1e-5, so `outward_plane` (the
 labels work's planar-face normal) also accepts what the offset's `plane_of`
 does.
+
+## Notes from the rebuild trims (no patch needed)
+
+Profiling a part rebuilt as one of its features was dragged (a pocket under a
+fillet, a face offset and another fillet) put about 40% of each rebuild into
+checks and reads that the results didn't need in full. Results are unchanged:
+every mesh, volume and name came out the same.
+
+- `Brep::edges` no longer integrates each edge's exact length
+  (`SmApiEdgeComputeLength`, an ODE per edge), which nothing read and which
+  was 9% of the rebuild. `Brep::edge_length` integrates one edge's on demand.
