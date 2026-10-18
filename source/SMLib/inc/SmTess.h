@@ -26,6 +26,8 @@
 #include <SmEdgeuse.h>
 #include <SmAttribute.h>
 
+#include <unordered_set>
+
 class SmCurveTessDriver;
 class SmSurfaceTessDriver;
 class SmTess;
@@ -622,6 +624,18 @@ public:
 
   SmStatus     SplitFaceEdgesToUVSize    (SmFace * pFace);  // renamed from CreateFaceUVSegments()
 
+  // game-cad patch: with pOptOnlyEdgesOf, splits only pFace's edges that one
+  // of those faces also uses, as SplitFaceEdgesToUVSize(pFace) splits them,
+  // and sets rbSameAsWholeFace FALSE, splitting nothing, when one of those
+  // edgeuses has no UV trim curve: its end point would come from pFace's next
+  // edgeuse, which Phase1SetupFaces may not have split as Phase1SetupBrep does.
+  SmStatus     SplitFaceEdgesToUVSize
+  (
+    SmFace                                  * pFace,
+    const std::unordered_set<const SmFace*> * pOptOnlyEdgesOf,
+    SmBoolean                               & rbSameAsWholeFace
+  );
+
   SmStatus     FindInsideOutTopoVertices 
   (
     const SmPolyEdge        * cpSeg1,
@@ -762,6 +776,22 @@ public:
     SmTArray<SmFace*> * pOptFacesToTessellate = NULL,   ///< [in ]: Only Set up to tessellate these faces for now.                 <br>
     SmTArray<SmStatus>* pFaceStatuses = NULL // out: First error per setup face; SM_SUCCESS for successful faces
   );                                                                                                                          
+
+  // Tessellate Phase 1 for some faces only (game-cad patch): leaves those faces
+  // exactly as Phase1SetupBrep(pBrep) would, splitting only their edges and
+  // building surface caches only for them and the faces sharing their edges.
+  // That holds when Phase1SetupBrep refines no face's boundary, which this can
+  // check only for the faces given: the caller must know the rest don't, for
+  // example from an earlier run in which they were given. When
+  // rbSameAsWholeBrep comes back FALSE (refinement, or anything Phase1SetupBrep
+  // would recover from), the faces aren't set up that way and this SmTess
+  // must not tessellate them.
+  SmStatus      Phase1SetupFaces
+  (
+    SmBrep                  * pBrepUsedForTessellation, ///< [in ]: Brep to tessellate, as for Phase1SetupBrep            <br>
+    const SmTArray<SmFace*> & crFacesToTessellate,      ///< [in ]: faces of pBrepUsedForTessellation to set up           <br>
+    SmBoolean               & rbSameAsWholeBrep         ///< [out]: TRUE = those faces are as Phase1SetupBrep leaves them <br>
+  );
 
   // Tessellate Phase 2 - for 1 pFace: add compatible Face->Surface tessellation to existing mTS_pPolyBrep Face->Edge->Curve tessellations.
   //   m_pTessBrep         = not modified.

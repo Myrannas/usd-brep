@@ -3218,6 +3218,17 @@ TODO:
 SmStatus SmTess::SplitFaceEdgesToUVSize
   (SmFace * pFace)     // in : target pFace in m_pTessBrep being tessellated
 {
+  SmBoolean bSameAsWholeFace;
+  return SplitFaceEdgesToUVSize(pFace, NULL, bSameAsWholeFace);
+}
+
+SmStatus SmTess::SplitFaceEdgesToUVSize
+  (SmFace                                  * pFace,             // in : target pFace in m_pTessBrep being tessellated
+   const std::unordered_set<const SmFace*> * pOptOnlyEdgesOf,   // in : NULL = every edge, else only edges these faces also use
+   SmBoolean                               & rbSameAsWholeFace) // out: FALSE = nothing split: an edgeuse had no UVTrimCurve
+{
+  rbSameAsWholeFace = TRUE;
+
   // locals
   SM_PTR_ARRAY(sEdgeuses, SmEdgeuse, 64) ; // SmTArray<SmEdgeuse*>
   SmTessSrfCache      * pSC = m_vCache.GetSecond(pFace); NER(pSC);
@@ -3225,6 +3236,32 @@ SmStatus SmTess::SplitFaceEdgesToUVSize
   // get pFace->Edgeuses
   SmFaceuse           * pUpperFU = pFace->GetUpwardFaceuse();
   pUpperFU->GetEdgeuses(sEdgeuses);
+
+  // game-cad: keep the edgeuses of edges shared with pOptOnlyEdgesOf, in
+  // order. Each edgeuse is split on its own below, from its own UV end points
+  // when it has a UVTrimCurve, so these come out as they would with the rest.
+  if (pOptOnlyEdgesOf)
+    {
+      SM_PTR_ARRAY(sEdgeFaces, SmFace, 8) ; // SmTArray<SmFace*>
+      ULONG lKept = 0;
+      for (ULONG ii = 0; ii < sEdgeuses.GetSize(); ii++)
+        {
+          SmEdgeuse * pEU     = sEdgeuses[ii];
+          SmBoolean   bShared = FALSE;
+          pEU->GetEdge()->GetFaces(sEdgeFaces);
+          for (ULONG jj = 0; jj < sEdgeFaces.GetSize() && !bShared; jj++)
+            { bShared = pOptOnlyEdgesOf->count(sEdgeFaces[jj]) > 0; }
+          if (!bShared)
+            { continue; }
+          if (pEU->GetUVTrimCurve() == NULL)
+            {
+              rbSameAsWholeFace = FALSE;
+              return SM_SUCCESS;
+            }
+          sEdgeuses[lKept++] = pEU;
+        }
+      sEdgeuses.SetSize(lKept);
+    }
 
 #ifdef SM_DEBUG_CODE
   SmBoolean bDebugMe = FALSE;
@@ -11864,6 +11901,191 @@ SmStatus SmTess::Phase1SetupBrep
   return SM_SUCCESS;
 
 } // end SmTess::Phase1SetupBrep
+
+/*******************************************************************//**
+PURPOSE: game-cad patch: Phase1SetupBrep for some faces only, leaving them
+  exactly as Phase1SetupBrep would.
+
+NOTES:
+  Phase1SetupBrep's steps act on one face or one edge at a time, until
+  refinement:
+    1. A face's SmTessSrfCache depends only on its surface (whose natural
+       domain the tree spans) and the tessellation parameters.
+    2. IsoEdgeSubdivide and TessellateEdge split an edge from its own curve,
+       vertices and UVTrimCurves and the caches of the faces using it.
+    3. SplitFaceEdgesToUVSize splits each edgeuse of a face on its own,
+       against that face's cache, so an edge comes out of it split by each
+       of its faces in face order.
+    4. MakePolyBrepFromFaceEdges builds a face's boundary polygon from its
+       own edges and cache, splitting edges only when it reports refinement.
+  So without refinement, a face's boundary depends only on its own edges and
+  the faces sharing them, and Phase1SetupBrep's loop of refinement passes
+  ends after the first. This runs steps 1-3 for the faces given, their edges
+  and the faces sharing those edges (whose caches split shared edges, and
+  which split only those), and step 4 for the faces given, in the order
+  Phase1SetupBrep takes them.
+
+  It can't see whether other faces would refine. rbSameAsWholeBrep is TRUE
+  when none of the faces given refines or fails at any step, and then they
+  are as Phase1SetupBrep leaves them, provided the other faces wouldn't
+  refine either. Otherwise the brep is left part-way through set-up and only
+  fit to be deleted with this SmTess.
+
+  Neighbouring faces' caches are deleted once their shared edges are split,
+  so only the faces given can go on to Phase2CreateFacePolygons.
+
+  increments an unlocked mark value
+***********************************************************************/
+SmStatus SmTess::Phase1SetupFaces
+ (SmBrep                  * pBrepUsedForTessellation, // in : Brep to tessellate, as for Phase1SetupBrep
+  const SmTArray<SmFace*> & crFacesToTessellate,      // in : faces of pBrepUsedForTessellation to set up
+  SmBoolean               & rbSameAsWholeBrep)        // out: TRUE = those faces are as Phase1SetupBrep leaves them
+{
+  // check input
+  NER(pBrepUsedForTessellation);
+
+  // init output
+  rbSameAsWholeBrep = FALSE;
+
+  // as Phase1SetupBrep
+  m_pTessBrep = pBrepUsedForTessellation;
+  m_pTessBrep->m_bEditingEnabled = TRUE;
+  m_pTessBrep->ClearAllPolyVertices() ;
+  m_pTessBrep->AddAttribute(new(m_pTessBrep->GetContext()) SmAttribute(SM_AI_TESSELLATING));
+
+  // locals
+  ULONG ii, jj, kk ;
+  SM_PTR_ARRAY(sAllFaces, SmFace, 256) ; // SmTArray<SmFace*>
+  SM_PTR_ARRAY(sFaces,    SmFace, 256) ; // SmTArray<SmFace*> = faces needing caches, in brep order
+  SM_PTR_ARRAY(sEdges,    SmEdge, 256) ; // SmTArray<SmEdge*>
+  SM_PTR_ARRAY(sFEdges,   SmEdge, 256) ; // SmTArray<SmEdge*>
+  SM_PTR_ARRAY(sEFaces,   SmFace, 256) ; // SmTArray<SmFace*>
+  SM_OBJ_ARRAY(sRectangularTrim, SmBoolean, 512) ; // SmTArray<SmBoolean>
+  std::unordered_set<const SmFace*> sWanted ;  // the faces to tessellate
+  std::unordered_set<const SmFace*> sCached ;  // those and every face sharing an edge with one
+
+  for (ii=0; ii<crFacesToTessellate.GetSize(); ii++)
+    {
+      SmFace * pFace = crFacesToTessellate[ii];
+      NER(pFace);
+      sWanted.insert(pFace);
+      sCached.insert(pFace);
+      pFace->GetEdges(sFEdges);
+      for (jj=0; jj<sFEdges.GetSize(); jj++)
+        {
+          sFEdges[jj]->GetFaces(sEFaces);
+          for (kk=0; kk<sEFaces.GetSize(); kk++)
+            { sCached.insert(sEFaces[kk]); }
+        }
+    }
+
+  // An edge is split here when one of the faces to tessellate uses it.
+  auto touchesWanted = [&](SmEdge * pEdge) -> SmBoolean
+  {
+    pEdge->GetFaces(sEFaces);
+    for (ULONG ff=0; ff<sEFaces.GetSize(); ff++)
+      {
+        if (sWanted.count(sEFaces[ff]) > 0)
+          { return TRUE; }
+      }
+    return FALSE;
+  };
+
+  m_pTessBrep->GetFaces(sAllFaces);
+  size_t lWantedFound = 0;
+  for (ii=0; ii<sAllFaces.GetSize(); ii++)
+    {
+      if (sCached.count(sAllFaces[ii]) > 0)
+        { sFaces.Add(sAllFaces[ii]); }
+      lWantedFound += sWanted.count(sAllFaces[ii]);
+    }
+  if (lWantedFound != sWanted.size())
+    { return SM_ERR_INVALID_INPUT; } // a face of another brep
+
+  // 1. surface caches, as Phase1SetupBrep's loop without TBB
+  for (ii=0; ii<sFaces.GetSize(); ii++)
+    {
+      SmFace   * pFace            = sFaces[ii];
+      SmBoolean  bRectangularTrim = FALSE ;
+      SmBoolean  bNaturalTrim     = FALSE ;
+      SmExtent2d sUVDomain        = pFace->GetUVDomain() ;
+
+      if (pFace->FindIfRectangularTrim(sUVDomain, bRectangularTrim, bNaturalTrim) != SM_SUCCESS)
+        { bRectangularTrim = FALSE ; }
+      pFace->SetIsRectangularTrim(bRectangularTrim);
+      sRectangularTrim.Add(bRectangularTrim);
+
+      if (CreateFaceTessCache(pFace) != SM_SUCCESS)
+        { return SM_SUCCESS; } // Phase1SetupBrep fails the face
+    }
+
+  // This creates SmEdges.
+  SmTemporaryChangeValue <SmBoolean> sTempChangeDB( ((SmContext*) &m_crContext)->GetDoingBooleanRef(), TRUE );
+
+  // 2. iso and curve splits of every edge the faces use
+  m_pTessBrep->GetEdges(sEdges);
+  for (ii=0; ii<sEdges.GetSize(); ii++)
+    {
+      if (touchesWanted(sEdges[ii]))
+        { IsoEdgeSubdivide(sEdges[ii]); }
+    }
+
+  m_pTessBrep->GetEdges(sEdges);
+  for (ii=0; ii<sEdges.GetSize(); ii++)
+    {
+      if (touchesWanted(sEdges[ii]) && TessellateEdge(sEdges[ii]) != SM_SUCCESS)
+        { return SM_SUCCESS; } // Phase1SetupBrep fails
+    }
+
+  // 3. UV size splits, by every face using those edges in face order
+  for (ii=0; ii<sFaces.GetSize(); ii++)
+    {
+      SmFace    * pFace = sFaces[ii];
+      SmBoolean   bWanted = sWanted.count(pFace) > 0;
+      SmBoolean   bSameAsWholeFace = TRUE;
+      if (   SplitFaceEdgesToUVSize(pFace, bWanted ? NULL : &sWanted, bSameAsWholeFace) != SM_SUCCESS
+          || !bSameAsWholeFace)
+        { return SM_SUCCESS; } // Phase1SetupBrep recreates the face's UVTrimCurves, or can't be matched
+    }
+
+  // 4. boundary polygons of the faces to tessellate, with no refinement
+  SM_PTR_ARRAY(sEdgeuses, SmEdgeuse, 64) ; // SmTArray<SmEdgeuse*>
+  for (ii=0; ii<sFaces.GetSize(); ii++)
+    {
+      SmFace * pFace = sFaces[ii];
+      if (sWanted.count(pFace) == 0)
+        { continue; }
+
+      // A split edge is refinement, whether or not it was reported.
+      pFace->GetUpwardFaceuse()->GetEdgeuses(sEdgeuses);
+      ULONG     lEdgeuses       = sEdgeuses.GetSize();
+      SmBoolean bRefinementDone = FALSE;
+      if (MakePolyBrepFromFaceEdges(pFace, bRefinementDone) != SM_SUCCESS || bRefinementDone)
+        { return SM_SUCCESS; }
+      pFace->GetUpwardFaceuse()->GetEdgeuses(sEdgeuses);
+      if (sEdgeuses.GetSize() != lEdgeuses)
+        { return SM_SUCCESS; }
+    }
+
+  // the neighbours' caches have done their part
+  for (ii=0; ii<sFaces.GetSize(); ii++)
+    {
+      if (sWanted.count(sFaces[ii]) == 0)
+        { SER(Phase3DeleteFacePolygons(sFaces[ii])); }
+    }
+
+  // as Phase1SetupBrep
+  if (this->m_bAdvancingFront)
+    {
+      for (ii=0; ii<sFaces.GetSize(); ii++)
+        { sFaces[ii]->SetIsRectangularTrim(sRectangularTrim[ii]); }
+    }
+
+  // all done
+  rbSameAsWholeBrep = TRUE;
+  return SM_SUCCESS;
+
+} // end SmTess::Phase1SetupFaces
 
 /*******************************************************************//**
 PURPOSE: Convenience routine that calls
