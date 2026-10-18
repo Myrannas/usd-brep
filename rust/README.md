@@ -101,8 +101,8 @@ wall, follow two pushed faces at once.
 
 It is `SmBrep::LocalOperation`, the kernel's own replace-a-face local
 operation on the offset executive, reimplemented in the shim, with three
-kernel patches (see `PATCHES.md`). The topology never changes, so every face
-and edge keeps its label and its index. The result is checked: a move that
+kernel patches (see `PATCHES.md`). With nothing in the way the topology
+never changes, so every face and edge keeps its label and its index. The result is checked: a move that
 would make a face vanish fails (`SHIM_ERR_CHANGED_TOPOLOGY`, or
 `SHIM_ERR_BROKE_SOLID` when the kernel gets that far), and any result that
 isn't manifold, has gaps over the brep's tolerance, or has a volume that
@@ -111,7 +111,21 @@ tessellation that doesn't bear the volume out) fails with
 `SHIM_ERR_BROKE_SOLID`.
 Blends on a moved curved face (a rounded hole rim) fail with
 `SHIM_ERR_UNSUPPORTED_FACE`, and so, for now, do fillets sliding along drafted
-walls and a few moves of sphere faces that the kernel gets wrong.
+walls and a few moves of sphere faces that the kernel gets wrong. Every planar
+face's loops are checked too: none may cross, and every inner loop must stay
+inside the outer one.
+
+A plane pushed in can run into features standing beside it, such as a boss or
+a hole on a lid near the edge above a pushed wall. It cuts through them, as
+Parasolid does: each is set aside, the face is offset without it, and it comes
+back cut by the face's new plane. A boss is joined back as far as the plane
+leaves it, and a hole is cut back out as a notch. Those faces keep their
+labels. A cut boss's new face is unlabelled where it doesn't merge into the
+moved face. `Brep::offset_obstacles` lists what an offset runs into.
+`SHIM_ERR_OBSTRUCTED` means one of them can't be set aside: it doesn't stand
+entirely on one side of a planar face, or something else stands in its way.
+`Brep::offset_faces_unchecked` returns the kernel's bare result, for diagnosis
+only.
 
 `Brep::tapered_prism`, `Brep::cone` and `Brep::torus` build drafted prisms,
 frustums and rings.

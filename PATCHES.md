@@ -257,3 +257,46 @@ and then moves the sheet into the caller's frame with `SmApiTransform`.
   merged face kept whichever label the survivor had, and two flush boxes of
   one feature kept a mix of both boxes' indices in one operand order. It now
   keeps the lower (feature, index), whichever face survives.
+
+## Notes from pushing faces through (no patch needed)
+
+A face pushed in can run into features standing beside it: in game-cad's
+`bugs.gcad` a crate's front wall pushed in 30 or 46 mm passes under two bosses
+on the lid near the front edge. The lid trims back with the wall, and its
+inner loops (the bosses' rims) would then cross its new boundary or fall
+outside it: new topology. The local operation doesn't make it. It moves the
+lid's edge anyway and returns a solid that passed every check: manifold, the
+same faces and edges, no gaps, and a volume within 2% because the bosses are
+small. At 46 mm `SmApiTessellate` then fails with `SM_ERR`, and at 30 mm it
+tessellates nonsense.
+
+- The checks now include `loops_stay_apart`: on every planar face, no two
+  loops cross, and every inner loop lies inside the outer one. Loops are
+  polylines in the face's plane through 24 points per edge. Curved faces are
+  skipped, since their loops can wrap around the seam in (u, v). The broken
+  results above fail it with `SHIM_ERR_CHANGED_TOPOLOGY`.
+- `find_obstacles` looks, before the operation, for inner loops of the faces
+  beside the moving ones (from `plan_offset`'s motions) that reach into the
+  space a pushed plane sweeps. The obstacle is the set of faces reachable
+  from such a loop without crossing its face. It's a boss when it stands
+  entirely on that face's outer side, a hole when it's entirely inside.
+- `push_through` sets each one aside with a box on its face's plane, just
+  covering it, and checks that nothing else reaches into the box. A boss
+  comes out as `part ∩ box` and the part keeps `part − box`; a hole is filled
+  with `part ∪ box` and kept as `box − part`. Once `RemoveTopologicalEdgesAndVertices`
+  has merged the box's coplanar cuts back into the face, the picked faces are
+  found again by a `SM_AB_COPY` attribute and offset as usual. Each boss is
+  then cut by a box behind the pushed plane and joined back, unless it lies
+  wholly beyond the plane. Each hole is cut back out. The result is checked
+  like an offset, except for its face and edge counts, and must have as many
+  shells as before. A boss on a side wall near the pushed face's corner
+  shows why: the round between them moves in, the wall pulls back from under
+  what's left of the boss, and that would come back as a separate lump. It's
+  refused instead.
+- A boss cut flush merges its new face into the pushed face, and a cut
+  cylinder's side comes back in two pieces, split where its seam was. Volumes
+  match the part without the features plus what's left of them to 1e-11
+  (`tests/cases.rs`).
+- With nothing in the way, the offset takes the same path as before, bit for
+  bit. `offset_faces_unchecked` keeps the bare local operation, for
+  diagnosing the kernel and for testing callers with a broken solid.

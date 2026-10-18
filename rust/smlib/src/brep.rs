@@ -614,12 +614,25 @@ impl Brep {
     /// drafted wall they slide along it, between two picked faces they follow
     /// both.
     ///
-    /// The topology doesn't change, so every face and edge keeps its
-    /// [`Label`]: the moved faces and the neighbours that stretch alike. A
-    /// move that would shrink a face to nothing fails with
+    /// A picked plane pushed in can run into features standing on the faces
+    /// beside it: a boss or a hole on a lid near the edge above a pushed
+    /// wall, whose loops would cross the lid's new boundary. Each is set
+    /// aside, the faces are offset without it, and it comes back cut by the
+    /// plane's new position, as Parasolid pushes a face through: a boss
+    /// joined back as far as the plane leaves it, a hole cut back.
+    /// [`offset_obstacles`](Brep::offset_obstacles) lists them. Where a cut
+    /// boss's new face doesn't merge into the moved face it is unlabelled;
+    /// everything else keeps its [`Label`]. `SHIM_ERR_OBSTRUCTED` when one
+    /// can't be set aside: it doesn't stand entirely on one side of a planar
+    /// face, or something else stands in its way.
+    ///
+    /// With nothing in the way the topology doesn't change, so every face and
+    /// edge keeps its [`Label`]: the moved faces and the neighbours that
+    /// stretch alike. A move that would shrink a face to nothing fails with
     /// `SHIM_ERR_BROKE_SOLID` or `SHIM_ERR_CHANGED_TOPOLOGY`, never a broken
     /// solid: the kernel's result is checked for manifoldness, the same faces
-    /// and edges, gaps within the brep's tolerance, and a volume that can be
+    /// and edges, every planar face's loops apart (none crossing, every inner
+    /// one inside the outer), gaps within the brep's tolerance, and a volume that can be
     /// trusted: each face's integral agrees with its edges, or else the
     /// volume agrees with the tessellation's. `SHIM_ERR_UNSUPPORTED_FACE`: a
     /// picked curved face other than a cone has blends on it (their new
@@ -635,22 +648,7 @@ impl Brep {
     /// [`fillet`](Brep::fillet).
     pub fn offset_faces(self, faces: &[usize], distance: f64) -> Result<Brep, Error> {
         const OP: &str = "SmBrep::LocalOperation";
-        if !distance.is_finite() {
-            return Err(Error::InvalidArgument {
-                operation: OP,
-                reason: "offset distance must be finite",
-            });
-        }
-        if faces.is_empty() {
-            return Err(Error::InvalidArgument {
-                operation: OP,
-                reason: "no faces to offset",
-            });
-        }
-        let indices: Vec<u32> = faces
-            .iter()
-            .map(|&face| u32::try_from(face).unwrap_or(u32::MAX))
-            .collect();
+        let indices = offset_indices(OP, faces, distance)?;
         // SAFETY: self is a live brep on the kernel thread; indices holds
         // indices.len() values.
         let status = unsafe {
@@ -658,6 +656,73 @@ impl Brep {
         };
         Error::check(OP, status)?;
         Ok(self)
+    }
+
+    /// [`offset_faces`](Brep::offset_faces)'s local operation alone: the
+    /// kernel's own result, neither checked nor pushed through anything in
+    /// the way, so it can be a broken solid that fails later, in
+    /// [`tessellate`](Brep::tessellate) for one. For diagnosing the kernel,
+    /// and for testing what callers do with a broken solid.
+    pub fn offset_faces_unchecked(self, faces: &[usize], distance: f64) -> Result<Brep, Error> {
+        const OP: &str = "SmBrep::LocalOperation";
+        let indices = offset_indices(OP, faces, distance)?;
+        // SAFETY: as in offset_faces.
+        let status = unsafe {
+            sys::sm_brep_offset_faces_unchecked(
+                self.raw.as_ptr(),
+                indices.as_ptr(),
+                indices.len(),
+                distance,
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(self)
+    }
+
+    /// What offsetting `faces` by `distance` runs into: the features standing
+    /// on faces beside the moving ones, along inner loops, that reach into
+    /// the space a picked plane pushed in sweeps (see
+    /// [`offset_faces`](Brep::offset_faces)). Each is its faces' indices, in
+    /// face order, and the features come in the order of their first faces;
+    /// none when nothing is in the way.
+    pub fn offset_obstacles(
+        &self,
+        faces: &[usize],
+        distance: f64,
+    ) -> Result<Vec<Vec<usize>>, Error> {
+        const OP: &str = "offset obstacles";
+        let indices = offset_indices(OP, faces, distance)?;
+        let query = |out_faces: *mut u32, out_obstacles: *mut u32, capacity: usize| {
+            let mut count = 0;
+            // SAFETY: self is a live brep on the kernel thread; indices holds
+            // indices.len() values; the outputs hold `capacity` values each.
+            let status = unsafe {
+                sys::sm_brep_offset_obstacles(
+                    self.raw.as_ptr(),
+                    indices.as_ptr(),
+                    indices.len(),
+                    distance,
+                    out_faces,
+                    out_obstacles,
+                    capacity,
+                    &mut count,
+                )
+            };
+            Error::check(OP, status).map(|()| count)
+        };
+        let count = query(ptr::null_mut(), ptr::null_mut(), 0)?;
+        let mut face_list = vec![0u32; count];
+        let mut obstacle_list = vec![0u32; count];
+        query(face_list.as_mut_ptr(), obstacle_list.as_mut_ptr(), count)?;
+        let mut obstacles: Vec<Vec<usize>> = Vec::new();
+        for (face, obstacle) in face_list.into_iter().zip(obstacle_list) {
+            let obstacle = obstacle as usize;
+            if obstacles.len() <= obstacle {
+                obstacles.resize_with(obstacle + 1, Vec::new);
+            }
+            obstacles[obstacle].push(face as usize);
+        }
+        Ok(obstacles)
     }
 
     /// How many edges `query` picks.
@@ -942,6 +1007,30 @@ impl Brep {
             Ok(Some(mesh))
         }
     }
+}
+
+/// `faces` as the shim's indices, after the checks every offset makes.
+fn offset_indices(
+    operation: &'static str,
+    faces: &[usize],
+    distance: f64,
+) -> Result<Vec<u32>, Error> {
+    if !distance.is_finite() {
+        return Err(Error::InvalidArgument {
+            operation,
+            reason: "offset distance must be finite",
+        });
+    }
+    if faces.is_empty() {
+        return Err(Error::InvalidArgument {
+            operation,
+            reason: "no faces to offset",
+        });
+    }
+    Ok(faces
+        .iter()
+        .map(|&face| u32::try_from(face).unwrap_or(u32::MAX))
+        .collect())
 }
 
 impl Drop for Brep {

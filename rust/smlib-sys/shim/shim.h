@@ -41,6 +41,7 @@ static const sm_status SM_SHIM_ERR_BAD_FRAME = 2023;           /* placement axes
 static const sm_status SM_SHIM_ERR_BAD_SWEEP = 2024;           /* a zero sweep distance, or a sweep that isn't a solid */
 static const sm_status SM_SHIM_ERR_UNSUPPORTED_FACE = 2025;    /* the face, or a blend on it, can't be moved this way */
 static const sm_status SM_SHIM_ERR_CHANGED_TOPOLOGY = 2026;    /* the move would make a face vanish (or appear) */
+static const sm_status SM_SHIM_ERR_OBSTRUCTED = 2027;          /* the move runs into features it can't cut through */
 static const sm_status SM_SHIM_ERR_SPENT_TESSELLATION = 2030; /* the tessellation's mesh was already made */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
@@ -433,17 +434,41 @@ sm_status sm_brep_merge_faces(sm_brep *brep);
  * them tangent to all their neighbours. Built on SmBrep::LocalOperation; see
  * shim.cpp.
  *
- * The brep keeps its faces and edges, so a move that would make a face vanish
- * fails, with SM_SHIM_ERR_CHANGED_TOPOLOGY or SM_SHIM_ERR_BROKE_SOLID (the
- * kernel returned an open solid, one whose vertices or edges are off their
- * faces by more than the brep's tolerance, or one whose volume its own
- * tessellation disagrees with). SM_SHIM_ERR_UNSUPPORTED_FACE: a picked curved
+ * A planar face pushed in can run into features standing on the faces
+ * beside it (a boss or a hole on a lid near the edge above a pushed wall):
+ * their loops would cross their face's new boundary. Each is set aside, the
+ * faces are offset without it, and it comes back cut by the pushed face's
+ * new plane: a boss joined back as far as the plane leaves it, a hole cut
+ * back. SM_SHIM_ERR_OBSTRUCTED when one can't be set aside: it doesn't stand
+ * on a planar face entirely on one side of it, or something else stands in
+ * its way (see sm_brep_offset_obstacles). With nothing in the way the brep
+ * keeps its faces and edges, so a move that would make a face vanish fails,
+ * with SM_SHIM_ERR_CHANGED_TOPOLOGY or SM_SHIM_ERR_BROKE_SOLID (the kernel
+ * returned an open solid, a face whose loops cross or whose inner loop left
+ * its outer one, one whose vertices or edges are off their faces by more
+ * than the brep's tolerance, or one whose volume its own tessellation
+ * disagrees with). SM_SHIM_ERR_UNSUPPORTED_FACE: a picked curved
  * face other than a cone has blends on it, no translation keeps a blend
  * tangent to all its neighbours, or a surface has no offset.
  * SM_SHIM_ERR_BAD_FACE: an index is out of range or repeated. The brep is
  * unchanged when the kernel itself fails; after a check fails it may be
  * modified, so the caller should discard it. */
 sm_status sm_brep_offset_faces(sm_brep *brep, const uint32_t *faces, size_t count, double distance);
+
+/* sm_brep_offset_faces's local operation alone: the kernel's own result, not
+ * checked and not pushed through anything in the way, for diagnosing the
+ * kernel and for testing what callers do with a broken solid. */
+sm_status sm_brep_offset_faces_unchecked(sm_brep *brep, const uint32_t *faces, size_t count, double distance);
+
+/* What an offset of the faces by `distance` runs into (see
+ * sm_brep_offset_faces): the features standing on faces beside the moving
+ * ones, along inner loops, that reach into the space a picked plane pushed
+ * in sweeps. Writes up to `capacity` pairs of a face's index and its
+ * obstacle's number (from 0, in the brep's face order) and sets `count` to
+ * the number of pairs; none when nothing is in the way. */
+sm_status sm_brep_offset_obstacles(const sm_brep *brep, const uint32_t *faces, size_t count, double distance,
+                                   uint32_t *out_faces, uint32_t *out_obstacles, size_t capacity,
+                                   size_t *out_count);
 
 /* SmApiTessellate plus SmApiTessellateBoundaries, copied into an sm_mesh
  * with every triangle and vertex linked back to its B-rep face. */
