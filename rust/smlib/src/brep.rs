@@ -537,14 +537,15 @@ impl Brep {
     /// move that would shrink a face to nothing fails with
     /// `SHIM_ERR_BROKE_SOLID` or `SHIM_ERR_CHANGED_TOPOLOGY`, never a broken
     /// solid: the kernel's result is checked for manifoldness, the same faces
-    /// and edges, gaps within the brep's tolerance, and a volume its own
-    /// tessellation agrees with. `SHIM_ERR_UNSUPPORTED_FACE`: a picked curved
-    /// face other than a cone has blends on it (their new shape isn't a
-    /// translation), no translation keeps a blend tangent to all its
-    /// neighbours, or a surface has no offset. Some moves the kernel still
-    /// gets wrong, and refuses (`SHIM_ERR_BROKE_SOLID`): fillets sliding along
-    /// drafted walls, and some moves of faces cut by spheres (see
-    /// `PATCHES.md`).
+    /// and edges, gaps within the brep's tolerance, and a volume that can be
+    /// trusted: each face's integral agrees with its edges, or else the
+    /// volume agrees with the tessellation's. `SHIM_ERR_UNSUPPORTED_FACE`: a
+    /// picked curved face other than a cone has blends on it (their new
+    /// shape isn't a translation), no translation keeps a blend tangent to
+    /// all its neighbours, or a surface has no offset. Some moves the kernel
+    /// still gets wrong, and refuses (`SHIM_ERR_BROKE_SOLID`): fillets
+    /// sliding along drafted walls, and some moves of faces cut by spheres
+    /// (see `PATCHES.md`).
     ///
     /// Built on `SmBrep::LocalOperation`. `faces` must be non-empty and
     /// distinct (`SHIM_ERR_BAD_FACE` otherwise); a zero distance leaves the

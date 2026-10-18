@@ -98,8 +98,10 @@ kernel patches (see `PATCHES.md`). The topology never changes, so every face
 and edge keeps its label and its index. The result is checked: a move that
 would make a face vanish fails (`SHIM_ERR_CHANGED_TOPOLOGY`, or
 `SHIM_ERR_BROKE_SOLID` when the kernel gets that far), and any result that
-isn't manifold, has gaps over the brep's tolerance, or whose own
-volume disagrees with its tessellation's fails with `SHIM_ERR_BROKE_SOLID`.
+isn't manifold, has gaps over the brep's tolerance, or has a volume that
+can't be trusted (faces whose integrals disagree with their edges, and a
+tessellation that doesn't bear the volume out) fails with
+`SHIM_ERR_BROKE_SOLID`.
 Blends on a moved curved face (a rounded hole rim) fail with
 `SHIM_ERR_UNSUPPORTED_FACE`, and so, for now, do fillets sliding along drafted
 walls and a few moves of sphere faces that the kernel gets wrong.

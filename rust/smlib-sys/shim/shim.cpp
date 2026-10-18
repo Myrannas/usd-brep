@@ -701,33 +701,122 @@ sm_status largest_gap(SmBrep& brep, double& out) {
     return SM_SUCCESS;
 }
 
-// Whether the brep's own volume (SmApiBrepComputeVolume, from its faces' trim
-// curves) agrees with the volume enclosed by its tessellation. The offset
-// executive can return a solid that tessellates right and passes the gap
-// checks but whose trims disagree with its edges; mass properties, and
-// booleans after them, then go wrong. Seen with fillets sliding along drafted
-// walls: 20% short. Agreement is to 2%, above a coarse mesh's chord error and
-// well inside that.
-sm_status volume_agrees(SmBrep& brep, bool& agrees) {
-    agrees = false;
-    double volume = 0.0;
-    SmApiStatus status = SmApiBrepComputeVolume(&brep, 1e-4, volume);
+// The volume each face contributes about `origin`, as SmApiBrepComputeVolume
+// sums it (SmBrep::ComputePreciseProperties, from the faces' trim curves),
+// but integrating the volume alone. The integrator's step control follows
+// the face's area whatever is asked for, so each face's volume comes out
+// exactly as it does with every property requested. A face with solid on
+// both sides contributes from both; one with the same region on both sides
+// contributes nothing, as there.
+sm_status face_volumes(const SmTArray<SmFace*>& faces, const SmPoint3d& origin, double estimated_area, double accuracy,
+                       std::vector<double>& out) {
+    out.assign(faces.GetSize(), 0.0);
+    SmTArray<SmVector3d> unused_moments;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmFaceuse* uses[2] = {faces[i]->GetUpwardFaceuse(), faces[i]->GetUpwardFaceuse()->GetMate()};
+        if (uses[0]->GetShell()->GetRegion() == uses[1]->GetShell()->GetRegion()) continue;
+        for (SmFaceuse* use : uses) {
+            if (use->GetShell()->GetRegion()->IsVoid()) continue;
+            double unused_area = 0.0;
+            double volume = 0.0;
+            const SmStatus status = faces[i]->ComputePreciseProperties(use->GetOrientation(), accuracy, origin,
+                                                                       estimated_area, 0.0, unused_area, volume,
+                                                                       unused_moments, SM_PPF_VOLUME);
+            if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+            out[i] += volume;
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// Half the integral of (x - x0) dy - (y - y0) dx along the edge, start to
+// end: summed around a face's loops, the z component of its vector area.
+// Gauss-Legendre on equal pieces of the edge's range, exact for lines and
+// far tighter than the check needs for arcs and splines.
+sm_status edge_swept_area_z(const SmEdge* edge, const SmPoint3d& origin, double& out) {
+    out = 0.0;
+    if (!edge->GetCurve()) return SM_ERR;
+    double t0 = 0.0;
+    double t1 = 0.0;
+    SmApiStatus status = SmApiEdgeParameterRange(edge, t0, t1);
     if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    // As in describe_edge, a fillet can leave the range an ulp past the
+    // curve's domain.
+    const SmExtent1d domain = edge->GetCurve()->GetNaturalInterval();
+    t0 = std::min(std::max(t0, domain.GetMin()), domain.GetMax());
+    t1 = std::min(std::max(t1, domain.GetMin()), domain.GetMax());
+    static const double nodes[4] = {-0.8611363115940526, -0.3399810435848563, 0.3399810435848563,
+                                    0.8611363115940526};
+    static const double weights[4] = {0.3478548451374538, 0.6521451548625461, 0.6521451548625461,
+                                      0.3478548451374538};
+    const int pieces = 8;
+    const double half = 0.5 * (t1 - t0) / pieces;
+    for (int piece = 0; piece < pieces; ++piece) {
+        const double middle = t0 + (2 * piece + 1) * half;
+        for (int k = 0; k < 4; ++k) {
+            SmVector3d point;
+            SmVector3d tangent;
+            SmVector3d* point_out = &point;
+            SmVector3d* tangent_out = &tangent;
+            SmVector3d* no_second = nullptr;
+            status = SmApiEvaluateCurve(edge->GetCurve(), middle + nodes[k] * half, point_out, tangent_out, no_second);
+            if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+            out += weights[k] * half * 0.5 * ((point.x - origin.x) * tangent.y - (point.y - origin.y) * tangent.x);
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// The z component of each face's vector area from its edges, the normal
+// pointing out of the solid: around each solid side's faceuse, whose
+// edgeuses run clockwise seen from outside.
+sm_status face_areas_z(const SmBrep& brep, const SmTArray<SmFace*>& faces, const SmPoint3d& origin,
+                       std::vector<double>& out) {
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    std::unordered_map<const SmEdge*, double> swept;
+    swept.reserve(edges.GetSize());
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        double area = 0.0;
+        const sm_status status = edge_swept_area_z(edges[i], origin, area);
+        if (status != SM_SUCCESS) return status;
+        swept.emplace(edges[i], area);
+    }
+    out.assign(faces.GetSize(), 0.0);
+    SmTArray<SmEdgeuse*> edgeuses;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmFaceuse* uses[2] = {faces[i]->GetUpwardFaceuse(), faces[i]->GetUpwardFaceuse()->GetMate()};
+        if (uses[0]->GetShell()->GetRegion() == uses[1]->GetShell()->GetRegion()) continue;
+        for (SmFaceuse* use : uses) {
+            if (use->GetShell()->GetRegion()->IsVoid()) continue;
+            edgeuses.RemoveAll();
+            use->GetEdgeuses(edgeuses);
+            for (ULONG e = 0; e < edgeuses.GetSize(); ++e) {
+                const auto found = swept.find(edgeuses[e]->GetEdge());
+                if (found == swept.end()) return SM_ERR;
+                out[i] += edgeuses[e]->GetOrientation() == SM_OT_OPPOSITE ? found->second : -found->second;
+            }
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// What the brep's tessellation encloses: coarse, by angle alone, so an exact
+// solid's mesh is within about 1% of its volume.
+sm_status tessellated_volume(SmBrep& brep, double& enclosed) {
+    enclosed = 0.0;
     SmTessellationParams quality;
-    // Coarse, by angle alone: an exact solid's mesh is within about 1% of
-    // its volume.
     quality.dChordHeightTol = 0.0;
     quality.dCurveAngleTolDeg = 15.0;
     quality.dSurfaceAngleTolDeg = 15.0;
     quality.dMaxEdgeLength = 0.0;
     quality.dMaxAspectRatio = 0.0;
     SmPolyBrep* poly = nullptr;
-    status = SmApiTessellate(&brep, poly, quality);
+    const SmApiStatus status = SmApiTessellate(&brep, poly, quality);
     if (status != SM_SUCCESS || !poly) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
     const std::unique_ptr<SmPolyBrep, PolyBrepDeleter> owned(poly);
     SmTArray<SmPolyFace*> polygons;
     poly->GetPolyFaces(polygons);
-    double enclosed = 0.0;
     SmTArray<SmPolyLoop*> loops;
     SmTArray<SmPolyEdge*> corners;
     for (ULONG i = 0; i < polygons.GetSize(); ++i) {
@@ -745,6 +834,68 @@ sm_status volume_agrees(SmBrep& brep, bool& agrees) {
             }
         }
     }
+    return SM_SUCCESS;
+}
+
+// Whether the brep's own volume (SmApiBrepComputeVolume, from its faces' trim
+// curves) can be trusted. The offset executive can return a solid that
+// tessellates right and passes the gap checks but whose faces integrate
+// wrongly; mass properties, and booleans after them, then go wrong. Seen with
+// fillets sliding along drafted walls: the fillets' integrals over their
+// trims disagree with their own edges, and the volume comes out 20-30% short.
+//
+// SMLib integrates volume as the sum over faces of the integral of
+// (z - z0) n_z dA, so raising the origin by h changes a face's share by -h
+// times its projected area, the integral of n_z dA; for a face that
+// integrates right, that is also what its edges enclose (Stokes). So the
+// volume is integrated about two origins a box height apart, and each face's
+// change is held to its edges. That costs two integrations, against one and
+// a tessellation. When a face disagrees, or the volume isn't positive, the
+// old test decides: the volume must agree to 2% with what the brep's
+// tessellation encloses, above a coarse mesh's chord error and well inside
+// the failures seen.
+sm_status volume_agrees(SmBrep& brep, bool& agrees) {
+    agrees = false;
+    // SmApiBrepComputeVolume's origin, area estimate and accuracy.
+    SmExtent3d box;
+    SmStatus kernel_status = brep.CalculateBoundingBox(box);
+    if (kernel_status != SM_SUCCESS) return static_cast<sm_status>(kernel_status);
+    const SmVector3d size = box.GetSize();
+    const double extent = std::max(size.z, std::max(size.x, size.y));
+    const double estimated_area = extent * extent / 100.0;
+    const double accuracy = 1e-4;
+    const SmPoint3d origin = box.GetMid();
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    std::vector<double> about;
+    sm_status status = face_volumes(faces, origin, estimated_area, accuracy, about);
+    if (status != SM_SUCCESS) return status;
+    double volume = 0.0;
+    for (double share : about) volume += share;
+
+    // Anything the cheaper test can't measure goes to the tessellation too.
+    const double height = size.z;
+    std::vector<double> raised;
+    std::vector<double> projected;
+    if (volume > 0.0 && height > 0.0 &&
+        face_volumes(faces, origin + SmVector3d(0.0, 0.0, height), estimated_area, accuracy, raised) ==
+            SM_SUCCESS &&
+        face_areas_z(brep, faces, origin, projected) == SM_SUCCESS) {
+        double disagreement = 0.0;
+        double scale = 0.0;
+        for (ULONG i = 0; i < faces.GetSize(); ++i) {
+            disagreement += std::fabs(about[i] - raised[i] - height * projected[i]);
+            scale += std::fabs(about[i]) + std::fabs(raised[i]);
+        }
+        if (disagreement <= 1e-3 * scale) {
+            agrees = true;
+            return SM_SUCCESS;
+        }
+    }
+
+    double enclosed = 0.0;
+    status = tessellated_volume(brep, enclosed);
+    if (status != SM_SUCCESS) return status;
     agrees = std::fabs(volume - enclosed) <= 2e-2 * std::fabs(enclosed);
     return SM_SUCCESS;
 }
