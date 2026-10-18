@@ -446,6 +446,12 @@ impl Brep {
     /// the solid. The brep is unchanged; combine the prism with it by
     /// [`union`](Brep::union) or [`difference`](Brep::difference).
     ///
+    /// A side swept from a straight edge is a plane
+    /// ([`Surface::Plane`](crate::Surface::Plane)) and one swept from a
+    /// circular arc or circle a cylinder
+    /// ([`Surface::Cylinder`](crate::Surface::Cylinder)); a side swept from
+    /// any other curve is a NURBS surface.
+    ///
     /// The prism's faces carry no labels. [`Sweep::faces`] says which is the
     /// start, which the end, and which edge of `face` each side was swept
     /// from, for labelling them.

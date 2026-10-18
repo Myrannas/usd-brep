@@ -250,10 +250,39 @@ and then moves the sheet into the caller's frame with `SmApiTransform`.
   crossing squares, or two touching at a corner, still make faces. Callers
   hand over loops that neither cross nor touch.
 - `CreateCurveSweepFromFaces` sweeps each loop's curves as NURBS, so every
-  side of a swept prism is a NURBS surface, planar for lines (as for
-  `sweep_face` on a solid's face).
+  side of a swept prism was a NURBS surface, planar for lines (as for
+  `sweep_face` on a solid's face). See "Notes from the analytic sweeps" below.
 - Two faces of one feature can merge too, such as the ends of an extrude's
   adjacent regions. `LabelAttribute::Merge` compared only feature ids, so the
   merged face kept whichever label the survivor had, and two flush boxes of
   one feature kept a mix of both boxes' indices in one operand order. It now
   keeps the lower (feature, index), whichever face survives.
+
+## Notes from the analytic sweeps (no patch needed)
+
+`Brep::sweep_face` gives each side swept from a line a plane and each side
+swept from an arc or circle a cylinder, where the sweep made NURBS surfaces,
+so callers see a sketch extrude's walls, and an extruded face's, as what they
+are. The shim's `make_sides_analytic` does it after the sweep:
+
+- `CreateCurveSweep` joins each loop's curves into one composite NURBS,
+  sweeps that along the path and splits the surface into faces wherever it
+  is no better than tangent continuous: one face per curve, a circle staying
+  whole. The path direction comes out
+  degree 1 with two poles: a line's side is a bilinear patch (degree 2 with
+  three poles when a loop mixes lines and arcs), an arc's or circle's a
+  rational degree (2, 1) patch.
+- `SmBSplineSurface::CopyAndAddAnalytics`, which `SmPrimitiveCreation` uses
+  for its planes, recognises both: `SmPlane::IsNurbSurfacePlane` checks the
+  plane against the NURBS at ten points and reparameterises it onto the
+  NURBS's domain, and `SmCone::IsNurbSurfaceCone` takes rational degree
+  (2, 1) patches with a circle's knots, making an `SmCone` with a zero
+  semi-angle. SMLib's analytic surfaces are B-splines too, so a side keeps its
+  (u, v): the shim swaps the surface only when the copy's domain is the
+  NURBS's, and puts back the edges' UV trim curves, which `SmFace::SetSurface`
+  drops. Any result other than a plane or a cylinder (a surface of extrusion)
+  is discarded and the side keeps its NURBS.
+- Prisms keep their volumes to the last digit and their largest vertex, edge
+  and face gaps (5e-15 for a rectangle with a round hole); booleans and face
+  merges with the new sides work as before (`tests/planar_faces.rs`,
+  `tests/labels.rs`).

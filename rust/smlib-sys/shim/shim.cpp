@@ -641,6 +641,57 @@ int32_t source_edge(const SmFace* side, const SmFace* start, const SmTArray<SmEd
     return best_distance <= 1e3 * SM_ZONE_TOL_3D ? best : -1;
 }
 
+// CreateCurveSweepFromFaces makes every side a NURBS surface, so lines sweep
+// into planar NURBS and arcs and circles into cylindrical ones. Gives each side
+// that is a plane or a cylinder that analytic surface instead
+// (SmBSplineSurface::CopyAndAddAnalytics, as SmPrimitiveCreation makes its
+// planes). SMLib's analytic surfaces are B-splines too: the copy is checked
+// against the NURBS and keeps its parameters, so the face keeps its domain,
+// and its edges keep their UV trim curves, which SmFace::SetSurface drops and
+// this puts back. Any other side keeps its NURBS.
+void make_sides_analytic(SmBrep& brep, const SmTArray<SmFace*>& sides) {
+    const SmContext* context = brep.GetContext();
+    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
+    for (ULONG i = 0; i < sides.GetSize(); ++i) {
+        SmFace* side = sides[i];
+        const SmSurface* surface = side->GetSurface();
+        if (!surface || surface->GetType() != SmBSplineSurface_TYPE) continue;
+        SmSurface* raw = nullptr;
+        if (surface->CopyAndAddAnalytics(*context, raw) != SM_SUCCESS || !raw) {
+            delete raw;
+            continue;
+        }
+        std::unique_ptr<SmSurface> analytic(raw);
+        const SM_TYPE type = analytic->GetType();
+        const bool cylinder =
+            type == SmCylinder_TYPE || (type == SmCone_TYPE && static_cast<const SmCone*>(raw)->IsCylinder());
+        if ((type != SmPlane_TYPE && !cylinder) || !(analytic->GetNaturalUVDomain() == surface->GetNaturalUVDomain())) {
+            continue;
+        }
+
+        // Each edgeuse pair holds its trim curve on one of the two.
+        std::vector<std::pair<SmEdgeuse*, std::unique_ptr<SmBSplineCurve>>> trims;
+        SmTArray<SmEdgeuse*> uses;
+        side->GetUpwardEdgeuses(uses);
+        for (ULONG j = 0; j < uses.GetSize(); ++j) {
+            SmEdgeuse* owner = nullptr;
+            const SmBSplineCurve* trim = uses[j]->GetUVTrimCurve(&owner);
+            const bool kept = std::any_of(trims.begin(), trims.end(), [&](const auto& t) { return t.first == owner; });
+            if (!trim || !owner || kept) continue;
+            SmCurve* copy = nullptr;
+            if (trim->Copy(*context, copy) != SM_SUCCESS || !copy) {
+                delete copy;
+                continue;
+            }
+            trims.emplace_back(owner, static_cast<SmBSplineCurve*>(copy));
+        }
+        const SmExtent2d domain = side->GetUVDomain();
+        side->SetSurface(analytic.release(), TRUE);
+        side->SetUVDomain(domain);
+        for (auto& [owner, trim] : trims) owner->SetUVTrimCurve(trim.release(), 0.0, TRUE);
+    }
+}
+
 sm_status sweep_face(const SmBrep& brep, SmFace* face, double distance, SmBrep*& prism,
                      std::vector<sm_swept_face>& roles) {
     double normal[3];
@@ -670,6 +721,7 @@ sm_status sweep_face(const SmBrep& brep, SmFace* face, double distance, SmBrep*&
                                                sides, ends);
     if (status != SM_SUCCESS) return static_cast<sm_status>(status);
     if (!is_manifold_solid(*result) || starts.GetSize() != 1 || ends.GetSize() != 1) return SM_SHIM_ERR_BAD_SWEEP;
+    make_sides_analytic(*result, sides);
 
     SmTArray<SmEdge*> all_edges;
     brep.GetEdges(all_edges);
