@@ -176,7 +176,6 @@ typedef struct sm_edge_info {
  * - points: SM_EDGE_SAMPLES points on the edge, evenly spaced in its curve
  *   parameter from one end to the other. points[SM_EDGE_SAMPLES / 2] is the
  *   parametric midpoint.
- * - length: the edge's arc length, to a relative accuracy of 1e-7.
  * - face_a, face_b, use_count: as in sm_edge_info.
  * - normal_a, normal_b: the outward unit normals of face_a and face_b at the
  *   midpoint; zero when the face is absent or the normal can't be found.
@@ -184,7 +183,6 @@ typedef struct sm_edge_info {
  *   face_b. */
 typedef struct sm_edge_geometry {
     double points[SM_EDGE_SAMPLES][3];
-    double length;
     int32_t face_a;
     int32_t face_b;
     uint32_t use_count;
@@ -307,6 +305,12 @@ void sm_brep_free(sm_brep *brep);
  * brep's edge count to *count. Pass capacity = *count from sm_brep_counts to
  * get every edge. Edge indices below hold until the brep is next changed. */
 sm_status sm_brep_edge_geometry(const sm_brep *brep, sm_edge_geometry *out, size_t capacity, size_t *count);
+
+/* The arc length of the edge at an index of the brep's edge list
+ * (SmApiEdgeComputeLength), integrated to relative_accuracy (clamped to
+ * [1e-10, 1e-1]). It costs far more than sampling the edge, so
+ * sm_brep_edge_geometry leaves it out. */
+sm_status sm_brep_edge_length(const sm_brep *brep, size_t edge, double relative_accuracy, double *out);
 
 /* SmApiFilletEdgesPerEdge: fillets the edges at the given indices of the
  * brep's edge list in place. Edge edges[i] gets radii[i] and the

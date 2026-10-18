@@ -152,10 +152,11 @@ but not much else. What goes wrong, and what the shim
   blend, and moving the top after pushing a wall under fillets left the solid
   open.
 - Results are checked: manifold, the same faces and edges, every gap within the
-  brep's tolerance, and the brep's own volume within 2% of its tessellation's.
-  Moves that make a face vanish come back open, inside out (a box's walls
-  shrunk to zero height: manifold, negative volume, a 32 mm gap) or with trims
-  that disagree with the edges, and are refused.
+  brep's tolerance, and a volume that can be trusted (see "Notes from the
+  rebuild trims" below). Moves that make a face vanish come back open, inside
+  out (a box's walls shrunk to zero height: manifold, negative volume, a 32 mm
+  gap) or with faces whose integrals disagree with their edges, and are
+  refused.
 
 Results (`rust/smlib/tests/cases.rs`, all against the part built directly at
 its new size and, where known, its analytic volume, within 1e-6): plain,
@@ -179,3 +180,34 @@ is a B-spline surface whose control points share a plane, which
 `SmSurface::IsPlanar` can't confirm below about 1e-5, so `outward_plane` (the
 labels work's planar-face normal) also accepts what the offset's `plane_of`
 does.
+
+## Notes from the rebuild trims (no patch needed)
+
+Profiling a part rebuilt as one of its features was dragged (a pocket under a
+fillet, a face offset and another fillet) put about 40% of each rebuild into
+checks and reads that the results didn't need in full. Results are unchanged:
+meshes, volumes and names come out bit for bit as before, apart from results
+that already varied from run to run.
+
+- The face offset's volume check used to compare the brep's own volume
+  (`SmApiBrepComputeVolume`) with what its tessellation encloses, to 2%. The
+  tessellation cost more than the offset's own surfaces. SMLib integrates
+  volume as the sum over faces of the integral of (z - z0) n_z dA, so raising
+  the origin by h changes each face's share by h times its projected area,
+  and for a face that integrates right that is also what its edges enclose
+  (Stokes). The check now integrates the volume about two origins a box
+  height apart and holds each face's change to its edges. Only when a face
+  disagrees by more than 1e-3 of the shares, or the volume isn't positive,
+  does the tessellation decide, as before.
+  - The failure the old check was built for, fillets sliding along drafted
+    walls, is a face whose integral over its own trims disagrees with its own
+    edges: the fillets' projected areas came out 7.6 times too small, though
+    their trims lie on their edges and their UV loops close. The new test
+    scores it 6e-2; every valid result in the tests scores 2.6e-4 or less
+    (a torus; 3.5e-5 for everything else), and the old test still refuses it.
+  - Each face's volume is integrated alone (`SM_PPF_VOLUME`), not with every
+    moment. The integrator's step control follows the area whatever is asked
+    for, so the volume is bit for bit what `SmApiBrepComputeVolume` gives.
+- `Brep::edges` no longer integrates each edge's exact length
+  (`SmApiEdgeComputeLength`, an ODE per edge), which nothing read and which
+  was 9% of the rebuild. `Brep::edge_length` integrates one edge's on demand.

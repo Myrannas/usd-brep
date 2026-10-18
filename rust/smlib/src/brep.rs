@@ -17,6 +17,9 @@ use crate::mesh::{Mesh, TessellationParams};
 /// centroid is then exact to a tenth of a micron on a metre-sized part.
 const CENTROID_ACCURACY: f64 = 1e-7;
 
+/// Relative accuracy of [`Brep::edge_length`].
+const EDGE_LENGTH_ACCURACY: f64 = 1e-7;
+
 /// A B-rep solid owned by the kernel. It is freed on drop.
 ///
 /// A `Brep` is neither `Send` nor `Sync`: it stays on the kernel's thread.
@@ -311,6 +314,19 @@ impl Brep {
             .collect())
     }
 
+    /// The arc length of the edge at `edge` in [`edges`](Brep::edges)
+    /// (`SmApiEdgeComputeLength`), integrated to a relative accuracy of 1e-7.
+    /// This costs far more than [`edges`](Brep::edges), which leaves it out.
+    pub fn edge_length(&self, edge: usize) -> Result<f64, Error> {
+        let mut length = 0.0;
+        // SAFETY: self is a live brep on the kernel thread.
+        let status = unsafe {
+            sys::sm_brep_edge_length(self.raw.as_ptr(), edge, EDGE_LENGTH_ACCURACY, &mut length)
+        };
+        Error::check("SmApiEdgeComputeLength", status)?;
+        Ok(length)
+    }
+
     /// The geometry of every face, in the brep's face order: surface, label,
     /// bounds, and the outward normal of planar faces.
     pub fn faces(&self) -> Result<Vec<FaceGeometry>, Error> {
@@ -521,14 +537,15 @@ impl Brep {
     /// move that would shrink a face to nothing fails with
     /// `SHIM_ERR_BROKE_SOLID` or `SHIM_ERR_CHANGED_TOPOLOGY`, never a broken
     /// solid: the kernel's result is checked for manifoldness, the same faces
-    /// and edges, gaps within the brep's tolerance, and a volume its own
-    /// tessellation agrees with. `SHIM_ERR_UNSUPPORTED_FACE`: a picked curved
-    /// face other than a cone has blends on it (their new shape isn't a
-    /// translation), no translation keeps a blend tangent to all its
-    /// neighbours, or a surface has no offset. Some moves the kernel still
-    /// gets wrong, and refuses (`SHIM_ERR_BROKE_SOLID`): fillets sliding along
-    /// drafted walls, and some moves of faces cut by spheres (see
-    /// `PATCHES.md`).
+    /// and edges, gaps within the brep's tolerance, and a volume that can be
+    /// trusted: each face's integral agrees with its edges, or else the
+    /// volume agrees with the tessellation's. `SHIM_ERR_UNSUPPORTED_FACE`: a
+    /// picked curved face other than a cone has blends on it (their new
+    /// shape isn't a translation), no translation keeps a blend tangent to
+    /// all its neighbours, or a surface has no offset. Some moves the kernel
+    /// still gets wrong, and refuses (`SHIM_ERR_BROKE_SOLID`): fillets
+    /// sliding along drafted walls, and some moves of faces cut by spheres
+    /// (see `PATCHES.md`).
     ///
     /// Built on `SmBrep::LocalOperation`. `faces` must be non-empty and
     /// distinct (`SHIM_ERR_BAD_FACE` otherwise); a zero distance leaves the
@@ -744,7 +761,6 @@ fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
 
 const EMPTY_EDGE: sys::sm_edge_geometry = sys::sm_edge_geometry {
     points: [[0.0; 3]; EDGE_SAMPLES],
-    length: 0.0,
     face_a: -1,
     face_b: -1,
     use_count: 0,
