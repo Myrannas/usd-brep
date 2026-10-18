@@ -20,6 +20,11 @@
 #include <SmTrimmingTools.h>
 #include <SmAssertArray.h>
 
+#include <algorithm>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #ifdef SM_DEBUG_CODE
 #include <SmTopologyTraverser.h>
 #endif // SM_DEBUG_CODE
@@ -1053,6 +1058,40 @@ SmBoolean bDebugMe2 = FALSE;
 } // end SmOffsetExecutive::DoSolidOffset
 
 /*******************************************************************//**
+PURPOSE: DoExtendedOffset() helper: puts edgeuses of a Brep in the Brep's
+   own order, its edges in turn and each edge's edgeuses in turn, so that
+   they don't follow their addresses.
+
+NOTES: Edgeuses that aren't the Brep's go last, in their given order.
+***********************************************************************/
+static void sm_SortInBrepOrder
+  (const SmBrep         * pBrep,       // in : Brep whose order to follow
+   SmTArray<SmEdgeuse*> & rEdgeuses)   // i/o: edgeuses of pBrep to sort
+{
+  SmTArray<SmEdge*>    sEdges;
+  SmTArray<SmEdgeuse*> sUses;
+  std::unordered_map<const SmEdgeuse*, ULONG> sRanks;
+  pBrep->GetEdges(sEdges);
+  for (ULONG ii = 0; ii < sEdges.GetSize(); ii++)
+    {
+      sEdges[ii]->GetEdgeuses(sUses);
+      for (ULONG jj = 0; jj < sUses.GetSize(); jj++)
+        { sRanks.emplace(sUses[jj], (ULONG)sRanks.size()); }
+    }
+  std::vector<std::pair<ULONG, SmEdgeuse*>> sRanked;
+  for (ULONG ii = 0; ii < rEdgeuses.GetSize(); ii++)
+    {
+      const auto sFound = sRanks.find(rEdgeuses[ii]);
+      const ULONG lRank = sFound == sRanks.end() ? (ULONG)(sRanks.size() + ii) : sFound->second;
+      sRanked.emplace_back(lRank, rEdgeuses[ii]);
+    }
+  std::sort(sRanked.begin(), sRanked.end(),
+            [](const std::pair<ULONG, SmEdgeuse*> & a, const std::pair<ULONG, SmEdgeuse*> & b) { return a.first < b.first; });
+  for (ULONG ii = 0; ii < rEdgeuses.GetSize(); ii++)
+    { rEdgeuses[ii] = sRanked[ii].second; }
+}
+
+/*******************************************************************//**
 PURPOSE: This is the main top level method to offset a solid brep
     that extends convex edges instead of making rounded fillets.
 
@@ -1417,6 +1456,12 @@ SmBoolean bDebugMeAll = FALSE ;
   SmTArray<SmEdgeuse*> sOffSetEUS, sRadialEUS;
   SmTArray<SmEdge*>    sNewEdges;
   m_vEUToEU.GetAllFirsts(sOffsetEdgeuses);
+
+  // A local operation mates edges in the original Brep's order: the map's
+  // own order follows the edgeuses' addresses, and it decides which edge is
+  // mated first and which of an edge's sides is the target.
+  if (m_eOffsetOperation == SM_OO_LOCAL_OPERATION)
+    { sm_SortInBrepOrder(m_pOriginalBrep, sOffsetEdgeuses); }
 
 #ifdef SM_VALIDATE_TOPOLOGY
       m_pOffsetBrep->ValidatePointers();
