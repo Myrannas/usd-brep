@@ -1924,6 +1924,164 @@ SmBoolean bDebugMe4 = FALSE;
 } // end SmOffsetGeometryCreation::ExtendTrimEdges
 
 /*******************************************************************//**
+PURPOSE: MateEdges() helper: copy of a closed curve re-anchored to start at
+   dParam, in the same direction. rcJump is the curve's end point minus its
+   start point: zero for a curve closed in its own space, one period for a
+   UV curve that wraps a periodic surface's seam. The second piece is moved
+   by it so the pieces join.
+
+NOTES: 
+***********************************************************************/
+static SmStatus sm_ReanchorClosedCurve
+  (const SmContext      & crContext,  // in : context for new object construction
+   const SmBSplineCurve * pCurve,     // in : closed curve
+   double                 dParam,     // in : new start parameter, inside the natural interval
+   const SmVector3d     & rcJump,     // in : end point minus start point
+   SmBSplineCurve      *& rpResult)   // out: new curve, owned by the caller
+{
+  rpResult = NULL;
+  SmExtent1d sIvl = pCurve->GetNaturalInterval();
+  SmCurve *pCopy1 = NULL, *pCopy2 = NULL;
+  SER(pCurve->Copy(crContext, pCopy1));
+  SmObjDelete sClean1(pCopy1);
+  SER(pCurve->Copy(crContext, pCopy2));
+  SmObjDelete sClean2(pCopy2);
+  SmBSplineCurve *pAfter  = SM_CAST_PTR(SmBSplineCurve, pCopy1);
+  SmBSplineCurve *pBefore = SM_CAST_PTR(SmBSplineCurve, pCopy2);
+  NER(pAfter);
+  NER(pBefore);
+  SmExtent1d sAfter(dParam, sIvl.GetMax());
+  SmExtent1d sBefore(sIvl.GetMin(), dParam);
+  SER(pAfter->Trim(sAfter));
+  SER(pBefore->Trim(sBefore));
+  if (rcJump.Length() > 0.0)
+    {
+      SmAxis2Placement sShift;
+      sShift.Translate(rcJump);
+      SER(pBefore->Transform(sShift));
+    }
+  SmTArray<SmBSplineCurve*> sPieces;
+  sPieces.Add(pAfter);
+  sPieces.Add(pBefore);
+  SER(SmBSplineCurve::CreateByJoining(crContext, sPieces, NULL, rpResult));
+  NER(rpResult);
+  return SM_SUCCESS;
+} // end sm_ReanchorClosedCurve
+
+/*******************************************************************//**
+PURPOSE: MateEdges() helper: when the intersection curve that will replace
+   an open edge is closed, its two trim points split it into two arcs, and
+   the trim interval [a, b] TrimExtendedEdge() returns is only ever the one
+   inside the curve's parameter range. Keep whichever arc passes nearer the
+   original edge's midpoint: for the other, re-anchor the 3D curve and both
+   UV curves at b, so the arc is one interval running past the old seam.
+
+NOTES: Seen when a face offset moves a face onto a sphere: the plane of a
+   neighbouring wall then meets the sphere in a full circle, and the wall
+   came back trimmed by the far side of it, an inside-out solid with no
+   gaps. Leaves the curves alone unless the re-anchored ones still agree:
+   both UV curves lifted onto their surfaces must meet the 3D curve.
+***********************************************************************/
+static SmStatus sm_KeepNearerArcOfClosedCurve
+  (const SmContext  & crContext,   // in : context for new object construction
+   const SmEdgeuse  * pEdgeuse,    // in : original edgeuse being mated
+   const SmSurface  * pSurface1,   // in : surface of rpUVCurve1
+   const SmSurface  * pSurface2,   // in : surface of rpUVCurve2
+   double             dTol,        // in : 3D tolerance
+   SmCurve         *& rp3DCurve,   // i/o: intersection curve, replaced when re-anchored
+   SmBSplineCurve  *& rpUVCurve1,  // i/o: its UV curve on pSurface1, likewise
+   SmBSplineCurve  *& rpUVCurve2,  // i/o: its UV curve on pSurface2, likewise
+   SmExtent1d       & rTrimIvl)    // i/o: trim interval, likewise
+{
+  SmBSplineCurve *p3D = SM_CAST_PTR(SmBSplineCurve, rp3DCurve);
+  if (!p3D || !rpUVCurve1 || !rpUVCurve2) { return SM_SUCCESS; }
+  SmExtent1d sIvl = p3D->GetNaturalInterval();
+  if (   !SM_ARE_SAME(rpUVCurve1->GetNaturalInterval().GetMin(), sIvl.GetMin())
+      || !SM_ARE_SAME(rpUVCurve1->GetNaturalInterval().GetMax(), sIvl.GetMax())
+      || !SM_ARE_SAME(rpUVCurve2->GetNaturalInterval().GetMin(), sIvl.GetMin())
+      || !SM_ARE_SAME(rpUVCurve2->GetNaturalInterval().GetMax(), sIvl.GetMax()))
+    { return SM_SUCCESS; }
+
+  // Only a closed curve standing in for an open edge.
+  SmPoint3d sStart, sEnd;
+  SER(p3D->EvaluatePoint(sIvl.GetMin(), sStart));
+  SER(p3D->EvaluatePoint(sIvl.GetMax(), sEnd));
+  const SmEdge *pEdge = pEdgeuse->GetEdge();
+  if (sStart.DistanceBetween(sEnd) > dTol || pEdge->GetStartVertex() == pEdge->GetOtherVertex(pEdge->GetStartVertex()))
+    { return SM_SUCCESS; }
+
+  // Which arc is nearer the original edge?
+  const double dA = rTrimIvl.GetMin(), dB = rTrimIvl.GetMax(), dPeriod = sIvl.GetLength();
+  SmPoint3d sOrigMid, sInside, sOutside;
+  SER(((SmEdgeuse *)pEdgeuse)->NormalizedEvaluate(0.5, FALSE, sOrigMid));  // FALSE = 3d Eval
+  SER(p3D->EvaluatePoint(0.5 * (dA + dB), sInside));
+  double dOutsideMid = dB + 0.5 * (dPeriod - (dB - dA));
+  if (dOutsideMid > sIvl.GetMax()) { dOutsideMid -= dPeriod; }
+  SER(p3D->EvaluatePoint(dOutsideMid, sOutside));
+  if (sOutside.DistanceBetween(sOrigMid) >= sInside.DistanceBetween(sOrigMid)) { return SM_SUCCESS; }
+
+  // Re-anchor all three at b; the outside arc is then [b, a + period].
+  SmBSplineCurve *pCurves[3] = { p3D, rpUVCurve1, rpUVCurve2 };
+  SmBSplineCurve *pNew[3]    = { NULL, NULL, NULL };
+  SmObjDelete sCleanNew0, sCleanNew1, sCleanNew2;
+  SmObjDelete *pCleanNew[3]  = { &sCleanNew0, &sCleanNew1, &sCleanNew2 };
+  for (ULONG ii = 0; ii < 3; ii++)
+    {
+      SmPoint3d sFirst, sLast;
+      SER(pCurves[ii]->EvaluatePoint(sIvl.GetMin(), sFirst));
+      SER(pCurves[ii]->EvaluatePoint(sIvl.GetMax(), sLast));
+      SmVector3d sJump = sLast - sFirst;
+      if (ii == 0) { sJump = SmVector3d(0.0, 0.0, 0.0); }
+      if (sm_ReanchorClosedCurve(crContext, pCurves[ii], dB, sJump, pNew[ii]) != SM_SUCCESS || !pNew[ii])
+        { return SM_SUCCESS; }
+      pCleanNew[ii]->SetObj(pNew[ii]);
+    }
+  SmExtent1d sNewIvl = pNew[0]->GetNaturalInterval();
+  if (   !SM_ARE_SAME(sNewIvl.GetLength(), dPeriod)
+      || !SM_ARE_SAME(pNew[1]->GetNaturalInterval().GetMin(), sNewIvl.GetMin())
+      || !SM_ARE_SAME(pNew[2]->GetNaturalInterval().GetMin(), sNewIvl.GetMin()))
+    { return SM_SUCCESS; }
+  SmExtent1d sNewTrim(sNewIvl.GetMin(), sNewIvl.GetMin() + (dPeriod - (dB - dA)));
+
+  // The re-anchored curves must still agree, and keep a UV curve that went
+  // past its surface's seam on the surface's own domain.
+  const SmSurface *pSurfaces[2] = { pSurface1, pSurface2 };
+  for (ULONG ii = 1; ii < 3; ii++)
+    {
+      SmExtent2d sDomain = pSurfaces[ii - 1]->GetNaturalUVDomain();
+      SmPoint3d sUVMid;
+      SER(pNew[ii]->EvaluatePoint(sNewTrim.Evaluate(0.5), sUVMid));
+      SmPoint3d sFirst, sLast;
+      SER(pCurves[ii]->EvaluatePoint(sIvl.GetMin(), sFirst));
+      SER(pCurves[ii]->EvaluatePoint(sIvl.GetMax(), sLast));
+      SmVector3d sJump = sLast - sFirst;
+      if (sJump.Length() > 0.0 && !sDomain.ContainsPoint2d(SmPoint2d(sUVMid.x, sUVMid.y), SM_EFF_ZERO))
+        {
+          SmAxis2Placement sBack;
+          sBack.Translate(SmVector3d(0.0, 0.0, 0.0) - sJump);
+          SER(pNew[ii]->Transform(sBack));
+        }
+      for (ULONG kk = 0; kk < 3; kk++)
+        {
+          const double dT = sNewTrim.Evaluate(0.5 * kk);
+          SmPoint3d sUV, sOnSurface, sOnCurve;
+          SER(pNew[ii]->EvaluatePoint(dT, sUV));
+          SmPoint2d sUV2(sUV.x, sUV.y);
+          if (!sDomain.ContainsPoint2d(sUV2, SM_EFF_ZERO_SQRT)) { return SM_SUCCESS; }
+          SER(pSurfaces[ii - 1]->EvaluatePoint(sUV2, sOnSurface));
+          SER(pNew[0]->EvaluatePoint(dT, sOnCurve));
+          if (sOnSurface.DistanceBetween(sOnCurve) > dTol) { return SM_SUCCESS; }
+        }
+    }
+
+  delete rp3DCurve;  rp3DCurve  = pNew[0]; sCleanNew0.Clear();
+  delete rpUVCurve1; rpUVCurve1 = pNew[1]; sCleanNew1.Clear();
+  delete rpUVCurve2; rpUVCurve2 = pNew[2]; sCleanNew2.Clear();
+  rTrimIvl = sNewTrim;
+  return SM_SUCCESS;
+} // end sm_KeepNearerArcOfClosedCurve
+
+/*******************************************************************//**
 PURPOSE:  Mate a couple of edges by extension and intersection.
 
 NOTES: 
@@ -2144,6 +2302,11 @@ SmBoolean bDebugMe = FALSE;
       sSurface2UVCurves.RemoveAt(lMinCurve,1);
 
       // Trim bound best XSectCurves to sTrimIvl
+      // A closed intersection curve standing in for an open edge: keep the
+      // arc nearer the original edge, which the trim interval needn't be.
+      SER(sm_KeepNearerArcOfClosedCurve(crContext, pEdgeuse, pExtSurface1, pExtSurface2,
+                                        pEdgeuse->GetEdge()->GetTolerance(),
+                                        p3DCurveFound, pUVCurve1Found, pUVCurve2Found, sTrimIvl));
       SER(p3DCurveFound->Trim(sTrimIvl));    // may snap sIvl by tol to existing knots
       SER(pUVCurve1Found->Trim(sTrimIvl));   // may snap sIvl by tol to existing knots
       SER(pUVCurve2Found->Trim(sTrimIvl));   // may snap sIvl by tol to existing knots
