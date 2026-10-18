@@ -14,12 +14,14 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `c282328` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: `TrimExtendedEdge` trims against a not-yet-mated tangent neighbour's old UV curve, which in a local operation can describe the old corner. | For `SM_OO_LOCAL_OPERATION`, also offer the base vertex as a trim point when it lies on the new curve; the shim moves vertices it can place there for the operation. |
 | `4d13c5e` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: `Phase1SetupBrep` builds every face's surface cache and splits every edge, so a small edit still pays for the whole solid's edge preparation. | Add `SmTess::Phase1SetupFaces`, which sets up only the faces given (with caches for the faces sharing their edges, which split only those edges) exactly as `Phase1SetupBrep` would, and reports refinement or anything `Phase1SetupBrep` would recover from; and a `SplitFaceEdgesToUVSize` overload that splits only edges shared with given faces. Existing calls are unchanged. |
 | `7efc9ef` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: a face's surface cache, often the largest part of setting it up, is built again every tessellation though it depends only on the surface and the parameters. | `Phase1SetupFaces` takes an optional `SmTessSrfCacheStore`: faces take its caches for identical surfaces, and faces set up only to split shared edges leave theirs there. `SmTessSrfCache::SetFace` moves a cache to another face and tessellation. |
+| `76a3dbc` | `SmMemBlockMgr.h`, `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: Phase 2 subdivides and labels a face's surface cache, so a kept cache serves one face once, and faces whose surfaces stay while their boundaries move (beside a dragged fillet) build theirs in every tessellation. | Add `SmTessSrfCache::Copy`, a deep copy of a cache as `BuildTree` leaves it: the tree's node and node-data blocks byte for byte with their pointers mapped (`SmMemBlockMgr::CopyFrom`), B-spline subdivision surfaces with their exact knots; NULL for a cache holding anything else. `Phase1SetupFaces` gives the faces it tessellates copies and leaves originals in the store, which also gets copies of caches it builds when `SmTessSrfCacheStore::WantsCopy` says to. `SetFace` repoints nodes from the old face's surface to the new one's. |
 
 `source/SM_API` is unmodified. Each offset patch changes only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
 offset); solid offsets and shells take the code paths they always did. The
-tessellation patches only add methods and a class: `SmApiTessellate` and
-`Phase1SetupBrep` take the code paths they always did.
+tessellation patches only add methods and a class (`SmMemBlockMgr` gains a
+block copy and block accessors): `SmApiTessellate` and `Phase1SetupBrep`
+take the code paths they always did.
 
 ## Notes from the bring-up (no patch needed)
 

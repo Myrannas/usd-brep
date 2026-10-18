@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 use smlib::{
     Brep, EdgeBlend, EdgeQuery, Error, FaceKey, FilletOptions, Kernel, Mesh, SurfaceCaches,
-    TessellationParams,
+    SurfaceKind, TessellationParams,
 };
 
 const L: f64 = 100.0;
@@ -714,6 +714,74 @@ fn kept_surface_caches_leave_faces_as_they_were() {
         [2, 3, 4, 5, 6, 7, 10, 11]
             .iter()
             .all(|&i| caches_kept[i] > 0),
+        "caches kept per step: {caches_kept:?}"
+    );
+}
+
+/// A prism with drafted walls and every edge rounded, notched by a cylinder
+/// at (x, 20) through its front wall and top front round: NURBS faces (the
+/// walls are planar NURBS, the rounds curved ones) that keep their surfaces
+/// while the notch moves.
+fn notched_prism(k: &Kernel, x: f64) -> Result<Brep, Error> {
+    let base = [
+        [-30.0, -20.0, 0.0],
+        [30.0, -20.0, 0.0],
+        [30.0, 20.0, 0.0],
+        [-30.0, 20.0, 0.0],
+    ];
+    let rounded = Brep::tapered_prism(k, &base, 25.0, 10.0)?.fillet(
+        &[EdgeBlend::round(
+            EdgeQuery::Sharp {
+                min_angle_deg: 30.0,
+            },
+            4.0,
+        )],
+        &FilletOptions::default(),
+    )?;
+    rounded.difference(Brep::cylinder(k, [x, 20.0, -1.0], 8.0, 30.0)?)
+}
+
+#[test]
+fn kept_surface_caches_are_copied_for_faces_tessellated_again() {
+    // Every face is tessellated at every step, so the store keeps only
+    // copies of the caches of faces it tessellates: a face whose surface
+    // stays takes a copy of the cache kept for it, B-spline subdivision and
+    // all, and leaves the original for the next step.
+    let (caches_kept, nurbs) = on_kernel(|k| {
+        let mut caches = SurfaceCaches::new(k);
+        let mut caches_kept = Vec::new();
+        let mut nurbs = Vec::new();
+        for x in [0.0, 3.0, 6.0, 9.0] {
+            let part = notched_prism(k, x).unwrap();
+            let faces = part.faces().unwrap();
+            nurbs.push(
+                faces
+                    .iter()
+                    .filter(|face| SurfaceKind::of(&face.surface) == SurfaceKind::Nurbs)
+                    .count(),
+            );
+            let name = format!("notch at {x}");
+            let reused = reuse_some_with(
+                &name,
+                &part,
+                &final_params(),
+                &mut Kept::new(),
+                Some(&mut caches),
+            );
+            assert_eq!(reused, 0, "{name}: nothing kept to reuse");
+            caches_kept.push(caches.len());
+        }
+        (caches_kept, nurbs)
+    });
+    assert!(nurbs.iter().all(|&n| n >= 20), "NURBS faces: {nurbs:?}");
+    // The first step builds every cache and keeps none; the second keeps
+    // copies of the caches it builds for surfaces the first built too; from
+    // the third, faces take copies and the store keeps what they copied.
+    assert_eq!(caches_kept[0], 0, "caches kept per step: {caches_kept:?}");
+    assert!(
+        caches_kept[1] >= 20
+            && caches_kept[2] >= caches_kept[1]
+            && caches_kept[3] >= caches_kept[1],
         "caches kept per step: {caches_kept:?}"
     );
 }

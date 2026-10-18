@@ -472,8 +472,11 @@ void sm_tessellation_free(sm_tessellation *tessellation);
  *
  * With caches (or NULL), a face whose surface is identical to one a cache
  * was kept for takes that cache rather than building its own, and the
- * caches of faces used only to split shared edges are kept. A cache depends
- * only on its surface and the parameters, so the mesh comes out the same. */
+ * caches of faces used only to split shared edges are kept. A wanted face
+ * takes a copy, since triangulating changes a cache, and the cache stays
+ * kept; it keeps a copy of a cache it builds when one of the store's last
+ * two calls built one for the same surface. A cache depends only on its
+ * surface and the parameters, so the mesh comes out the same. */
 sm_status sm_brep_tessellation_keys(sm_brep *brep, const sm_tessellation_params *params, uint64_t *keys,
                                     int32_t *keyed, size_t face_count);
 sm_status sm_brep_tessellate_some(sm_brep *brep, const sm_tessellation_params *params, const uint8_t *wanted,
@@ -481,7 +484,8 @@ sm_status sm_brep_tessellate_some(sm_brep *brep, const sm_tessellation_params *p
 
 /* An empty store of surface caches for sm_brep_tessellate_some, which keeps
  * the caches given back by its last two calls that triangulated any face, by
- * surface and parameters.
+ * surface and parameters, and remembers which surfaces they found no cache
+ * for.
  * NULL when out of memory. Use and free it on the kernel thread. */
 sm_surface_caches *sm_surface_caches_new(void);
 

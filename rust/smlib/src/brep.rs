@@ -807,8 +807,9 @@ impl Brep {
     /// whole solid.
     ///
     /// With `caches`, faces take surface caches kept from earlier calls for
-    /// identical surfaces, and the faces sharing wanted faces' edges leave
-    /// theirs there: see [`SurfaceCaches`]. The mesh comes out the same.
+    /// identical surfaces (wanted faces take copies), and the faces sharing
+    /// wanted faces' edges leave theirs there, as do wanted faces whose
+    /// surfaces recur: see [`SurfaceCaches`]. The mesh comes out the same.
     pub fn tessellate_some(
         &self,
         params: &TessellationParams,
