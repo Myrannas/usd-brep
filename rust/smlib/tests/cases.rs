@@ -1,5 +1,6 @@
-//! The demo's four cases on a 100 × 60 × 40 mm box centred on the origin,
-//! Z up, in kernel millimetres.
+//! The demo's cases on a 100 × 60 × 40 mm box centred on the origin, Z up,
+//! in kernel millimetres: four booleans, then fillets and chamfers on edges
+//! picked by geometric queries.
 //!
 //! The test harness runs each test on its own thread, but the kernel belongs
 //! to one thread, so every test sends its kernel work to a shared kernel
@@ -11,7 +12,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
-use smlib::{Brep, Error, Kernel, Mesh, Surface, TessellationParams};
+use smlib::{
+    Brep, Continuity, EdgeBlend, EdgeQuery, Error, FilletOptions, Kernel, Mesh, Surface,
+    TessellationParams, Tolerance,
+};
 
 const L: f64 = 100.0;
 const W: f64 = 60.0;
@@ -317,4 +321,412 @@ fn rejects_bad_dimensions() {
             .unwrap_err()
     });
     assert!(matches!(err, Error::InvalidArgument { .. }), "{err:?}");
+}
+
+const UP: [f64; 3] = [0.0, 0.0, 1.0];
+const X: [f64; 3] = [1.0, 0.0, 0.0];
+const Y: [f64; 3] = [0.0, 1.0, 0.0];
+const Z: [f64; 3] = UP;
+
+fn neg([x, y, z]: [f64; 3]) -> [f64; 3] {
+    [-x, -y, -z]
+}
+
+/// The box's four vertical edges: between a ±X face and a ±Y face.
+fn vertical_edges() -> EdgeQuery {
+    let mut any = Vec::new();
+    for x in [X, neg(X)] {
+        for y in [Y, neg(Y)] {
+            any.push(EdgeQuery::BetweenFaces { a: x, b: y });
+        }
+    }
+    EdgeQuery::Or(any)
+}
+
+/// The rim of a hole of radius `r` along Z at (x, y), where it meets the top
+/// face.
+fn top_rim(x: f64, y: f64, r: f64) -> EdgeQuery {
+    EdgeQuery::OnCircle {
+        center: [x, y, H / 2.0],
+        axis: UP,
+        radius: r,
+    }
+}
+
+fn hole(k: &Kernel, r: f64) -> Result<Brep, Error> {
+    block(k)?.difference(Brep::cylinder(k, [0.0, 0.0, -H / 2.0], r, H)?)
+}
+
+/// A box with every edge and corner rounded by `r`: the inner box, slabs on
+/// its faces, quarter cylinders on its edges and sphere octants at its
+/// corners.
+fn rounded_box_volume(r: f64) -> f64 {
+    let (a, b, c) = (L - 2.0 * r, W - 2.0 * r, H - 2.0 * r);
+    a * b * c
+        + 2.0 * r * (a * b + b * c + c * a)
+        + PI * r * r * (a + b + c)
+        + 4.0 / 3.0 * PI * r.powi(3)
+}
+
+/// The material a 45° chamfer with legs `d` removes from the convex rim of a
+/// hole of radius `r`: a triangle of area d²/2 swept around the axis at the
+/// radius of its centroid, r + d/3 (Pappus).
+fn rim_chamfer_volume(r: f64, d: f64) -> f64 {
+    PI * d * d * (r + d / 3.0)
+}
+
+fn options() -> FilletOptions {
+    FilletOptions::default()
+}
+
+#[test]
+fn edge_queries_pick_by_geometry() {
+    let tol = Tolerance::default();
+    let counts = on_kernel(move |k| {
+        let block = block(k).unwrap();
+        let count = |q: EdgeQuery| block.count_edges(&q, &tol).unwrap();
+        let top = EdgeQuery::MidpointOnPlane {
+            point: [0.0, 0.0, H / 2.0],
+            normal: UP,
+        };
+        let bottom = EdgeQuery::InPlane {
+            point: [0.0, 0.0, -H / 2.0],
+            normal: neg(UP),
+        };
+        let box_counts = [
+            count(EdgeQuery::All),
+            count(EdgeQuery::Sharp {
+                min_angle_deg: 30.0,
+            }),
+            count(top.clone()),
+            count(bottom.clone()),
+            count(EdgeQuery::BetweenFaces { a: Z, b: X }),
+            count(EdgeQuery::BetweenFaces {
+                a: neg(Y),
+                b: neg(Z),
+            }),
+            count(vertical_edges()),
+            count(!top.clone().or(bottom.clone())),
+            count(top.and(EdgeQuery::BetweenFaces { a: Z, b: neg(X) })),
+        ];
+
+        let part = hole(k, 10.0).unwrap();
+        let edges = part.edges().unwrap();
+        let seams = edges
+            .iter()
+            .filter(|e| e.bend_deg().is_some_and(|b| b < 1.0))
+            .count();
+        let count = |q: EdgeQuery| part.count_edges(&q, &tol).unwrap();
+        let hole_counts = [
+            edges.len(),
+            seams,
+            count(EdgeQuery::Sharp {
+                min_angle_deg: 30.0,
+            }),
+            count(top_rim(0.0, 0.0, 10.0)),
+            count(top_rim(0.0, 0.0, 10.5)),
+            count(EdgeQuery::OnCircle {
+                center: [0.0, 0.0, -H / 2.0],
+                axis: neg(UP),
+                radius: 10.0,
+            }),
+        ];
+        (box_counts, hole_counts, edges)
+    });
+    let (box_counts, [hole_edges, seams, sharp, rim, wrong_rim, bottom_rim], edges) = counts;
+    println!(
+        "box picks {box_counts:?}; hole: {hole_edges} edges, {seams} seams, {sharp} sharp, rim {rim}"
+    );
+    assert_eq!(box_counts, [12, 12, 4, 4, 1, 1, 4, 4, 1]);
+    assert!(seams >= 1, "the hole's cylinder should have a seam");
+    assert_eq!(sharp, hole_edges - seams, "seams aren't sharp");
+    assert!(rim >= 1, "the top rim");
+    assert_eq!(wrong_rim, 0, "a circle 0.5 mm too wide picks nothing");
+    assert_eq!(bottom_rim, rim, "top and bottom rims split alike");
+    for edge in &edges {
+        assert_eq!(edge.use_count, 2);
+        assert!(edge.length > 0.0);
+        for n in edge.normals.iter().flatten() {
+            assert!(
+                (dot(*n, *n).sqrt() - 1.0).abs() < 1e-9,
+                "normal {n:?} isn't unit length"
+            );
+        }
+    }
+}
+
+#[test]
+fn filleted_box() {
+    let r = 8.0;
+    let built = build(move |k| {
+        let block = block(k)?;
+        assert_eq!(
+            block.count_edges(
+                &EdgeQuery::Sharp {
+                    min_angle_deg: 30.0
+                },
+                &Tolerance::default()
+            )?,
+            12
+        );
+        block.fillet(
+            &[EdgeBlend::round(
+                EdgeQuery::Sharp {
+                    min_angle_deg: 30.0,
+                },
+                r,
+            )],
+            &options(),
+        )
+    });
+    assert!(built.manifold);
+    assert_volume("filleted box", built.volume, rounded_box_volume(r));
+    assert_mesh("filleted box", &built);
+    println!("filleted box surfaces: {:?}", surface_kinds(&built.mesh));
+    assert_eq!(
+        built.brep_faces,
+        6 + 12 + 8,
+        "6 faces, 12 edge fillets, 8 corners"
+    );
+}
+
+#[test]
+fn filleted_box_across_radii() {
+    for r in [0.5, 2.0, 5.0, 12.0, 19.0] {
+        let built =
+            build(move |k| block(k)?.fillet(&[EdgeBlend::round(EdgeQuery::All, r)], &options()));
+        let name = format!("filleted box r={r}");
+        assert!(built.manifold, "{name}");
+        assert_volume(&name, built.volume, rounded_box_volume(r));
+        assert_mesh(&name, &built);
+    }
+}
+
+#[test]
+fn chamfered_hole_rim() {
+    // A linear section: a 45° chamfer with legs equal to the radius.
+    let r = 10.0;
+    for d in [0.5, 1.0, 2.0, 3.0, 4.0, 6.0] {
+        let built = build(move |k| {
+            hole(k, r)?.fillet(&[EdgeBlend::linear(top_rim(0.0, 0.0, r), d)], &options())
+        });
+        let name = format!("chamfered rim d={d}");
+        assert!(built.manifold, "{name}");
+        assert_volume(
+            &name,
+            built.volume,
+            BOX_VOLUME - PI * r * r * H - rim_chamfer_volume(r, d),
+        );
+        assert_mesh(&name, &built);
+        assert_eq!(
+            built.brep_faces, 8,
+            "{name}: the hole's 7 faces and the chamfer"
+        );
+    }
+}
+
+#[test]
+fn chamfered_hole_off_centre() {
+    let (x, y, r, d) = (25.0, -12.0, 6.0, 2.0);
+    let built = build(move |k| {
+        let part = block(k)?.difference(Brep::cylinder(k, [x, y, -H / 2.0], r, H)?)?;
+        part.fillet(&[EdgeBlend::linear(top_rim(x, y, r), d)], &options())
+    });
+    assert!(built.manifold);
+    let expected = BOX_VOLUME - PI * r * r * H - rim_chamfer_volume(r, d);
+    assert_volume("off-centre chamfered rim", built.volume, expected);
+    assert_mesh("off-centre chamfered rim", &built);
+}
+
+#[test]
+fn rounded_hole_rim() {
+    // A round removes the spandrel between the corner and the arc, area
+    // (1 − π/4)·d², whose centroid sits (10 − 3π) / (12 − 3π)·d from each
+    // face.
+    let (r, d) = (10.0, 3.0);
+    let built = build(move |k| {
+        hole(k, r)?.fillet(&[EdgeBlend::round(top_rim(0.0, 0.0, r), d)], &options())
+    });
+    let spandrel = (1.0 - PI / 4.0) * d * d;
+    let centroid = r + (10.0 - 3.0 * PI) / (12.0 - 3.0 * PI) * d;
+    assert!(built.manifold);
+    assert_volume(
+        "rounded rim",
+        built.volume,
+        BOX_VOLUME - PI * r * r * H - 2.0 * PI * centroid * spandrel,
+    );
+    assert_mesh("rounded rim", &built);
+}
+
+#[test]
+fn constant_width_chamfer_on_a_circle() {
+    // SmApiChamferFillet's solver handles small rims, but from about d = 2.5
+    // to 4 on this one it reports success and leaves an open shell. The shim
+    // turns that into an error rather than hand back a broken solid.
+    let r = 10.0;
+    for d in [1.0, 2.0] {
+        let built = build(move |k| {
+            hole(k, r)?.chamfer(
+                &top_rim(0.0, 0.0, r),
+                d * 2f64.sqrt(),
+                &Tolerance::default(),
+            )
+        });
+        let name = format!("constant-width rim d={d}");
+        assert!(built.manifold, "{name}");
+        assert_volume(
+            &name,
+            built.volume,
+            BOX_VOLUME - PI * r * r * H - rim_chamfer_volume(r, d),
+        );
+        assert_mesh(&name, &built);
+    }
+    let error = on_kernel(move |k| {
+        hole(k, r)
+            .unwrap()
+            .chamfer(
+                &top_rim(0.0, 0.0, r),
+                3.0 * 2f64.sqrt(),
+                &Tolerance::default(),
+            )
+            .map(|_| ())
+            .unwrap_err()
+    });
+    println!("constant-width rim d=3: {error}");
+    assert!(
+        matches!(error, Error::Kernel { status, .. } if status.name() == Some("SHIM_ERR_BROKE_SOLID")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn per_edge_radii_and_sections() {
+    // Vertical edges only, so no corner joins three fillets and the volume is
+    // exact: two rounds of 5 and two flat cuts set back 4.
+    let (round, flat) = (5.0, 4.0);
+    let plus_x = EdgeQuery::Or(vec![
+        EdgeQuery::BetweenFaces { a: X, b: Y },
+        EdgeQuery::BetweenFaces { a: X, b: neg(Y) },
+    ]);
+    let built = build(move |k| {
+        block(k)?.fillet(
+            &[
+                EdgeBlend::round(plus_x, round),
+                EdgeBlend::linear(vertical_edges(), flat),
+            ],
+            &options(),
+        )
+    });
+    let expected =
+        BOX_VOLUME - 2.0 * (1.0 - PI / 4.0) * round * round * H - 2.0 * flat * flat / 2.0 * H;
+    assert!(built.manifold);
+    assert_volume("mixed vertical fillets", built.volume, expected);
+    assert_mesh("mixed vertical fillets", &built);
+    assert_eq!(built.brep_faces, 10);
+}
+
+#[test]
+fn blend_sections() {
+    let r = 6.0;
+    let flat = BOX_VOLUME - 4.0 * r * r / 2.0 * H;
+    let round = BOX_VOLUME - 4.0 * (1.0 - PI / 4.0) * r * r * H;
+    for continuity in [Continuity::G1, Continuity::G2, Continuity::G3] {
+        let built = build(move |k| {
+            let options = FilletOptions {
+                continuity,
+                ..options()
+            };
+            block(k)?.fillet(&[EdgeBlend::blend(vertical_edges(), r)], &options)
+        });
+        let name = format!("{continuity:?} blend");
+        assert!(built.manifold, "{name}");
+        println!(
+            "{name}: volume {:.1}; flat {flat:.1}, round {round:.1}",
+            built.volume
+        );
+        // A blend between the same lines bulges past the flat cut.
+        assert!(
+            built.volume > flat && built.volume < BOX_VOLUME,
+            "{name}: {}",
+            built.volume
+        );
+        assert_mesh(&name, &built);
+    }
+}
+
+#[test]
+fn chamfered_box_edges() {
+    let w = 4.0;
+    // Vertical edges: each loses a right triangle with legs w/√2.
+    let built = build(move |k| block(k)?.chamfer(&vertical_edges(), w, &Tolerance::default()));
+    assert!(built.manifold);
+    assert_volume(
+        "chamfered vertical edges",
+        built.volume,
+        BOX_VOLUME - 4.0 * w * w / 4.0 * H,
+    );
+    assert_mesh("chamfered vertical edges", &built);
+
+    // Every edge, with beveled corners. Each edge's prism is w²/4 in section;
+    // summed over full edge lengths they overcount the corners.
+    let built = build(move |k| block(k)?.chamfer(&EdgeQuery::All, w, &Tolerance::default()));
+    assert!(built.manifold);
+    let prisms = w * w / 4.0 * 4.0 * (L + W + H);
+    println!(
+        "chamfered box: volume {:.1}, faces {}",
+        built.volume, built.brep_faces
+    );
+    assert!(
+        built.volume > BOX_VOLUME - prisms && built.volume < BOX_VOLUME - 4.0 * w * w / 4.0 * H
+    );
+    assert_mesh("chamfered box", &built);
+}
+
+#[test]
+fn rejects_bad_fillets() {
+    let results = on_kernel(|k| {
+        let tol = Tolerance::default();
+        let nowhere = EdgeQuery::MidpointOnPlane {
+            point: [0.0, 0.0, 100.0],
+            normal: UP,
+        };
+        let no_normal = EdgeQuery::BetweenFaces { a: [0.0; 3], b: X };
+        [
+            block(k)
+                .unwrap()
+                .fillet(&[EdgeBlend::round(nowhere.clone(), 2.0)], &options()),
+            block(k)
+                .unwrap()
+                .fillet(&[EdgeBlend::round(EdgeQuery::All, f64::NAN)], &options()),
+            block(k)
+                .unwrap()
+                .fillet(&[EdgeBlend::round(no_normal, 2.0)], &options()),
+            block(k).unwrap().fillet(&[], &options()),
+            block(k).unwrap().chamfer(&nowhere, 2.0, &tol),
+            block(k).unwrap().chamfer(&EdgeQuery::All, -1.0, &tol),
+        ]
+        .map(|r| r.map(|_| ()).unwrap_err())
+    });
+    for error in results {
+        assert!(matches!(error, Error::InvalidArgument { .. }), "{error:?}");
+    }
+}
+
+#[test]
+fn oversized_fillet_fails_cleanly() {
+    // Radius 25 can't fit the 40 mm height: the kernel either refuses or
+    // returns something that isn't a valid solid. Either way, no crash, and
+    // the kernel keeps working.
+    let outcome = on_kernel(|k| {
+        match block(k)
+            .unwrap()
+            .fillet(&[EdgeBlend::round(EdgeQuery::All, 25.0)], &options())
+        {
+            Err(error) => format!("refused: {error}"),
+            Ok(brep) => format!("returned; manifold {:?}", brep.is_manifold()),
+        }
+    });
+    println!("radius 25 on a 40 mm box: {outcome}");
+    let built = build(block);
+    assert_volume("box after a failed fillet", built.volume, BOX_VOLUME);
 }

@@ -3,10 +3,34 @@
 - `smlib-sys`: builds SMLib (`source/SMLib`) and SM_API (`source/SM_API`) with
   the `cc` crate, plus a C shim (`smlib-sys/shim`), and exposes the shim through
   committed bindgen bindings.
-- `smlib`: the safe API. `Kernel`, `Brep` (primitives, booleans, volume,
-  manifold check) and `Mesh`, a tessellation that keeps its links to the B-rep:
-  per-triangle face ids, per-vertex surface (u, v), per-face surface
-  parameters and per-edge polylines.
+- `smlib`: the safe API. `Kernel`, `Brep` (primitives, booleans, fillets,
+  chamfers, volume, manifold check) and `Mesh`, a tessellation that keeps its
+  links to the B-rep: per-triangle face ids, per-vertex surface (u, v),
+  per-face surface parameters and per-edge polylines.
+
+## Fillets and chamfers
+
+Edges are picked by geometric query, never by index, since indices change
+with every operation. An `EdgeQuery` tests each edge's `EdgeGeometry`
+(sample points, length, and the adjacent faces' outward normals at its
+midpoint): `MidpointOnPlane`, `InPlane`, `OnCircle`, `BetweenFaces` (by
+normals), `Sharp` (by the angle between normals), and `And` / `Or` / `Not`.
+
+- `Brep::fillet` wraps `SmApiFilletEdgesPerEdge`: each `EdgeBlend` gives its
+  edges a radius and a circular, linear or blend cross-section;
+  `FilletOptions` sets G1/G2/G3 continuity for blends. A linear section is a
+  chamfer set back by the radius on each face of a 90° edge, and is the
+  reliable way to chamfer curved edges.
+- `Brep::chamfer` is `SmApiChamferFillet` restricted to the picked edges: a
+  constant chamfer width with beveled corners. It's fine on straight edges
+  but not on circles (see `PATCHES.md`).
+- Both consume the brep and fail with `SHIM_ERR_BROKE_SOLID` when a manifold
+  solid comes back non-manifold, which the kernel can do while reporting
+  success.
+- There is no undo: `SmApiRemoveFillet` is a no-op (`KNOWN_ISSUES.md`), so
+  rebuild from the unfilleted solid. The default 15° surface angle avoids
+  the inside-out triangles next to fillets listed there; the tests check
+  every triangle's winding.
 
 ```sh
 cargo test -p smlib

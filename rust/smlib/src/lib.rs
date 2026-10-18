@@ -6,17 +6,23 @@
 //! [`Kernel`] handle. Neither type is `Send` or `Sync`, so no kernel object can
 //! leave that thread. Tessellation output ([`Mesh`]) is plain data and can.
 //!
+//! Fillets and chamfers ([`Brep::fillet`], [`Brep::chamfer`]) pick their
+//! edges with an [`EdgeQuery`], a geometric test, never by index.
+//!
 //! The kernel is unit-agnostic; lengths are in whatever unit the model uses.
 //! The [`TessellationParams`] defaults assume millimetres.
 //!
 //! ```no_run
-//! use smlib::{Brep, Kernel, TessellationParams};
+//! use smlib::{Brep, EdgeBlend, EdgeQuery, FilletOptions, Kernel, TessellationParams};
 //!
 //! let kernel = Kernel::init()?;
 //! let block = Brep::cuboid(&kernel, [-50.0, -30.0, -20.0], [100.0, 60.0, 40.0])?;
 //! let pin = Brep::cylinder(&kernel, [0.0, 0.0, -25.0], 10.0, 50.0)?;
 //! let part = block.difference(pin)?;
 //! assert!(part.is_manifold()?);
+//! // Round every sharp edge of the part, including the hole's rims.
+//! let sharp = EdgeQuery::Sharp { min_angle_deg: 30.0 };
+//! let part = part.fillet(&[EdgeBlend::round(sharp, 2.0)], &FilletOptions::default())?;
 //! let mesh = part.tessellate(&TessellationParams::default())?;
 //! println!("{} triangles over {} faces", mesh.triangle_count(), mesh.faces.len());
 //! # Ok::<(), smlib::Error>(())
@@ -26,11 +32,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod brep;
+mod edges;
 mod error;
+mod fillet;
 mod kernel;
 mod mesh;
 
 pub use brep::Brep;
+pub use edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 pub use error::{Error, Status};
+pub use fillet::{Continuity, CrossSection, EdgeBlend, FilletOptions};
 pub use kernel::Kernel;
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};

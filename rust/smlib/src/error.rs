@@ -53,6 +53,9 @@ impl Status {
             2003 => "SHIM_ERR_OUT_OF_MEMORY",
             2004 => "SHIM_ERR_UNMAPPED_FACE",
             2005 => "SHIM_ERR_UNSUPPORTED_POLYGON",
+            2006 => "SHIM_ERR_BAD_EDGE",
+            2007 => "SHIM_ERR_BAD_FILLET",
+            2008 => "SHIM_ERR_BROKE_SOLID",
             _ => return None,
         })
     }

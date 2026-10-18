@@ -13,9 +13,11 @@
 #include <vector>
 
 #include <SmApiBrep.h>
+#include <SmApiCurves.h>
 #include <SmApiGeneral.h>
 #include <SmApiPrimitives.h>
 #include <SmApiQueries.h>
+#include <SmApiSurfaces.h>
 
 #include <SmAxis2Placement.h>
 #include <SmBSplineSurface.h>
@@ -25,6 +27,11 @@
 #include <SmEdge.h>
 #include <SmEdgeuse.h>
 #include <SmFace.h>
+#include <SmFaceuse.h>
+#include <SmFilletCorner.h>
+#include <SmFilletExecutive.h>
+#include <SmFilletSolver.h>
+#include <SmFilletStandardSolver.h>
 #include <SmPlane.h>
 #include <SmPoly.h>
 #include <SmSphere.h>
@@ -219,36 +226,58 @@ sm_status build_triangles(SmPolyBrep& poly, const std::unordered_map<const SmFac
     return SM_SUCCESS;
 }
 
-sm_status build_edges(SmBrep& brep, double angle_tol_deg, const std::unordered_map<const SmFace*, uint32_t>& face_index,
-                      sm_mesh& mesh) {
+using FaceIndex = std::unordered_map<const SmFace*, uint32_t>;
+
+FaceIndex index_faces(const SmBrep& brep) {
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    FaceIndex face_index;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) face_index.emplace(faces[i], static_cast<uint32_t>(i));
+    return face_index;
+}
+
+// The faces an edge joins: the first two, and how many faces use it.
+struct EdgeFaces {
+    SmFace* faces[2] = {nullptr, nullptr};
+    uint32_t use_count = 0;
+};
+
+EdgeFaces faces_of(const SmEdge* edge) {
+    EdgeFaces result;
+    SmTArray<SmEdgeuse*> uses;
+    edge->GetEdgeuses(uses);
+    // Each use of the edge by a face comes as an edgeuse and its mate, one
+    // per side of the face; count each pair once. A seam is used twice by
+    // the same face.
+    std::vector<const SmEdgeuse*> counted;
+    for (ULONG j = 0; j < uses.GetSize(); ++j) {
+        const SmEdgeuse* use = uses[j];
+        if (std::find(counted.begin(), counted.end(), use->GetMate()) != counted.end()) continue;
+        counted.push_back(use);
+        if (counted.size() <= 2) result.faces[counted.size() - 1] = use->GetFace();
+    }
+    result.use_count = static_cast<uint32_t>(counted.size());
+    return result;
+}
+
+int32_t face_id(const FaceIndex& face_index, const SmFace* face) {
+    const auto found = face_index.find(face);
+    return found == face_index.end() ? -1 : static_cast<int32_t>(found->second);
+}
+
+sm_status build_edges(SmBrep& brep, double angle_tol_deg, const FaceIndex& face_index, sm_mesh& mesh) {
     SmTArray<SmEdge*> edges;
     brep.GetEdges(edges);
     std::unordered_map<const SmEdge*, size_t> edge_index;
     mesh.edges.resize(edges.GetSize());
-    SmTArray<SmEdgeuse*> uses;
     for (ULONG i = 0; i < edges.GetSize(); ++i) {
         edge_index.emplace(edges[i], i);
         sm_edge_info& info = mesh.edges[i];
         std::memset(&info, 0, sizeof info);
-        info.face_a = -1;
-        info.face_b = -1;
-        uses.RemoveAll();
-        edges[i]->GetEdgeuses(uses);
-        // Each use of the edge by a face comes as an edgeuse and its mate, one
-        // per side of the face; count each pair once. A seam is used twice by
-        // the same face.
-        std::vector<const SmEdgeuse*> counted;
-        for (ULONG j = 0; j < uses.GetSize(); ++j) {
-            const SmEdgeuse* use = uses[j];
-            if (std::find(counted.begin(), counted.end(), use->GetMate()) != counted.end()) continue;
-            counted.push_back(use);
-            if (counted.size() <= 2) {
-                const auto found = face_index.find(use->GetFace());
-                const int32_t face = found == face_index.end() ? -1 : static_cast<int32_t>(found->second);
-                (counted.size() == 1 ? info.face_a : info.face_b) = face;
-            }
-        }
-        info.use_count = static_cast<uint32_t>(counted.size());
+        const EdgeFaces faces = faces_of(edges[i]);
+        info.face_a = faces.faces[0] ? face_id(face_index, faces.faces[0]) : -1;
+        info.face_b = faces.faces[1] ? face_id(face_index, faces.faces[1]) : -1;
+        info.use_count = faces.use_count;
     }
 
     SmTArray<SmPoint3d> points;
@@ -275,6 +304,121 @@ sm_status build_edges(SmBrep& brep, double angle_tol_deg, const std::unordered_m
         }
     }
     return SM_SUCCESS;
+}
+
+// The face's outward unit normal at the point on it nearest `near`, as
+// usd_brep's Face.outward_normal_at_uv orients it: the surface normal,
+// flipped when the face's upward faceuse isn't in the infinite region.
+bool outward_normal(const SmFace* face, const SmPoint3d& near, double out[3]) {
+    const SmSurface* surface = face->GetSurface();
+    if (!surface) return false;
+    SmPoint3d closest;
+    SmTArray<SmPoint2d> uvs;
+    double distance = 0.0;
+    if (SmApiSurfaceClosestPoint(surface, near, closest, uvs, distance) != SM_SUCCESS || uvs.GetSize() == 0) {
+        return false;
+    }
+    SmVector3d normal;
+    if (SmApiEvaluateSurfaceNormal(surface, SmVector2d(uvs[0].x, uvs[0].y), normal) != SM_SUCCESS) return false;
+    const SmBrep* brep = face->GetBrep();
+    const SmFaceuse* upward = face->GetUpwardFaceuse();
+    if (brep && upward && upward->GetShell() && brep->GetInfiniteRegion() != upward->GetShell()->GetRegion()) {
+        normal *= -1.0;
+    }
+    put3(out, normal);
+    return true;
+}
+
+sm_status describe_edge(const SmEdge* edge, const FaceIndex& face_index, sm_edge_geometry& info) {
+    std::memset(&info, 0, sizeof info);
+    double t0 = 0.0;
+    double t1 = 0.0;
+    SmApiStatus status = SmApiEdgeParameterRange(edge, t0, t1);
+    if (status != SM_SUCCESS) return status;
+    for (int k = 0; k < SM_EDGE_SAMPLES; ++k) {
+        SmVector3d point;
+        SmVector3d* point_out = &point;
+        SmVector3d* no_derivative = nullptr;
+        SmVector3d* no_second = nullptr;
+        const double t = t0 + (t1 - t0) * k / (SM_EDGE_SAMPLES - 1);
+        status = SmApiEvaluateCurve(edge->GetCurve(), t, point_out, no_derivative, no_second);
+        if (status != SM_SUCCESS) return status;
+        put3(info.points[k], point);
+    }
+    status = SmApiEdgeComputeLength(edge, 1e-9, info.length);
+    if (status != SM_SUCCESS) return status;
+
+    const EdgeFaces faces = faces_of(edge);
+    info.use_count = faces.use_count;
+    const double* mid = info.points[SM_EDGE_SAMPLES / 2];
+    const SmPoint3d midpoint(mid[0], mid[1], mid[2]);
+    int32_t* ids[2] = {&info.face_a, &info.face_b};
+    double* normals[2] = {info.normal_a, info.normal_b};
+    for (int side = 0; side < 2; ++side) {
+        const SmFace* face = faces.faces[side];
+        *ids[side] = face ? face_id(face_index, face) : -1;
+        if (face && !outward_normal(face, midpoint, normals[side])) {
+            normals[side][0] = normals[side][1] = normals[side][2] = 0.0;
+        }
+    }
+    return SM_SUCCESS;
+}
+
+bool is_manifold_solid(const SmBrep& brep) {
+    SmBoolean manifold = FALSE;
+    return SmApiBrepIsManifoldSolid(&brep, manifold) == SM_SUCCESS && manifold;
+}
+
+// Runs a fillet operation and holds the kernel to its word: some report
+// success yet leave a manifold solid open (see sm_brep_chamfer_edges).
+template <typename F>
+sm_status keeping_solid(SmBrep& brep, F&& fillet) {
+    const bool was_solid = is_manifold_solid(brep);
+    const sm_status status = fillet();
+    if (status != SM_SUCCESS) return status;
+    if (was_solid && !is_manifold_solid(brep)) return SM_SHIM_ERR_BROKE_SOLID;
+    return SM_SUCCESS;
+}
+
+// Resolves edge indices into the brep's current edge list. Repeats are
+// rejected: the kernel would fillet the edge twice.
+sm_status edges_at(SmBrep& brep, const uint32_t* indices, size_t count, SmTArray<SmEdge*>& out) {
+    SmTArray<SmEdge*> all;
+    brep.GetEdges(all);
+    std::vector<bool> taken(all.GetSize(), false);
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t index = indices[i];
+        if (index >= all.GetSize() || taken[index]) return SM_SHIM_ERR_BAD_EDGE;
+        taken[index] = true;
+        out.Add(all[index]);
+    }
+    return SM_SUCCESS;
+}
+
+// SmApiChamferFillet's set-up, loading solvers for the picked edges only.
+// The executive deletes the solvers; the generator and the self-intersection
+// handler only need to outlive it.
+sm_status chamfer(SmBrep& target, SmTArray<SmEdge*>& picked, double width) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    SmLinearCrossSectionFSG linear;
+    SmMakeSurfaceBlendSIH self_intersections(1.0);
+    SmFilletExecutive executive(*context, &target);
+    executive.SetSelfIntersectionHandler(&self_intersections);
+    executive.SetDoGlobalMerge(TRUE);
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        SmEdgeuse* use = picked[i]->GetBlendEdgeuse();
+        if (!use) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+        SmFilletSolver* solver = new (*context) SmConstantDistanceFS(
+            *context, target.GetTolerance(), 30.0 * SM_PI / 180.0, 2.0 * SM_PI / 180.0, width, use);
+        solver->SetFilletSurfaceGenerator(&linear);
+        const SmStatus loaded = executive.LoadFilletSolver(solver);
+        if (loaded != SM_SUCCESS) return static_cast<sm_status>(loaded);
+    }
+    SmStatus result = executive.CreateFilletCorners();
+    if (result != SM_SUCCESS) return static_cast<sm_status>(result);
+    SmTArray<SmFilletCorner*>& corners = executive.GetFilletCorners();
+    for (ULONG i = 0; i < corners.GetSize(); ++i) corners[i]->SetBevel(TRUE);
+    return static_cast<sm_status>(executive.DoFilleting());
 }
 
 }  // namespace
@@ -379,6 +523,66 @@ void sm_brep_free(sm_brep* brep) {
         delete brep_of(brep);
     } catch (...) {
     }
+}
+
+sm_status sm_brep_edge_geometry(const sm_brep* brep, sm_edge_geometry* out, size_t capacity, size_t* count) {
+    if (!brep || !count || (capacity > 0 && !out)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        const SmBrep* source = brep_of(brep);
+        SmTArray<SmEdge*> edges;
+        source->GetEdges(edges);
+        const FaceIndex face_index = index_faces(*source);
+        const size_t written = std::min(capacity, static_cast<size_t>(edges.GetSize()));
+        for (size_t i = 0; i < written; ++i) {
+            const sm_status status = describe_edge(edges[static_cast<ULONG>(i)], face_index, out[i]);
+            if (status != SM_SUCCESS) return status;
+        }
+        *count = edges.GetSize();
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_fillet_edges(sm_brep* brep, const uint32_t* edges, const double* radii, const int32_t* sections,
+                               size_t count, uint32_t continuity, double thumbweight) {
+    if (!brep || (count > 0 && (!edges || !radii || !sections))) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (continuity < 1 || continuity > 3 || !(thumbweight > 0.0) || !std::isfinite(thumbweight)) {
+        return SM_SHIM_ERR_BAD_FILLET;
+    }
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmTArray<SmEdge*> picked;
+        sm_status status = edges_at(*target, edges, count, picked);
+        if (status != SM_SUCCESS) return status;
+        SmTArray<double> radius_values;
+        SmTArray<SmFilletSurfaceGeneratorType> section_types;
+        for (size_t i = 0; i < count; ++i) {
+            if (!(radii[i] > 0.0) || !std::isfinite(radii[i])) return SM_SHIM_ERR_BAD_FILLET;
+            radius_values.Add(radii[i]);
+            switch (sections[i]) {
+                case SM_FILLET_LINEAR: section_types.Add(SM_FSG_LINEAR); break;
+                case SM_FILLET_CIRCULAR: section_types.Add(SM_FSG_CIRCULAR); break;
+                case SM_FILLET_BLEND: section_types.Add(SM_FSG_BLEND_CURVE); break;
+                default: return SM_SHIM_ERR_BAD_FILLET;
+            }
+        }
+        return keeping_solid(*target, [&] {
+            return static_cast<sm_status>(
+                SmApiFilletEdgesPerEdge(target, picked, radius_values, section_types, continuity, thumbweight));
+        });
+    });
+}
+
+sm_status sm_brep_chamfer_edges(sm_brep* brep, const uint32_t* edges, size_t count, double width) {
+    if (!brep || (count > 0 && !edges)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!(width > 0.0) || !std::isfinite(width)) return SM_SHIM_ERR_BAD_FILLET;
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmTArray<SmEdge*> picked;
+        const sm_status status = edges_at(*target, edges, count, picked);
+        if (status != SM_SUCCESS) return status;
+        if (picked.GetSize() == 0) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+        return keeping_solid(*target, [&] { return chamfer(*target, picked, width); });
+    });
 }
 
 sm_status sm_brep_tessellate(sm_brep* brep, const sm_tessellation_params* params, sm_mesh** out) {

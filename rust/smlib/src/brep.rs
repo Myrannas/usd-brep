@@ -5,7 +5,9 @@ use std::ptr::{self, NonNull};
 
 use smlib_sys as sys;
 
+use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
+use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::kernel::Kernel;
 use crate::mesh::{Mesh, TessellationParams};
 
@@ -185,6 +187,155 @@ impl Brep {
         (faces, edges)
     }
 
+    /// The geometry of every edge, in the brep's edge order, for seeing what
+    /// an [`EdgeQuery`] will pick.
+    pub fn edges(&self) -> Result<Vec<EdgeGeometry>, Error> {
+        const OP: &str = "sm_brep_edge_geometry";
+        let mut raw = vec![EMPTY_EDGE; self.edge_count()];
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; raw has room for
+        // raw.len() edges.
+        let status = unsafe {
+            sys::sm_brep_edge_geometry(self.raw.as_ptr(), raw.as_mut_ptr(), raw.len(), &mut count)
+        };
+        Error::check(OP, status)?;
+        raw.truncate(count);
+        Ok(raw.iter().map(EdgeGeometry::from_raw).collect())
+    }
+
+    /// How many edges `query` picks.
+    pub fn count_edges(&self, query: &EdgeQuery, tolerance: &Tolerance) -> Result<usize, Error> {
+        check_query("EdgeQuery", query)?;
+        Ok(self
+            .edges()?
+            .iter()
+            .filter(|edge| query.matches(edge, tolerance))
+            .count())
+    }
+
+    /// Fillets edges picked by geometric queries
+    /// (`SmApiFilletEdgesPerEdge`), each group with its own radius and
+    /// cross-section.
+    ///
+    /// Every query must pick at least one edge. An edge picked by more than
+    /// one blend takes the first. A manifold solid that the kernel leaves
+    /// non-manifold is an error (`SHIM_ERR_BROKE_SOLID`), even when the kernel
+    /// reports success.
+    ///
+    /// The brep is consumed: on failure the kernel may have half-modified it,
+    /// so it is dropped. There is no undo; the kernel's `SmApiRemoveFillet`
+    /// does nothing (KNOWN_ISSUES.md), so rebuild from the unfilleted solid
+    /// instead.
+    pub fn fillet(self, blends: &[EdgeBlend], options: &FilletOptions) -> Result<Brep, Error> {
+        const OP: &str = "SmApiFilletEdgesPerEdge";
+        if blends.is_empty() {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "no edges to fillet",
+            });
+        }
+        for blend in blends {
+            check_query(OP, &blend.edges)?;
+            check_positive(
+                OP,
+                blend.radius,
+                "fillet radius must be finite and positive",
+            )?;
+        }
+        check_positive(
+            OP,
+            options.thumbweight,
+            "thumbweight must be finite and positive",
+        )?;
+        let picked = self.pick(OP, blends.iter().map(|b| &b.edges), &options.tolerance)?;
+        let indices: Vec<u32> = picked.iter().map(|&(edge, _)| edge).collect();
+        let radii: Vec<f64> = picked.iter().map(|&(_, b)| blends[b].radius).collect();
+        let sections: Vec<i32> = picked
+            .iter()
+            .map(|&(_, b)| blends[b].section.to_raw())
+            .collect();
+        // SAFETY: self is a live brep on the kernel thread; the three arrays
+        // each hold indices.len() elements.
+        let status = unsafe {
+            sys::sm_brep_fillet_edges(
+                self.raw.as_ptr(),
+                indices.as_ptr(),
+                radii.as_ptr(),
+                sections.as_ptr(),
+                indices.len(),
+                options.continuity as u32,
+                options.thumbweight,
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(self)
+    }
+
+    /// Chamfers the edges `query` picks with a flat face `width` across, as
+    /// `SmApiChamferFillet` does for every edge: a 90° edge is set back by
+    /// `width / √2` on each face, and corners where chamfered edges meet are
+    /// beveled.
+    ///
+    /// The kernel's constant-width solver is reliable on straight edges but
+    /// not on circles: on the rim of a hole it can report success and leave
+    /// an open shell, which comes back here as `SHIM_ERR_BROKE_SOLID`. For a
+    /// chamfer on a curved edge, use [`fillet`](Brep::fillet) with
+    /// [`EdgeBlend::linear`](crate::EdgeBlend::linear).
+    ///
+    /// Consumed and dropped on failure, as [`fillet`](Brep::fillet).
+    pub fn chamfer(
+        self,
+        query: &EdgeQuery,
+        width: f64,
+        tolerance: &Tolerance,
+    ) -> Result<Brep, Error> {
+        const OP: &str = "SmApiChamferFillet";
+        check_query(OP, query)?;
+        check_positive(OP, width, "chamfer width must be finite and positive")?;
+        let picked = self.pick(OP, [query], tolerance)?;
+        let indices: Vec<u32> = picked.iter().map(|&(edge, _)| edge).collect();
+        // SAFETY: self is a live brep on the kernel thread; indices holds
+        // indices.len() elements.
+        let status = unsafe {
+            sys::sm_brep_chamfer_edges(self.raw.as_ptr(), indices.as_ptr(), indices.len(), width)
+        };
+        Error::check(OP, status)?;
+        Ok(self)
+    }
+
+    /// Resolves queries to `(edge index, query index)` pairs, each edge going
+    /// to the first query that picks it. The indices are only good until the
+    /// brep changes, so they never leave this crate.
+    fn pick<'q>(
+        &self,
+        operation: &'static str,
+        queries: impl IntoIterator<Item = &'q EdgeQuery>,
+        tolerance: &Tolerance,
+    ) -> Result<Vec<(u32, usize)>, Error> {
+        let edges = self.edges()?;
+        let mut owner: Vec<Option<usize>> = vec![None; edges.len()];
+        for (q, query) in queries.into_iter().enumerate() {
+            let mut any = false;
+            for (edge, slot) in edges.iter().zip(&mut owner) {
+                if query.matches(edge, tolerance) {
+                    any = true;
+                    slot.get_or_insert(q);
+                }
+            }
+            if !any {
+                return Err(Error::InvalidArgument {
+                    operation,
+                    reason: "an edge query picks no edges",
+                });
+            }
+        }
+        Ok(owner
+            .iter()
+            .enumerate()
+            .filter_map(|(edge, q)| q.map(|q| (edge as u32, q)))
+            .collect())
+    }
+
     /// Tessellates the solid (`SmApiTessellate`) and samples its edges
     /// (`SmApiTessellateBoundaries`) into a [`Mesh`] that keeps its links to
     /// the brep's faces and edges.
@@ -230,6 +381,23 @@ impl fmt::Debug for Brep {
 
 fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
     sys::sm_vec3 { x, y, z }
+}
+
+const EMPTY_EDGE: sys::sm_edge_geometry = sys::sm_edge_geometry {
+    points: [[0.0; 3]; EDGE_SAMPLES],
+    length: 0.0,
+    face_a: -1,
+    face_b: -1,
+    use_count: 0,
+    normal_a: [0.0; 3],
+    normal_b: [0.0; 3],
+};
+
+fn check_query(operation: &'static str, query: &EdgeQuery) -> Result<(), Error> {
+    match query.problem() {
+        Some(reason) => Err(Error::InvalidArgument { operation, reason }),
+        None => Ok(()),
+    }
 }
 
 fn check_point(operation: &'static str, point: [f64; 3]) -> Result<(), Error> {

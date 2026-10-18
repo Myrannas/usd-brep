@@ -24,3 +24,29 @@ tests pass against them.
   `SmCylinder`; the shim reports it as a cylinder via `SmCone::IsCylinder()`.
 - `SmApiCreateContext` is the only setup call needed; neither TBB nor USD is
   linked on macOS.
+
+## Notes from the fillet work (no patch needed)
+
+Fillets and chamfers needed no kernel changes either. What the shim works
+around:
+
+- `SmApiChamferFillet`'s constant-distance solver (`SmConstantDistanceFS`)
+  mis-trims circular edges. On the top rim of a 10 mm hole through a
+  100 × 60 × 40 box, widths of about 3.5 to 5.7 (legs 2.5 to 4) return
+  `SM_SUCCESS` but leave an open shell: the chamfer face is added, the
+  neighbouring faces aren't trimmed to it, and one rail comes back split into
+  dozens of unshared edges. Widths below and above that range work, and so
+  does every straight edge tried. Upstream's own `SmApiChamferFillet` on the
+  same part fails the same way; `StitchAndOrient()` doesn't repair it. A
+  linear cross-section through `SmApiFilletEdgesPerEdge` (constant radius)
+  chamfers the same rim correctly at every size.
+- Fillets can also report success on a broken result: radius 25 on every
+  edge of a 40 mm-high box returns `SM_SUCCESS` and a non-manifold brep. The
+  shim checks manifoldness before and after each fillet or chamfer and
+  returns `SM_SHIM_ERR_BROKE_SOLID` instead.
+- `SmApiFilletEdgesPerEdge` calls `SetDoGlobalMerge(TRUE)` before
+  `SetFilletParameters`, which resets it to `FALSE`, so global merge is off.
+  Circular sections take the per-edge branch, which uses a 0.1 arc
+  tolerance instead of the single-type branch's `dXSectTol`. Neither showed
+  up in the results: box fillets come out as exact cylinders and sphere
+  corners, with volumes within 1e-7 of analytic.
