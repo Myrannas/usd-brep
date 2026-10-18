@@ -11,7 +11,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
-use smlib::{BoundaryCurve, Brep, Error, Frame, Kernel, Label, PlaneCurve, SweptFace};
+use smlib::{BoundaryCurve, Brep, Error, Frame, Kernel, Label, PlaneCurve, Surface, SweptFace};
 
 type Job = Box<dyn FnOnce(&Kernel) + Send>;
 
@@ -84,8 +84,8 @@ struct Swept {
     edge_labels: Vec<Option<Label>>,
     edges_in_plane: bool,
     roles: Vec<SweptFace>,
-    /// Whether each side is planar, in the prism's face order.
-    planar_sides: Vec<bool>,
+    /// Each side's surface, in the prism's face order.
+    sides: Vec<Surface>,
     start: [f64; 3],
     end: [f64; 3],
     volume: f64,
@@ -111,12 +111,19 @@ fn sweep(loops: Vec<Vec<BoundaryCurve>>, frame: Frame, distance: f64) -> Swept {
             let index = swept.faces.iter().position(|r| *r == role).unwrap();
             swept.prism.face_centroid(index).unwrap().centroid
         };
-        let planar_sides = swept
+        let sides = swept
             .faces
             .iter()
             .zip(&prism_faces)
             .filter(|(role, _)| matches!(role, SweptFace::Side { .. }))
-            .map(|(_, face)| face.normal.is_some())
+            .map(|(_, face)| {
+                // A plane has a normal; nothing else does.
+                assert_eq!(
+                    face.normal.is_some(),
+                    matches!(face.surface, Surface::Plane { .. })
+                );
+                face.surface.clone()
+            })
             .collect();
         assert!(swept.prism.is_manifold().unwrap());
         Swept {
@@ -125,7 +132,7 @@ fn sweep(loops: Vec<Vec<BoundaryCurve>>, frame: Frame, distance: f64) -> Swept {
             area,
             edge_labels: edges.iter().map(|e| e.label.clone()).collect(),
             edges_in_plane,
-            planar_sides,
+            sides,
             start: centroid(SweptFace::Start),
             end: centroid(SweptFace::End),
             volume: swept.prism.volume(1e-9).unwrap(),
@@ -175,10 +182,15 @@ fn a_rectangle_with_a_hole_faces_its_frame_and_traces_its_sides() {
             assert_eq!(swept.roles.len(), 7);
             let traced: BTreeSet<u32> = side_labels(&swept).iter().map(|l| l.index).collect();
             assert_eq!(traced, (0..5).collect());
-            // The sweep makes every side a NURBS surface; the lines' are
-            // planar.
-            let planar = swept.planar_sides.iter().filter(|p| **p).count();
-            assert_eq!(planar, 4, "{:?}", swept.planar_sides);
+            // The lines sweep into planes and the circle into a cylinder
+            // round the hole, along the frame's z.
+            let planes = swept
+                .sides
+                .iter()
+                .filter(|s| matches!(s, Surface::Plane { .. }));
+            assert_eq!(planes.count(), 4, "{:?}", swept.sides);
+            let centre = frame.to_world([5.0, 0.0, 0.0]);
+            assert_cylinders(&swept.sides, &[(centre, 5.0)], frame.z_axis());
 
             // The end is `distance` along the frame's z from the start.
             let along = scale(frame.z_axis(), distance);
@@ -227,6 +239,14 @@ fn arcs_run_either_way() {
         assert!(close(swept.area, area), "{}", swept.area);
         let traced: BTreeSet<u32> = side_labels(&swept).iter().map(|l| l.index).collect();
         assert_eq!(traced, (0..4).collect());
+        // Two planes, and the ends round their centres.
+        let planes = swept
+            .sides
+            .iter()
+            .filter(|s| matches!(s, Surface::Plane { .. }));
+        assert_eq!(planes.count(), 2, "{:?}", swept.sides);
+        let ends = [([0.0; 3], 5.0), ([30.0, 0.0, 0.0], 5.0)];
+        assert_cylinders(&swept.sides, &ends, [0.0, 0.0, 1.0]);
         assert!(close(swept.volume, area * 4.0), "{}", swept.volume);
     }
 }
@@ -304,6 +324,39 @@ fn bad_loops_are_refused() {
             "{result:?}"
         );
     }
+}
+
+/// That the sides other than planes are cylinders along `axis`, one round
+/// each (centre, radius), in any order.
+fn assert_cylinders(sides: &[Surface], expected: &[([f64; 3], f64)], axis: [f64; 3]) {
+    let mut left = expected.to_vec();
+    for side in sides {
+        if matches!(side, Surface::Plane { .. }) {
+            continue;
+        }
+        let Surface::Cylinder {
+            origin,
+            axis: along,
+            radius,
+            ..
+        } = *side
+        else {
+            panic!("{side:?} isn't a plane or a cylinder");
+        };
+        assert!(1.0 - dot(along, axis).abs() < 1e-12, "{along:?}");
+        // The centre's distance from the axis.
+        let offset = |centre| {
+            let d = sub(centre, origin);
+            let d = sub(d, scale(along, dot(d, along)));
+            dot(d, d).sqrt()
+        };
+        let found = left
+            .iter()
+            .position(|&(centre, r)| offset(centre) < 1e-9 && (radius - r).abs() < 1e-9)
+            .unwrap_or_else(|| panic!("{side:?} isn't one of {left:?}"));
+        left.remove(found);
+    }
+    assert!(left.is_empty(), "no cylinders for {left:?}");
 }
 
 /// Within the accuracy areas and volumes are integrated to.

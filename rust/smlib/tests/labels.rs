@@ -397,6 +397,11 @@ fn sweeps_report_their_caps_and_sides() {
             };
             let edge = &source[source_edge.expect("every side has a source")];
             assert!(edge.face_labels.iter().flatten().any(|l| l.role == "+Z"));
+            assert!(
+                matches!(prism_faces[index].surface, Surface::Plane { .. }),
+                "{:?}",
+                prism_faces[index].surface
+            );
             let c = prism_faces[index].centroid;
             let mid = edge.midpoint();
             assert_near(
@@ -454,6 +459,18 @@ fn offsetting_a_face_between_rounds_keeps_every_face_single() {
         let sweep = part.sweep_face(top, 15.0).unwrap();
         let mut prism = sweep.prism;
         assert_eq!(sweep.faces.len(), 10, "two caps and eight sides");
+        // The caps and the sides above the walls are planes, and the sides
+        // above the rounds cylinders, as the walls and rounds are.
+        let mut sides: BTreeMap<&str, usize> = BTreeMap::new();
+        for face in prism.faces().unwrap() {
+            let kind = match face.surface {
+                Surface::Plane { .. } => "plane",
+                Surface::Cylinder { radius, .. } if (radius - 20.0).abs() < 1e-9 => "round",
+                _ => "other",
+            };
+            *sides.entry(kind).or_default() += 1;
+        }
+        assert_eq!(sides, BTreeMap::from([("plane", 6), ("round", 4)]));
         for (index, role) in sweep.faces.iter().enumerate() {
             // Sides take a newer feature's label, so merging leaves the
             // neighbours' labels in place.
