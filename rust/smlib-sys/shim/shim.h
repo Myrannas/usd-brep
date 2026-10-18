@@ -234,9 +234,9 @@ sm_status sm_brep_fillet_edges(sm_brep *brep, const uint32_t *edges, const doubl
  * as SmApiChamferFillet does for every edge: a constant-distance solver with
  * a flat cross-section, beveling corners where chamfered edges meet. width is
  * the distance across the chamfer face, so a 90-degree edge is set back by
- * width / sqrt(2) on each face. Failures are as for sm_brep_fillet_edges:
- * SM_SHIM_ERR_BROKE_SOLID catches the kernel chamfering some circular edges
- * into an open shell while reporting success. */
+ * width / sqrt(2) on each face. Unlike SmApiChamferFillet it leaves the
+ * executive's global merge off, which breaks chamfers on circular edges.
+ * Failures are as for sm_brep_fillet_edges. */
 sm_status sm_brep_chamfer_edges(sm_brep *brep, const uint32_t *edges, size_t count, double width);
 
 /* SmApiTessellate plus SmApiTessellateBoundaries, copied into an sm_mesh

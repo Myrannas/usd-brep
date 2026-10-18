@@ -19,11 +19,11 @@ normals), `Sharp` (by the angle between normals), and `And` / `Or` / `Not`.
 - `Brep::fillet` wraps `SmApiFilletEdgesPerEdge`: each `EdgeBlend` gives its
   edges a radius and a circular, linear or blend cross-section;
   `FilletOptions` sets G1/G2/G3 continuity for blends. A linear section is a
-  chamfer set back by the radius on each face of a 90° edge, and is the
-  reliable way to chamfer curved edges.
+  chamfer set back by the radius on each face of a 90° edge.
 - `Brep::chamfer` is `SmApiChamferFillet` restricted to the picked edges: a
-  constant chamfer width with beveled corners. It's fine on straight edges
-  but not on circles (see `PATCHES.md`).
+  constant chamfer width with beveled corners. It leaves the kernel's global
+  merge off, which `SmApiChamferFillet` turns on and which breaks chamfers on
+  circles (see `PATCHES.md`).
 - Both consume the brep and fail with `SHIM_ERR_BROKE_SOLID` when a manifold
   solid comes back non-manifold, which the kernel can do while reporting
   success.

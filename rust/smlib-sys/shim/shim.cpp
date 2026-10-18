@@ -398,13 +398,19 @@ sm_status edges_at(SmBrep& brep, const uint32_t* indices, size_t count, SmTArray
 // SmApiChamferFillet's set-up, loading solvers for the picked edges only.
 // The executive deletes the solvers; the generator and the self-intersection
 // handler only need to outlive it.
+//
+// Unlike SmApiChamferFillet, this leaves global merge off. The executive
+// already merges the chamfer in by topology insertion, and its header says
+// only one merge mode should be on; with both, a chamfer on a circular edge
+// can come back as an open shell. SmApiFilletEdgesPerEdge also ends up with
+// global merge off, since SetFilletParameters resets it. Corners that need
+// global merge turn it on themselves (SmFilletNx1Corner).
 sm_status chamfer(SmBrep& target, SmTArray<SmEdge*>& picked, double width) {
     const SmContext* context = SmApiGetOrCreateContext();
     SmLinearCrossSectionFSG linear;
     SmMakeSurfaceBlendSIH self_intersections(1.0);
     SmFilletExecutive executive(*context, &target);
     executive.SetSelfIntersectionHandler(&self_intersections);
-    executive.SetDoGlobalMerge(TRUE);
     for (ULONG i = 0; i < picked.GetSize(); ++i) {
         SmEdgeuse* use = picked[i]->GetBlendEdgeuse();
         if (!use) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);

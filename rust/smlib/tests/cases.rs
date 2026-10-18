@@ -560,43 +560,56 @@ fn rounded_hole_rim() {
 
 #[test]
 fn constant_width_chamfer_on_a_circle() {
-    // SmApiChamferFillet's solver handles small rims, but from about d = 2.5
-    // to 4 on this one it reports success and leaves an open shell. The shim
-    // turns that into an error rather than hand back a broken solid.
-    let r = 10.0;
-    for d in [1.0, 2.0] {
-        let built = build(move |k| {
-            hole(k, r)?.chamfer(
-                &top_rim(0.0, 0.0, r),
-                d * 2f64.sqrt(),
-                &Tolerance::default(),
-            )
-        });
-        let name = format!("constant-width rim d={d}");
-        assert!(built.manifold, "{name}");
-        assert_volume(
-            &name,
-            built.volume,
-            BOX_VOLUME - PI * r * r * H - rim_chamfer_volume(r, d),
-        );
-        assert_mesh(&name, &built);
+    // With SmApiChamferFillet's global merge on, legs of about 2.5 to 4 on
+    // the 10 mm rim (and 3 on the 20 mm one) came back as open shells. The
+    // shim leaves it off; every size should now be exact.
+    for (r, legs) in [
+        (10.0, &[0.5, 1.0, 2.0, 2.5, 3.0, 3.5, 4.0, 6.0][..]),
+        (20.0, &[3.0, 6.0][..]),
+    ] {
+        for &d in legs {
+            let built = build(move |k| {
+                hole(k, r)?.chamfer(
+                    &top_rim(0.0, 0.0, r),
+                    d * 2f64.sqrt(),
+                    &Tolerance::default(),
+                )
+            });
+            let name = format!("constant-width rim r={r} d={d}");
+            assert!(built.manifold, "{name}");
+            assert_volume(
+                &name,
+                built.volume,
+                BOX_VOLUME - PI * r * r * H - rim_chamfer_volume(r, d),
+            );
+            assert_mesh(&name, &built);
+            assert_eq!(built.brep_faces, 8, "{name}");
+        }
     }
-    let error = on_kernel(move |k| {
-        hole(k, r)
+}
+
+#[test]
+fn chamfer_too_big_to_fit_fails_cleanly() {
+    // A chamfer with legs of 3 on the top rim of a 2 mm boss would cut past
+    // the boss's whole side. The kernel refuses it; the kernel keeps working.
+    let error = on_kernel(|k| {
+        let part = block(k)
             .unwrap()
-            .chamfer(
-                &top_rim(0.0, 0.0, r),
-                3.0 * 2f64.sqrt(),
-                &Tolerance::default(),
-            )
+            .union(Brep::cylinder(k, [0.0, 0.0, H / 2.0], 12.0, 2.0).unwrap())
+            .unwrap();
+        let rim = EdgeQuery::OnCircle {
+            center: [0.0, 0.0, H / 2.0 + 2.0],
+            axis: UP,
+            radius: 12.0,
+        };
+        part.chamfer(&rim, 3.0 * 2f64.sqrt(), &Tolerance::default())
             .map(|_| ())
             .unwrap_err()
     });
-    println!("constant-width rim d=3: {error}");
-    assert!(
-        matches!(error, Error::Kernel { status, .. } if status.name() == Some("SHIM_ERR_BROKE_SOLID")),
-        "{error:?}"
-    );
+    println!("chamfer past a 2 mm boss: {error}");
+    assert!(matches!(error, Error::Kernel { .. }), "{error:?}");
+    let built = build(block);
+    assert_volume("box after a refused chamfer", built.volume, BOX_VOLUME);
 }
 
 #[test]

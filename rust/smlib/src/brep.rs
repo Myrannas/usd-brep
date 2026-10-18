@@ -276,10 +276,11 @@ impl Brep {
     /// `width / √2` on each face, and corners where chamfered edges meet are
     /// beveled.
     ///
-    /// The kernel's constant-width solver is reliable on straight edges but
-    /// not on circles: on the rim of a hole it can report success and leave
-    /// an open shell, which comes back here as `SHIM_ERR_BROKE_SOLID`. For a
-    /// chamfer on a curved edge, use [`fillet`](Brep::fillet) with
+    /// Unlike `SmApiChamferFillet`, this leaves the kernel's global merge off;
+    /// with it on, chamfers on circular edges can come back as open shells.
+    /// A chamfer that can't fit, such as one that would cut past a whole
+    /// face, is an error. For a chamfer given by its setback on each face,
+    /// use [`fillet`](Brep::fillet) with
     /// [`EdgeBlend::linear`](crate::EdgeBlend::linear).
     ///
     /// Consumed and dropped on failure, as [`fillet`](Brep::fillet).
