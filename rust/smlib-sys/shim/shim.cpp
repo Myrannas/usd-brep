@@ -3,11 +3,14 @@
 #include "shim.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <new>
+#include <sstream>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,7 +30,9 @@
 #include <SmBSplineSurface.h>
 #include <SmBrep.h>
 #include <SmCone.h>
+#include <SmCopyBrepMap.h>
 #include <SmCylinder.h>
+#include <SmDatabaseIO.h>
 #include <SmEdge.h>
 #include <SmEdgeuse.h>
 #include <SmFace.h>
@@ -36,7 +41,9 @@
 #include <SmFilletExecutive.h>
 #include <SmFilletSolver.h>
 #include <SmFilletStandardSolver.h>
+#include <SmGraphicsExtern.h>
 #include <SmLine.h>
+#include <SmLoopuse.h>
 #include <SmOffsetExecutive.h>
 #include <SmOffsetGeometryCreation.h>
 #include <SmPlane.h>
@@ -45,8 +52,10 @@
 #include <SmSphere.h>
 #include <SmSurfOfRevolution.h>
 #include <SmSurfTypes.h>
+#include <SmTess.h>
 #include <SmTorus.h>
 #include <SmVertex.h>
+#include <SmVertexuse.h>
 
 struct sm_mesh {
     std::vector<float> positions;
@@ -2340,5 +2349,438 @@ void sm_mesh_view_get(const sm_mesh* mesh, sm_mesh_view* out) {
 }
 
 void sm_mesh_free(sm_mesh* mesh) { delete mesh; }
+
+}  // extern "C"
+
+// Face-by-face tessellation (sm_tessellation).
+//
+// SmApiTessellate runs SmBrep::ConvertToPolyBrep, which drives SmTess in three
+// phases on a copy of the brep. Phase 1 splits every edge for the whole solid
+// and builds each face's surface cache and boundary polygon from those
+// splits. Phase 2 then triangulates one face inside its boundary, and the
+// polygon output turns that into 3D polygons; both read only that face's
+// cache, boundary, surface, trim curves and vertices, and leave the copy's
+// topology alone (SmTess.cpp). sm_tessellation drives the phases itself: phase
+// 1 for every face, as ConvertToPolyBrep runs it, then phase 2 and the output
+// only for the faces asked for, each into a poly brep of its own. So a face
+// comes out the same whichever other faces are triangulated, and its key, a
+// digest of everything phase 2 and the output read for it, says when an
+// earlier result for it can stand in.
+
+struct sm_tessellation {
+    SmBrep* source;
+    SmCurveTessDriver curves;
+    SmSurfaceTessDriver surfaces;
+    SmTess tess;
+    double max_edge_length;
+    sm_tessellation_params params;
+    // The copy's faces, in the source's face order.
+    SmTArray<SmFace*> faces;
+    // Each face's key digest, and whether it couldn't be keyed.
+    std::vector<std::array<uint64_t, 2>> keys;
+    std::vector<bool> unkeyed;
+    bool keyed = false;
+    bool meshed = false;
+
+    sm_tessellation(SmBrep& brep, const sm_tessellation_params& p, double edge_length)
+        : source(&brep),
+          curves(0, p.chord_height_tol, p.curve_angle_tol_deg, edge_length, 0.0001, FALSE),
+          surfaces(p.chord_height_tol, p.surface_angle_tol_deg, edge_length, 0.0, 0.001, p.max_aspect_ratio),
+          tess(*brep.GetContext(), curves, surfaces),
+          max_edge_length(edge_length),
+          params(p) {
+        tess.SetAdvancingFront(FALSE);
+    }
+};
+
+namespace {
+
+// ConvertToPolyBrep tessellates with the context's boolean flag set.
+struct DoingBoolean {
+    SmTemporaryChangeValue<SmBoolean> change;
+    explicit DoingBoolean(const SmBrep& brep)
+        : change(SM_CONST_CAST(SmContext*, brep.GetContext())->GetDoingBooleanRef(), TRUE) {}
+};
+
+// SmApiTessellate's max edge length: a negative value is relative to the
+// brep's bounding-box diagonal.
+double max_edge_length(SmBrep& brep, double requested) {
+    if (requested >= 0.0) return requested;
+    SmExtent3d box;
+    brep.CalculateBoundingBox(box);
+    double size = box.GetSize().Length();
+    if (size >= 1.0e15 || size <= 0.0) size = 1.0;
+    return -0.025 * size * requested;
+}
+
+// Collects a face's key. SMLib writes curves and surfaces in full through
+// SmDatabaseIO (WriteToDB); this binary writer keeps the exact bits of every
+// value instead of writing a file. Anything written straight to the stream
+// is kept too.
+class KeyWriter final : public SmDatabaseIO {
+public:
+    KeyWriter() : SmDatabaseIO(SM_BINARY) { SetOutStreamPtr(&stream_); }
+
+    SmStatus WriteLongs(const ULONG* values, ULONG count) override { return put(values, count * sizeof *values); }
+    SmStatus WriteDoubles(const double* values, ULONG count) override { return put(values, count * sizeof *values); }
+    SmStatus WriteCharacters(const char* values, ULONG count) override { return put(values, count); }
+    SmStatus WriteBooleans(const SmBoolean* values, ULONG count) override {
+        return put(values, count * sizeof *values);
+    }
+    SmStatus WriteLong(long value) override { return put(&value, sizeof value); }
+    SmStatus WriteBoolean(SmBoolean value) override { return put(&value, sizeof value); }
+    SmStatus WriteDouble(double value) override { return put(&value, sizeof value); }
+    SmStatus WriteShort(short value) override { return put(&value, sizeof value); }
+    SmStatus WriteChar(char value) override { return put(&value, sizeof value); }
+
+    void point(const SmPoint3d& p) {
+        WriteDouble(p.x);
+        WriteDouble(p.y);
+        WriteDouble(p.z);
+    }
+
+    // Writes a curve or surface the first time it's seen and its index after
+    // that. False when SMLib can't write it.
+    template <typename Geometry>
+    bool geometry(const Geometry* object) {
+        if (!object) {
+            WriteLong(-1);
+            return true;
+        }
+        const auto found = seen_.find(object);
+        if (found != seen_.end()) {
+            WriteLong(found->second);
+            return true;
+        }
+        WriteLong(static_cast<long>(seen_.size()));
+        seen_.emplace(object, static_cast<long>(seen_.size()));
+        WriteLong(static_cast<long>(object->GetType()));
+        return object->WriteToDB(*this, SM_CURRENT_DATABASE_VERSION) == SM_SUCCESS;
+    }
+
+    std::string finish() {
+        bytes_ += stream_.str();
+        return std::move(bytes_);
+    }
+
+private:
+    SmStatus put(const void* data, size_t size) {
+        bytes_.append(static_cast<const char*>(data), size);
+        return SM_SUCCESS;
+    }
+
+    std::ostringstream stream_;
+    std::string bytes_;
+    std::map<const void*, long> seen_;
+};
+
+// MurmurHash3_x64_128 (Austin Appleby, public domain) with seed 0: a face
+// key's bytes run to tens of kilobytes, of which callers keep this digest.
+void digest(const std::string& bytes, uint64_t out[2]) {
+    const auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+    const auto fmix = [](uint64_t k) {
+        k ^= k >> 33;
+        k *= 0xff51afd7ed558ccdULL;
+        k ^= k >> 33;
+        k *= 0xc4ceb9fe1a85ec53ULL;
+        k ^= k >> 33;
+        return k;
+    };
+    const uint64_t c1 = 0x87c37b91114253d5ULL;
+    const uint64_t c2 = 0x4cf5ad432745937fULL;
+    uint64_t h1 = 0;
+    uint64_t h2 = 0;
+    const size_t blocks = bytes.size() / 16;
+    for (size_t i = 0; i < blocks; ++i) {
+        uint64_t k1 = 0;
+        uint64_t k2 = 0;
+        std::memcpy(&k1, bytes.data() + i * 16, 8);
+        std::memcpy(&k2, bytes.data() + i * 16 + 8, 8);
+        h1 ^= rotl(k1 * c1, 31) * c2;
+        h1 = (rotl(h1, 27) + h2) * 5 + 0x52dce729;
+        h2 ^= rotl(k2 * c2, 33) * c1;
+        h2 = (rotl(h2, 31) + h1) * 5 + 0x38495ab5;
+    }
+    // The tail, zero-padded: a zero word leaves the hash as the reference's
+    // switch over the tail length does.
+    unsigned char tail[16] = {};
+    std::memcpy(tail, bytes.data() + blocks * 16, bytes.size() % 16);
+    uint64_t k1 = 0;
+    uint64_t k2 = 0;
+    std::memcpy(&k1, tail, 8);
+    std::memcpy(&k2, tail + 8, 8);
+    h2 ^= rotl(k2 * c2, 33) * c1;
+    h1 ^= rotl(k1 * c1, 31) * c2;
+    h1 ^= bytes.size();
+    h2 ^= bytes.size();
+    h1 += h2;
+    h2 += h1;
+    h1 = fmix(h1);
+    h2 = fmix(h2);
+    h1 += h2;
+    h2 += h1;
+    out[0] = h1;
+    out[1] = h2;
+}
+
+// The key of one face of the tessellation's copy after phase 1: the
+// parameters, the face's surface, domain, flags and tolerances, every
+// edgeuse of its loops (UV trim curve, edge curve and interval, start vertex),
+// and the boundary polygon phase 1 built, vertex by vertex. Empty when SMLib
+// can't write the face's geometry, so it can't be keyed.
+std::string face_key(const sm_tessellation& t, SmFace* face) {
+    KeyWriter key;
+    key.WriteDouble(t.params.chord_height_tol);
+    key.WriteDouble(t.params.curve_angle_tol_deg);
+    key.WriteDouble(t.params.surface_angle_tol_deg);
+    key.WriteDouble(t.max_edge_length);
+    key.WriteDouble(t.params.max_aspect_ratio);
+
+    if (!key.geometry(face->GetSurface())) return std::string();
+    const SmExtent2d domain = face->GetUVDomain();
+    key.WriteDouble(domain.GetUMin());
+    key.WriteDouble(domain.GetVMin());
+    key.WriteDouble(domain.GetUMax());
+    key.WriteDouble(domain.GetVMax());
+    key.WriteDouble(face->GetTolerance().val);
+    key.WriteBoolean(face->GetRectangularTrim());
+    const SmFaceuse* upward = face->GetUpwardFaceuse();
+    const SmBrep* brep = face->GetBrep();
+    if (!upward || !upward->GetShell() || !brep) return std::string();
+    key.WriteBoolean(upward->GetShell()->GetRegion() != brep->GetInfiniteRegion());
+    key.WriteDouble(brep->GetTolerance().val);
+
+    std::map<const SmEdgeuse*, long> edgeuses;
+    SmTArray<SmLoopuse*> loops;
+    face->GetUpwardLoopuses(loops);
+    SmTArray<SmEdgeuse*> uses;
+    for (ULONG i = 0; i < loops.GetSize(); ++i) {
+        key.WriteLong(-2);
+        uses.RemoveAll();
+        loops[i]->GetEdgeuses(uses);
+        for (ULONG j = 0; j < uses.GetSize(); ++j) {
+            const SmEdgeuse* use = uses[j];
+            edgeuses.emplace(use, static_cast<long>(edgeuses.size()));
+            key.WriteLong(static_cast<long>(use->GetOrientation()));
+            if (!key.geometry(use->GetUVTrimCurvePointer())) return std::string();
+            const SmEdge* edge = use->GetEdge();
+            if (!edge) return std::string();
+            if (!key.geometry(edge->GetCurve())) return std::string();
+            key.WriteDouble(edge->GetInterval().GetMin());
+            key.WriteDouble(edge->GetInterval().GetMax());
+            key.WriteDouble(edge->GetTolerance().val);
+            const SmVertexuse* start = use->GetVertexuse();
+            const SmVertex* vertex = start ? start->GetVertex() : nullptr;
+            if (!vertex) return std::string();
+            key.point(vertex->GetPoint());
+            key.WriteDouble(vertex->GetTolerance().val);
+        }
+    }
+
+    const SmPolyBrep* boundary = t.tess.GetTessBrepOfFace(face);
+    if (!boundary) return std::string();
+    key.WriteDouble(boundary->GetTolerance().val);
+    std::map<const SmPolyVertex*, long> vertices;
+    SmTArray<SmPolyFace*> polygons;
+    SM_CONST_CAST(SmPolyBrep*, boundary)->GetPolyFaces(polygons);
+    SmTArray<SmPolyLoop*> rings;
+    SmTArray<SmPolyEdge*> sides;
+    for (ULONG i = 0; i < polygons.GetSize(); ++i) {
+        key.WriteLong(-3);
+        rings.RemoveAll();
+        polygons[i]->GetPolyLoops(rings);
+        for (ULONG j = 0; j < rings.GetSize(); ++j) {
+            key.WriteLong(-4);
+            sides.RemoveAll();
+            rings[j]->GetPolyEdges(sides);
+            for (ULONG k = 0; k < sides.GetSize(); ++k) {
+                const SmPolyEdge* side = sides[k];
+                const auto found = edgeuses.find(side->GetOriginalEdgeuse());
+                key.WriteLong(found == edgeuses.end() ? -1 : found->second);
+                const SmPolyVertex* vertex = side->GetStartPolyVertex();
+                const auto seen = vertices.find(vertex);
+                if (seen != vertices.end()) {
+                    key.WriteLong(seen->second);
+                    continue;
+                }
+                key.WriteLong(static_cast<long>(vertices.size()));
+                vertices.emplace(vertex, static_cast<long>(vertices.size()));
+                if (!vertex) continue;
+                key.point(vertex->GetPoint());
+                const auto owner = edgeuses.find(vertex->GetOriginalEdgeuse());
+                key.WriteLong(owner == edgeuses.end() ? -1 : owner->second);
+                key.WriteBoolean(vertex->GetOriginalVertex() != nullptr);
+            }
+        }
+    }
+    return key.finish();
+}
+
+// Adds the polygons of one face's own poly brep to the mesh, as
+// build_triangles does for a whole one.
+sm_status add_face_triangles(SmPolyBrep& poly, const SmFace* face, uint32_t face_id, sm_mesh& mesh) {
+    SmTArray<SmPolyFace*> polygons;
+    poly.GetPolyFaces(polygons);
+    MeshBuilder builder{mesh, {}};
+    SmTArray<SmPolyLoop*> loops;
+    SmTArray<SmPolyEdge*> corners;
+    std::vector<uint32_t> ring;
+    for (ULONG i = 0; i < polygons.GetSize(); ++i) {
+        const SmPolyFace* polygon = polygons[i];
+        if (polygon->GetOriginalFace() != face) return SM_SHIM_ERR_UNMAPPED_FACE;
+        loops.RemoveAll();
+        polygon->GetPolyLoops(loops);
+        if (loops.GetSize() != 1) return SM_SHIM_ERR_UNSUPPORTED_POLYGON;
+        corners.RemoveAll();
+        loops[0]->GetPolyEdges(corners);
+        if (corners.GetSize() < 3) return SM_SHIM_ERR_UNSUPPORTED_POLYGON;
+
+        ring.clear();
+        for (ULONG j = 0; j < corners.GetSize(); ++j) ring.push_back(builder.vertex(corners[j], face_id));
+        if (ring.size() > 3) ++mesh.polygons_split;
+        for (size_t j = 1; j + 1 < ring.size(); ++j) {
+            mesh.indices.insert(mesh.indices.end(), {ring[0], ring[j], ring[j + 1]});
+            mesh.face_ids.push_back(face_id);
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// Phase 2 and the polygon output for one face, into a poly brep of its own,
+// then the face's triangles into the mesh.
+sm_status triangulate_face(sm_tessellation& t, ULONG index, sm_mesh& mesh) {
+    SmFace* face = t.faces[index];
+    // SmApiTessellate fails when any face does.
+    if (t.tess.Phase2CreateFacePolygons(face) != SM_SUCCESS) return SM_ERR;
+    SmPolygonOutputCallback output;
+    output.SetOutputType(SM_PO_CREATE_POLYBREP);
+    SmPolyShell* shell = nullptr;
+    const SmStatus status = t.tess.OutputFacePolygons(face, output, &shell);
+    t.tess.Phase3DeleteFacePolygons(face);
+    SmPolyBrep* poly = t.tess.Get3DPolyBrep();
+    t.tess.Set3DPolyBrep(nullptr);
+    const std::unique_ptr<SmPolyBrep, PolyBrepDeleter> owned_poly(poly);
+    if (status != SM_SUCCESS) return status;
+    if (!poly) return SM_SUCCESS;
+    // The copy's vertices point at their output vertices, which go with this
+    // poly brep; the next face makes its own.
+    SmTArray<SmPolyVertex*> outputs;
+    poly->GetPolyVertices(outputs);
+    for (ULONG i = 0; i < outputs.GetSize(); ++i) {
+        SmVertex* vertex = outputs[i]->GetOriginalVertex();
+        if (vertex && vertex->GetPolyVertex() == outputs[i]) vertex->SetPolyVertex(nullptr);
+    }
+    return add_face_triangles(*poly, face, static_cast<uint32_t>(index), mesh);
+}
+
+}  // namespace
+
+extern "C" {
+
+sm_status sm_brep_tessellation_begin(sm_brep* brep, const sm_tessellation_params* params, sm_tessellation** out) {
+    if (!brep || !params || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmBrep* source = brep_of(brep);
+        const DoingBoolean doing_boolean(*source);
+        auto t = std::make_unique<sm_tessellation>(*source, *params, max_edge_length(*source, params->max_edge_length));
+
+        SmCopyBrepMap copies;
+        SmBrep* copy = new (*source->GetContext()) SmBrep(*source, &copies);
+        SmTArray<SmFace*> originals;
+        source->GetFaces(originals);
+        copy->GetFaces(t->faces);
+        bool mapped = t->faces.GetSize() == originals.GetSize();
+        for (ULONG i = 0; mapped && i < t->faces.GetSize(); ++i) {
+            mapped = copies.GetAt(t->faces[i]) == originals[i];
+        }
+        if (!mapped) {
+            delete copy;
+            return SM_SHIM_ERR_UNMAPPED_FACE;
+        }
+
+        // From here the tessellator owns the copy.
+        SmBoolean failed = FALSE;
+        SmTArray<SmStatus> boundaries;
+        const SmStatus status = t->tess.Phase1SetupBrep(copy, failed, NULL, &boundaries);
+        if (status != SM_SUCCESS) return status;
+        for (ULONG i = 0; i < boundaries.GetSize(); ++i) {
+            if (boundaries[i] != SM_SUCCESS) return SM_ERR;
+        }
+        *out = t.release();
+        return SM_SUCCESS;
+    });
+}
+
+size_t sm_tessellation_face_count(const sm_tessellation* tessellation) {
+    return tessellation ? tessellation->faces.GetSize() : 0;
+}
+
+sm_status sm_tessellation_face_key(sm_tessellation* tessellation, size_t face, uint64_t key[2], int32_t* keyed) {
+    if (!tessellation || !key || !keyed) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (face >= tessellation->faces.GetSize()) return SM_SHIM_ERR_BAD_FACE;
+    return guarded([&] {
+        sm_tessellation& t = *tessellation;
+        if (!t.keyed) {
+            if (t.meshed) return SM_SHIM_ERR_SPENT_TESSELLATION;
+            const DoingBoolean doing_boolean(*t.source);
+            std::vector<std::array<uint64_t, 2>> keys(t.faces.GetSize(), {0, 0});
+            t.unkeyed.assign(t.faces.GetSize(), false);
+            for (ULONG i = 0; i < t.faces.GetSize(); ++i) {
+                const std::string bytes = face_key(t, t.faces[i]);
+                if (bytes.empty()) {
+                    t.unkeyed[i] = true;
+                } else {
+                    digest(bytes, keys[i].data());
+                }
+            }
+            t.keys = std::move(keys);
+            t.keyed = true;
+        }
+        key[0] = t.keys[face][0];
+        key[1] = t.keys[face][1];
+        *keyed = t.unkeyed[face] ? 0 : 1;
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_tessellation_mesh(sm_tessellation* tessellation, const uint8_t* wanted, size_t wanted_count,
+                               sm_mesh** out) {
+    if (!tessellation || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    sm_tessellation& t = *tessellation;
+    if (wanted && wanted_count != t.faces.GetSize()) return SM_SHIM_ERR_BAD_FACE;
+    if (t.meshed) return SM_SHIM_ERR_SPENT_TESSELLATION;
+    t.meshed = true;
+    return guarded([&] {
+        const DoingBoolean doing_boolean(*t.source);
+        SmTArray<SmFace*> faces;
+        t.source->GetFaces(faces);
+        if (faces.GetSize() != t.faces.GetSize()) return SM_SHIM_ERR_UNMAPPED_FACE;
+        auto mesh = std::make_unique<sm_mesh>();
+        FaceIndex face_index;
+        mesh->faces.reserve(faces.GetSize());
+        for (ULONG i = 0; i < faces.GetSize(); ++i) {
+            face_index.emplace(faces[i], static_cast<uint32_t>(i));
+            mesh->faces.push_back(describe_face(faces[i]));
+        }
+        for (ULONG i = 0; i < t.faces.GetSize(); ++i) {
+            if (wanted && !wanted[i]) {
+                t.tess.Phase3DeleteFacePolygons(t.faces[i]);
+                continue;
+            }
+            const sm_status result = triangulate_face(t, i, *mesh);
+            if (result != SM_SUCCESS) return result;
+        }
+        const sm_status result = build_edges(*t.source, t.params.edge_angle_tol_deg, face_index, *mesh);
+        if (result != SM_SUCCESS) return result;
+        *out = mesh.release();
+        return SM_SUCCESS;
+    });
+}
+
+void sm_tessellation_free(sm_tessellation* tessellation) {
+    if (!tessellation) return;
+    const DoingBoolean doing_boolean(*tessellation->source);
+    delete tessellation;
+}
 
 }  // extern "C"

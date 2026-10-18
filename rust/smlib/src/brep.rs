@@ -12,6 +12,7 @@ use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams};
+use crate::tessellation::Tessellation;
 
 /// Relative accuracy of [`Brep::face_centroid`]: placing a feature at a
 /// centroid is then exact to a tenth of a micron on a metre-sized part.
@@ -735,6 +736,39 @@ impl Brep {
             sys::sm_mesh_free(raw.as_ptr());
             Ok(mesh)
         }
+    }
+
+    /// Starts tessellating the solid one face at a time: splits every edge
+    /// as [`tessellate`](Brep::tessellate) would, on a copy, and leaves the
+    /// faces to [`Tessellation::mesh`].
+    pub fn begin_tessellation(
+        &self,
+        params: &TessellationParams,
+    ) -> Result<Tessellation<'_>, Error> {
+        let raw_params = params.to_raw()?;
+        let mut out = ptr::null_mut();
+        // SAFETY: self is a live brep on the kernel thread; params outlives
+        // the call. The tessellation borrows self, so the brep outlives it
+        // and, being borrowed, can't change before its mesh is made.
+        let status =
+            unsafe { sys::sm_brep_tessellation_begin(self.raw.as_ptr(), &raw_params, &mut out) };
+        Error::check("SmApiTessellate", status)?;
+        let raw = NonNull::new(out).ok_or(Error::Kernel {
+            operation: "SmApiTessellate",
+            status: crate::Status::from_raw(sys::SM_SHIM_ERR_NULL_ARGUMENT),
+        })?;
+        // SAFETY: raw is a tessellation the shim just made of this brep.
+        Ok(unsafe { Tessellation::from_raw(raw) })
+    }
+
+    /// [`tessellate`](Brep::tessellate) one face at a time, triangulating
+    /// only the faces `wanted` marks: see [`Tessellation::mesh`].
+    pub fn tessellate_faces(
+        &self,
+        params: &TessellationParams,
+        wanted: Option<&[bool]>,
+    ) -> Result<Mesh, Error> {
+        self.begin_tessellation(params)?.mesh(wanted)
     }
 }
 

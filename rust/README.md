@@ -113,6 +113,34 @@ frustums and rings.
 cargo run --release -p smlib --example offset_face   # timings
 ```
 
+## Face-by-face tessellation
+
+`Brep::tessellate` runs `SmApiTessellate`, which drives SMLib's tessellator
+(`SmTess`) in three phases on a copy of the brep: phase 1 splits every edge
+for the whole solid and builds each face's surface cache and boundary
+polygon; phase 2 triangulates one face inside its boundary; the polygon
+output turns that into 3D polygons. Phase 2 and the output read only their
+face's cache, boundary, surface, trim curves and vertices.
+
+`Brep::begin_tessellation` runs phase 1 as `SmApiTessellate` does and
+returns a `Tessellation`; `Tessellation::mesh` then triangulates only the
+faces asked for, each into a poly brep of its own. A face's triangles and
+vertices come out bit for bit as the whole tessellation gives them, whichever
+other faces are triangulated, so a caller can keep earlier faces' triangles
+and stay watertight: every shared edge is split the same on both sides.
+
+`Tessellation::face_keys` says when that's safe. A face's `FaceKey` is a
+128-bit digest (MurmurHash3) of everything phase 2 and the output read for it:
+the parameters, the face's surface and every edge and trim curve as SMLib
+writes them to a file (`WriteToDB`, binary, so every bit counts), its domain,
+flags and tolerances, its vertices, and its boundary polygon after phase 1.
+Equal keys mean identical triangles. A neighbour's change that splits a
+shared edge differently changes the boundary, and so the key, of both faces.
+
+`tests/tessellation.rs` checks every face against `Brep::tessellate`, partial
+meshes against whole ones, and kept faces standing in across edits. Phase 1
+still runs for the whole solid, about 40% of a tessellation.
+
 ## Build cache
 
 The kernel takes about 30 s to compile on a 10-core M-series Mac. `build.rs`
