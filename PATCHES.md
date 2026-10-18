@@ -125,7 +125,12 @@ but not much else. What goes wrong, and what the shim
   every face at both of its ends lands where v would put it (it moves by v, or
   v moves it within its own surface). The shim moves every such edge itself,
   before the executive mates any, putting the moved edge on each face's copy
-  and marking it mated, and the executive leaves it alone.
+  and marking it mated, and the executive leaves it alone. A straight edge
+  that stays on its own line while its ends move along it (a wall's edge with
+  a vertical fillet under a raised top) is put in the same way, as the line
+  between its ends' predicted places: mated, it came from one face's lifted
+  trim curve, and which face followed pointer order, so the same part rebuilt
+  to different last digits, and different triangles, from run to run.
 - The executive picks each extended edge's end among candidate points by
   nearness to the original vertex, which after a long move can be the wrong
   candidate, and through an unmated tangent neighbour's old UV curve, which can

@@ -1418,6 +1418,47 @@ fn offset_faces_on_curved_faces() {
 }
 
 #[test]
+fn offsets_come_out_the_same_every_time() {
+    // The walls' edges with the vertical fillets stretch when the top rises.
+    // Left to the executive, they varied in the last digits with the heap's
+    // addresses; the same part must rebuild to the same bits.
+    let runs = on_kernel(|k| {
+        let part = box_of_height(k, H)?.fillet(
+            &[EdgeBlend::round(
+                EdgeQuery::ParallelTo { direction: UP },
+                8.0,
+            )],
+            &options(),
+        )?;
+        let lowest = |b: &Brep| -> Result<f64, Error> {
+            Ok(b.edges()?
+                .iter()
+                .flat_map(|e| e.samples)
+                .map(|p| p[2])
+                .fold(f64::INFINITY, f64::min))
+        };
+        let before = lowest(&part)?;
+        let mut kept = Vec::new();
+        let mut runs = Vec::new();
+        for _ in 0..8 {
+            let moved = part.try_clone()?.offset_where(&top_at(H), 15.0)?;
+            let edges: Vec<_> = moved.edges()?.iter().map(|e| e.samples).collect();
+            runs.push((edges, lowest(&moved)? == before));
+            kept.push(moved);
+        }
+        Ok::<_, Error>(runs)
+    })
+    .unwrap();
+    for run in &runs[1..] {
+        assert!(run.0 == runs[0].0, "an offset came out different");
+    }
+    assert!(
+        runs[0].1,
+        "the walls' bottom ends stay exactly where they were"
+    );
+}
+
+#[test]
 fn edges_read_after_an_offset_and_a_fillet() {
     // A boss raised by a sweep, the far end trimmed, then the boss's rim
     // rounded: the fillet leaves the seam's range an ulp past its line's

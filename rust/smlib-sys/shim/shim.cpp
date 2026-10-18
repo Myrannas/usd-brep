@@ -1226,16 +1226,13 @@ private:
         return false;
     }
 
-    // The original edge moved by `shift`, with its trim curve on the copy's
+    // `curve` (owned) as the copy's edge, with its trim curve on the copy's
     // (extended) surface, or false if the curve won't drop onto it whole.
-    bool moved_copy(const SmContext& context, SmOffsetExecutive* executive, const SmEdgeuse* original,
-                    SmEdgeuse* copy, const SmVector3d& shift, SmCurve*& curve, SmBSplineCurve*& uv) const {
-        curve = nullptr;
+    bool dropped_copy(const SmContext& context, SmOffsetExecutive* executive, const SmEdgeuse* original,
+                      SmEdgeuse* copy, SmBSplineCurve* curve, SmCurve*& out, SmBSplineCurve*& uv) const {
+        out = nullptr;
         uv = nullptr;
-        SmBSplineCurve* moved = original->GetEdge()->CreateTrimmedNURBSCurve(context);
-        if (!moved) return false;
-        SmAxis2Placement placement;
-        placement.Translate(shift);
+        if (!curve) return false;
         SmSurface* extended = nullptr;
         SmExtent2d domain;
         SmTArray<SmBSplineCurve*> drops;
@@ -1244,24 +1241,26 @@ private:
         // The original edge may sit looser on its faces than the brep's
         // tolerance (fillet mitres do): it moves no less precise than it was.
         const double tolerance = std::max(copy->GetEdge()->GetTolerance(), original->GetEdge()->GetTolerance());
-        if (moved->Transform(placement) != SM_SUCCESS ||
-            executive->GetCreateExtendedSurface(copy->GetFace()->GetSurface(), domain, extended) != SM_SUCCESS ||
+        if (executive->GetCreateExtendedSurface(copy->GetFace()->GetSurface(), domain, extended) != SM_SUCCESS ||
             !extended ||
-            extended->DropAndTrimCurve(context, domain, *moved, moved->GetNaturalInterval(), tolerance / 3.0, drop,
+            extended->DropAndTrimCurve(context, domain, *curve, curve->GetNaturalInterval(), tolerance / 3.0, drop,
                                        deviation, drops, TRUE, TRUE) != SM_SUCCESS ||
             drops.GetSize() != 1 || drop > tolerance) {
-            delete moved;
+            delete curve;
             for (ULONG i = 0; i < drops.GetSize(); ++i) delete drops[i];
             return false;
         }
-        curve = moved;
+        out = curve;
         uv = drops[0];
         return true;
     }
 
-    // Puts the moved edge on every copy of `edge` whose face didn't itself
-    // move by `shift`; all or nothing.
-    bool move_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge, const SmVector3d& shift) {
+    // Puts a new curve on every copy of `edge` that `replace` picks, from
+    // `make` (given the original edgeuse; the curve runs as the edge's own);
+    // all or nothing.
+    template <typename Replace, typename Make>
+    bool replace_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge, Replace&& replace,
+                        Make&& make) {
         SmTArray<SmEdgeuse*> uses;
         edge->GetEdgeuses(uses);
         std::vector<std::pair<SmEdgeuse*, SmEdgeuse*>> sides;  // (original, its copy)
@@ -1274,9 +1273,9 @@ private:
         std::vector<SmBSplineCurve*> uvs(sides.size(), nullptr);
         bool ready = true;
         for (size_t i = 0; i < sides.size() && ready; ++i) {
-            const Motion motion = motion_of(m_motions, sides[i].first->GetFace());
-            if ((motion.shift - shift).Length() <= 1e-12) continue;
-            ready = moved_copy(context, executive, sides[i].first, sides[i].second, shift, curves[i], uvs[i]);
+            if (!replace(sides[i].first->GetFace())) continue;
+            ready = dropped_copy(context, executive, sides[i].first, sides[i].second, make(sides[i].first), curves[i],
+                                 uvs[i]);
         }
         for (size_t i = 0; i < sides.size() && ready; ++i) {
             if (!curves[i]) continue;
@@ -1297,6 +1296,90 @@ private:
         return ready;
     }
 
+    // Puts the original edge moved by `shift` on every copy of `edge` whose
+    // face didn't itself move by `shift`.
+    bool move_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge, const SmVector3d& shift) {
+        SmAxis2Placement placement;
+        placement.Translate(shift);
+        return replace_copies(
+            context, executive, edge,
+            [&](const SmFace* face) { return (motion_of(m_motions, face).shift - shift).Length() > 1e-12; },
+            [&](const SmEdgeuse* original) {
+                SmBSplineCurve* moved = original->GetEdge()->CreateTrimmedNURBSCurve(context);
+                if (moved && moved->Transform(placement) != SM_SUCCESS) {
+                    delete moved;
+                    moved = nullptr;
+                }
+                return moved;
+            });
+    }
+
+    // Where a straight edge goes when it stays on its own line and only its
+    // ends move along it: a wall's edge with a fillet under a raised top, or
+    // beside a pushed wall. Both its faces land as no move would put them
+    // (kept, or moved within their own surfaces), it isn't a seam, and both
+    // ends are placed (aim_vertices) on the line, in the same order. Mating
+    // such an edge lifts one face's old trim curve, which picks a side in
+    // pointer order and so varies in the last digits from run to run.
+    bool stretched_line(const SmContext& context, const SmEdge* edge, SmPoint3d& from, SmPoint3d& to) const {
+        SmVector3d direction;
+        if (!straight(edge, direction)) return false;
+        const EdgeFaces sides = faces_of(edge);
+        if (!sides.faces[0] || !sides.faces[1] || sides.faces[0] == sides.faces[1]) return false;
+        const SmVector3d none(0.0, 0.0, 0.0);
+        for (const SmFace* side : sides.faces) {
+            if (!lands_like(side, motion_of(m_motions, side), none)) return false;
+        }
+        const SmVertex* ends[2] = {edge->GetStartVertex(), edge->GetOtherVertex(edge->GetStartVertex())};
+        if (!ends[0] || !ends[1] || ends[0] == ends[1] || !m_placed.count(ends[0]) || !m_placed.count(ends[1])) {
+            return false;
+        }
+        // The edge's curve as the edge runs, against where its ends were.
+        const std::unique_ptr<SmBSplineCurve> curve(edge->CreateTrimmedNURBSCurve(context));
+        if (!curve) return false;
+        SmPoint3d start;
+        SmPoint3d end;
+        curve->GetEnds(start, end);
+        const SmPoint3d old0 = old_point(ends[0]);
+        const SmPoint3d old1 = old_point(ends[1]);
+        const bool forward = (start - old0).Length() + (end - old1).Length() <= (start - old1).Length() + (end - old0).Length();
+        from = (forward ? ends[0] : ends[1])->GetPoint();
+        to = (forward ? ends[1] : ends[0])->GetPoint();
+        const SmVector3d before = end - start;
+        const SmVector3d after = to - from;
+        if (after.Dot(before) <= 0.0 || after.Length() <= edge->GetTolerance()) return false;
+        // Both new ends on the old line.
+        for (const SmPoint3d& point : {from, to}) {
+            const SmVector3d offset = point - start;
+            if ((offset - direction * offset.Dot(direction)).Length() > edge->GetTolerance()) return false;
+        }
+        return true;
+    }
+
+    // Puts the stretched line (see stretched_line) on both copies of `edge`.
+    bool stretch_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge) {
+        SmPoint3d from;
+        SmPoint3d to;
+        if (!stretched_line(context, edge, from, to)) return false;
+        return replace_copies(
+            context, executive, edge, [](const SmFace*) { return true; },
+            [&](const SmEdgeuse*) {
+                SmBSplineCurve* line = nullptr;
+                if (SmBSplineCurve::CreateLineSegment(context, 3, from, to, line) != SM_SUCCESS) {
+                    delete line;
+                    line = nullptr;
+                }
+                return line;
+            });
+    }
+
+    SmPoint3d old_point(const SmVertex* vertex) const {
+        for (const auto& aimed : m_aimed) {
+            if (aimed.first == vertex) return aimed.second;
+        }
+        return vertex->GetPoint();
+    }
+
     // Before the executive mates any edge, moves every rigid one and marks its
     // edgeuses as mated. Its neighbours then find its moved ends whichever
     // order the executive's pointer-keyed maps give: a tangent neighbour that
@@ -1309,7 +1392,10 @@ private:
         brep->GetEdges(edges);
         for (ULONG i = 0; i < edges.GetSize(); ++i) {
             SmVector3d shift;
-            if (!rigid_shift(edges[i], shift) || !move_copies(context, executive, edges[i], shift)) continue;
+            const bool rigid = rigid_shift(edges[i], shift);
+            if (rigid ? !move_copies(context, executive, edges[i], shift) : !stretch_copies(context, executive, edges[i])) {
+                continue;
+            }
             m_moved.insert(edges[i]);
             SmTArray<SmEdgeuse*> uses;
             edges[i]->GetEdgeuses(uses);
@@ -1330,6 +1416,7 @@ private:
         for (ULONG i = 0; i < vertices.GetSize(); ++i) {
             SmPoint3d aimed;
             if (!predict_vertex(vertices[i], aimed)) continue;
+            m_placed.insert(vertices[i]);
             if ((aimed - vertices[i]->GetPoint()).Length() <= 1e-12) continue;
             m_aimed.emplace_back(vertices[i], vertices[i]->GetPoint());
             vertices[i]->SetPoint(aimed);
@@ -1451,12 +1538,14 @@ public:
     void restore() {
         for (auto& aimed : m_aimed) aimed.first->SetPoint(aimed.second);
         m_aimed.clear();
+        m_placed.clear();
     }
 
 private:
     bool m_prepared = false;
     std::unordered_set<const SmEdge*> m_moved;
     std::vector<std::pair<SmVertex*, SmPoint3d>> m_aimed;
+    std::unordered_set<const SmVertex*> m_placed;  // every vertex aim_vertices placed, moved or not
     const Motions& m_motions;
 };
 
