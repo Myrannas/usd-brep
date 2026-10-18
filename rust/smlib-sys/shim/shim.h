@@ -41,11 +41,15 @@ static const sm_status SM_SHIM_ERR_BAD_FRAME = 2023;           /* placement axes
 static const sm_status SM_SHIM_ERR_BAD_SWEEP = 2024;           /* a zero sweep distance, or a sweep that isn't a solid */
 static const sm_status SM_SHIM_ERR_UNSUPPORTED_FACE = 2025;    /* the face, or a blend on it, can't be moved this way */
 static const sm_status SM_SHIM_ERR_CHANGED_TOPOLOGY = 2026;    /* the move would make a face vanish (or appear) */
+static const sm_status SM_SHIM_ERR_SPENT_TESSELLATION = 2030; /* the tessellation's mesh was already made */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
 typedef struct sm_brep sm_brep;
 typedef struct sm_mesh sm_mesh;
+/* A tessellation in progress (sm_brep_tessellation_begin), owned by the
+ * caller. */
+typedef struct sm_tessellation sm_tessellation;
 
 typedef struct sm_vec3 {
     double x;
@@ -404,6 +408,40 @@ void sm_mesh_view_get(const sm_mesh *mesh, sm_mesh_view *out);
 
 /* Deletes a mesh. NULL is ignored. */
 void sm_mesh_free(sm_mesh *mesh);
+
+/* sm_brep_tessellate one face at a time. sm_brep_tessellation_begin splits
+ * every edge as SmApiTessellate does for the whole brep, on a copy, then
+ * sm_tessellation_mesh triangulates only the faces asked for. A face's
+ * triangles and vertices come out the same whichever other faces are
+ * triangulated, so meshes put together from different tessellations of the
+ * same faces stay watertight. The brep must outlive the tessellation and stay
+ * unchanged until sm_tessellation_mesh has returned. */
+sm_status sm_brep_tessellation_begin(sm_brep *brep, const sm_tessellation_params *params, sm_tessellation **out);
+
+/* The number of faces: the brep's. */
+size_t sm_tessellation_face_count(const sm_tessellation *tessellation);
+
+/* The face's key: a 128-bit digest (MurmurHash3) of everything that fixes
+ * its triangles, from the tessellation parameters, the face's surface, trim
+ * and tolerances, and its boundary as split. Faces with the same key are
+ * triangulated the same, vertex for vertex. *keyed is 0 for a face that can't
+ * be keyed (SMLib can't write its geometry). Keys can't be had after
+ * sm_tessellation_mesh (SM_SHIM_ERR_SPENT_TESSELLATION). */
+sm_status sm_tessellation_face_key(sm_tessellation *tessellation, size_t face, uint64_t key[2], int32_t *keyed);
+
+/* The mesh, with triangles and vertices only for the faces `wanted` marks:
+ * one byte per face, non-zero to triangulate (NULL triangulates every face).
+ * Faces follow each other in face order, each with its own run of vertices,
+ * numbered in the order its triangles first use them; each face's triangles
+ * and vertices are sm_brep_tessellate's for it. faces and edges cover the
+ * whole brep.
+ * Once per tessellation (SM_SHIM_ERR_SPENT_TESSELLATION);
+ * SM_SHIM_ERR_BAD_FACE when wanted_count isn't the face count. */
+sm_status sm_tessellation_mesh(sm_tessellation *tessellation, const uint8_t *wanted, size_t wanted_count,
+                               sm_mesh **out);
+
+/* Deletes a tessellation. NULL is ignored. */
+void sm_tessellation_free(sm_tessellation *tessellation);
 
 #ifdef __cplusplus
 }
