@@ -47,6 +47,9 @@ static const sm_status SM_SHIM_ERR_SPENT_TESSELLATION = 2030; /* the tessellatio
  * tessellation output copied into flat arrays, independent of the brep. */
 typedef struct sm_brep sm_brep;
 typedef struct sm_mesh sm_mesh;
+/* Surface caches kept from one sm_brep_tessellate_some to the next. */
+typedef struct sm_surface_caches sm_surface_caches;
+
 /* A tessellation in progress (sm_brep_tessellation_begin), owned by the
  * caller. */
 typedef struct sm_tessellation sm_tessellation;
@@ -465,11 +468,28 @@ void sm_tessellation_free(sm_tessellation *tessellation);
  * that: when a wanted face's boundary needs refining, or set-up of one of
  * them fails or can't be matched; sm_brep_tessellation_begin then
  * tessellates the brep. SM_SHIM_ERR_BAD_FACE when wanted_count isn't the face
- * count. The brep isn't changed. */
+ * count. The brep isn't changed.
+ *
+ * With caches (or NULL), a face whose surface is identical to one a cache
+ * was kept for takes that cache rather than building its own, and the
+ * caches of faces used only to split shared edges are kept. A cache depends
+ * only on its surface and the parameters, so the mesh comes out the same. */
 sm_status sm_brep_tessellation_keys(sm_brep *brep, const sm_tessellation_params *params, uint64_t *keys,
                                     int32_t *keyed, size_t face_count);
 sm_status sm_brep_tessellate_some(sm_brep *brep, const sm_tessellation_params *params, const uint8_t *wanted,
-                                  size_t wanted_count, sm_mesh **out);
+                                  size_t wanted_count, sm_surface_caches *caches, sm_mesh **out);
+
+/* An empty store of surface caches for sm_brep_tessellate_some, which keeps
+ * the caches given back by its last two calls that triangulated any face, by
+ * surface and parameters.
+ * NULL when out of memory. Use and free it on the kernel thread. */
+sm_surface_caches *sm_surface_caches_new(void);
+
+/* The number of caches kept. */
+size_t sm_surface_caches_count(const sm_surface_caches *caches);
+
+/* Deletes the store and its caches. NULL is ignored. */
+void sm_surface_caches_free(sm_surface_caches *caches);
 
 #ifdef __cplusplus
 }

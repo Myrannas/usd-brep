@@ -12,7 +12,7 @@ use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams};
-use crate::tessellation::{FaceKey, Tessellation};
+use crate::tessellation::{FaceKey, SurfaceCaches, Tessellation};
 
 /// Relative accuracy of [`Brep::face_centroid`]: placing a feature at a
 /// centroid is then exact to a tenth of a micron on a metre-sized part.
@@ -805,22 +805,30 @@ impl Brep {
     /// tessellation would recover from went wrong. Then
     /// [`begin_tessellation`](Brep::begin_tessellation) tessellates the
     /// whole solid.
+    ///
+    /// With `caches`, faces take surface caches kept from earlier calls for
+    /// identical surfaces, and the faces sharing wanted faces' edges leave
+    /// theirs there: see [`SurfaceCaches`]. The mesh comes out the same.
     pub fn tessellate_some(
         &self,
         params: &TessellationParams,
         wanted: &[bool],
+        caches: Option<&mut SurfaceCaches>,
     ) -> Result<Option<Mesh>, Error> {
         let raw_params = params.to_raw()?;
         let flags: Vec<u8> = wanted.iter().map(|&w| u8::from(w)).collect();
         let mut out = ptr::null_mut();
+        let caches = caches.map_or(ptr::null_mut(), SurfaceCaches::as_ptr);
         // SAFETY: self is a live brep on the kernel thread; params and the
-        // flags outlive the call.
+        // flags outlive the call, and caches is null or a live store on this
+        // thread.
         let status = unsafe {
             sys::sm_brep_tessellate_some(
                 self.raw.as_ptr(),
                 &raw_params,
                 flags.as_ptr(),
                 flags.len(),
+                caches,
                 &mut out,
             )
         };

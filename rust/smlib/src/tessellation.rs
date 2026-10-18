@@ -5,6 +5,7 @@ use smlib_sys as sys;
 
 use crate::brep::Brep;
 use crate::error::Error;
+use crate::kernel::Kernel;
 use crate::mesh::Mesh;
 
 /// A tessellation of a [`Brep`] in progress, from
@@ -112,3 +113,52 @@ impl Drop for Tessellation<'_> {
 /// What a face's triangles depend on, from [`Tessellation::face_keys`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FaceKey(pub(crate) [u64; 2]);
+
+/// Surface caches kept from one [`Brep::tessellate_some`] to the next.
+///
+/// SMLib builds a cache of each surface it tessellates, subdivided to the
+/// tessellation parameters, which can cost more than splitting the face's
+/// edges. A cache depends only on its surface and the parameters, so faces
+/// whose surfaces are identical to an earlier face's can share it. Caches
+/// SMLib used only to split edges a wanted face shares are kept here, and
+/// faces with identical surfaces take them rather than building their own.
+/// The store keeps the caches kept by its last two calls that triangulated
+/// any face.
+pub struct SurfaceCaches {
+    raw: NonNull<sys::sm_surface_caches>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl SurfaceCaches {
+    /// An empty store.
+    pub fn new(_kernel: &Kernel) -> SurfaceCaches {
+        // SAFETY: allocates an empty store; it touches no kernel state.
+        let raw = unsafe { sys::sm_surface_caches_new() };
+        SurfaceCaches {
+            raw: NonNull::new(raw).expect("out of memory for a surface cache store"),
+            _not_send: PhantomData,
+        }
+    }
+
+    /// The number of caches kept.
+    pub fn len(&self) -> usize {
+        // SAFETY: raw is live.
+        unsafe { sys::sm_surface_caches_count(self.raw.as_ptr()) }
+    }
+
+    /// Whether no cache is kept.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn as_ptr(&mut self) -> *mut sys::sm_surface_caches {
+        self.raw.as_ptr()
+    }
+}
+
+impl Drop for SurfaceCaches {
+    fn drop(&mut self) {
+        // SAFETY: we own the store, and it can't leave the kernel thread.
+        unsafe { sys::sm_surface_caches_free(self.raw.as_ptr()) }
+    }
+}

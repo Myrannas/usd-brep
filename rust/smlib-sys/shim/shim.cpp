@@ -2773,6 +2773,97 @@ std::string input_key(const sm_tessellation_params& params, double edge_length, 
 
 }  // namespace
 
+// Surface caches kept between sm_brep_tessellate_some calls, for
+// SmTess::Phase1SetupFaces: a cache depends only on its surface and the
+// parameters, so each is kept by a digest of both.
+struct sm_surface_caches final : SmTessSrfCacheStore {
+    sm_surface_caches() = default;
+    sm_surface_caches(const sm_surface_caches&) = delete;
+    sm_surface_caches& operator=(const sm_surface_caches&) = delete;
+
+    ~sm_surface_caches() override {
+        for (auto& [key, caches] : kept) {
+            for (const Kept& cache : caches) delete cache.cache;
+        }
+    }
+
+    // Starts a call with these parameters.
+    void begin(const sm_tessellation_params& p, double length) {
+        ++call;
+        params = p;
+        edge_length = length;
+        digests = Digests();
+    }
+
+    // Ends a call, dropping the caches neither it nor the call before kept.
+    void end() {
+        for (auto entry = kept.begin(); entry != kept.end();) {
+            auto& caches = entry->second;
+            for (auto cache = caches.begin(); cache != caches.end();) {
+                if (cache->call + 1 >= call) {
+                    ++cache;
+                    continue;
+                }
+                delete cache->cache;
+                cache = caches.erase(cache);
+            }
+            entry = caches.empty() ? kept.erase(entry) : std::next(entry);
+        }
+    }
+
+    size_t count() const {
+        size_t n = 0;
+        for (const auto& [key, caches] : kept) n += caches.size();
+        return n;
+    }
+
+    SmTessSrfCache* Take(SmFace* face) override {
+        std::array<uint64_t, 2> digest;
+        if (!key(*face, digest)) return nullptr;
+        const auto found = kept.find(digest);
+        if (found == kept.end()) return nullptr;
+        SmTessSrfCache* cache = found->second.back().cache;
+        found->second.pop_back();
+        if (found->second.empty()) kept.erase(found);
+        return cache;
+    }
+
+    void Keep(SmFace* face, SmTessSrfCache* cache) override {
+        std::array<uint64_t, 2> digest;
+        if (!key(*face, digest)) {
+            delete cache;
+            return;
+        }
+        kept[digest].push_back({cache, call});
+    }
+
+private:
+    struct Kept {
+        SmTessSrfCache* cache;
+        uint64_t call;
+    };
+
+    // What fixes a face's cache: its surface, and the parameters the
+    // tessellation gives its surface driver. False when SMLib can't write the
+    // surface.
+    bool key(const SmFace& face, std::array<uint64_t, 2>& out) {
+        KeyWriter bytes;
+        bytes.WriteDouble(params.chord_height_tol);
+        bytes.WriteDouble(params.surface_angle_tol_deg);
+        bytes.WriteDouble(edge_length);
+        bytes.WriteDouble(params.max_aspect_ratio);
+        if (!digests.put(bytes, face.GetSurface())) return false;
+        digest(bytes.finish(), out.data());
+        return true;
+    }
+
+    std::map<std::array<uint64_t, 2>, std::vector<Kept>> kept;
+    uint64_t call = 0;
+    sm_tessellation_params params{};
+    double edge_length = 0.0;
+    Digests digests;
+};
+
 extern "C" {
 
 sm_status sm_brep_tessellation_keys(sm_brep* brep, const sm_tessellation_params* params, uint64_t* keys,
@@ -2799,7 +2890,7 @@ sm_status sm_brep_tessellation_keys(sm_brep* brep, const sm_tessellation_params*
 }
 
 sm_status sm_brep_tessellate_some(sm_brep* brep, const sm_tessellation_params* params, const uint8_t* wanted,
-                                  size_t wanted_count, sm_mesh** out) {
+                                  size_t wanted_count, sm_surface_caches* caches, sm_mesh** out) {
     if (!brep || !params || !out || (wanted_count > 0 && !wanted)) return SM_SHIM_ERR_NULL_ARGUMENT;
     return guarded([&] {
         SmBrep* source = brep_of(brep);
@@ -2807,6 +2898,10 @@ sm_status sm_brep_tessellate_some(sm_brep* brep, const sm_tessellation_params* p
         const DoingBoolean doing_boolean(*source);
         auto t = std::make_unique<sm_tessellation>(*source, *params, max_edge_length(*source, params->max_edge_length));
         if (std::any_of(wanted, wanted + wanted_count, [](uint8_t w) { return w != 0; })) {
+            if (caches) caches->begin(*params, t->max_edge_length);
+            // Ends the call however it goes, once phase 1 has given caches back.
+            const std::unique_ptr<sm_surface_caches, void (*)(sm_surface_caches*)> ending(
+                caches, [](sm_surface_caches* c) { c->end(); });
             SmBrep* copy = nullptr;
             const sm_status copied = copy_into(*t, copy);
             if (copied != SM_SUCCESS) return copied;
@@ -2816,7 +2911,7 @@ sm_status sm_brep_tessellate_some(sm_brep* brep, const sm_tessellation_params* p
             }
             // From here the tessellator owns the copy.
             SmBoolean same = FALSE;
-            const SmStatus status = t->tess.Phase1SetupFaces(copy, some, same);
+            const SmStatus status = t->tess.Phase1SetupFaces(copy, some, same, caches);
             if (status != SM_SUCCESS) return status;
             if (!same) {
                 *out = nullptr;
@@ -2826,5 +2921,11 @@ sm_status sm_brep_tessellate_some(sm_brep* brep, const sm_tessellation_params* p
         return mesh_faces(*t, wanted, out);
     });
 }
+
+sm_surface_caches* sm_surface_caches_new(void) { return new (std::nothrow) sm_surface_caches(); }
+
+size_t sm_surface_caches_count(const sm_surface_caches* caches) { return caches ? caches->count() : 0; }
+
+void sm_surface_caches_free(sm_surface_caches* caches) { delete caches; }
 
 }  // extern "C"

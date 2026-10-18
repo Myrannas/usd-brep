@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use smlib::{
-    Brep, EdgeBlend, EdgeQuery, Error, FaceKey, FilletOptions, Kernel, Mesh, TessellationParams,
+    Brep, EdgeBlend, EdgeQuery, Error, FaceKey, FilletOptions, Kernel, Mesh, SurfaceCaches,
+    TessellationParams,
 };
 
 const L: f64 = 100.0;
@@ -412,13 +413,24 @@ fn rejects_a_flag_count_other_than_the_face_count() {
 /// against a whole tessellation. Returns how many faces were reused, and adds
 /// the new ones.
 fn reuse_some(name: &str, part: &Brep, params: &TessellationParams, kept: &mut Kept) -> usize {
+    reuse_some_with(name, part, params, kept, None)
+}
+
+/// [`reuse_some`], keeping surface caches in `caches`.
+fn reuse_some_with(
+    name: &str,
+    part: &Brep,
+    params: &TessellationParams,
+    kept: &mut Kept,
+    caches: Option<&mut SurfaceCaches>,
+) -> usize {
     let keys = part.tessellation_keys(params).unwrap();
     let wanted: Vec<bool> = keys
         .iter()
         .map(|key| key.as_ref().is_none_or(|key| !kept.contains_key(key)))
         .collect();
     let mesh = part
-        .tessellate_some(params, &wanted)
+        .tessellate_some(params, &wanted, caches)
         .unwrap()
         .unwrap_or_else(|| panic!("{name}: no face of these parts refines"));
     assert_face_runs(name, &mesh);
@@ -596,9 +608,9 @@ fn tessellate_some_rejects_a_flag_count_other_than_the_face_count() {
         let part = block(k).unwrap();
         let params = final_params();
         (
-            part.tessellate_some(&params, &[true; 5]).map(|_| ()),
+            part.tessellate_some(&params, &[true; 5], None).map(|_| ()),
             part.tessellation_keys(&params).map(|keys| keys.len()),
-            part.tessellate_some(&params, &[false; 6]).unwrap(),
+            part.tessellate_some(&params, &[false; 6], None).unwrap(),
         )
     });
     assert!(too_few.is_err());
@@ -640,14 +652,68 @@ fn tessellate_some_declines_boundaries_that_need_refining() {
         let alone: Vec<bool> = (0..faces)
             .map(|face| {
                 let wanted: Vec<bool> = (0..faces).map(|f| f == face).collect();
-                part.tessellate_some(&params, &wanted).unwrap().is_some()
+                part.tessellate_some(&params, &wanted, None)
+                    .unwrap()
+                    .is_some()
             })
             .collect();
-        let together = part.tessellate_some(&params, &vec![true; faces]).unwrap();
+        let together = part
+            .tessellate_some(&params, &vec![true; faces], None)
+            .unwrap();
         (alone, together.is_some(), part.tessellate(&params).unwrap())
     });
     // The planar ends refine; the cylinders don't.
     assert_eq!(alone, [true, false, false, true]);
     assert!(!together, "the ends refine with every face wanted too");
     assert!(whole.triangle_count() > 0);
+}
+
+#[test]
+fn kept_surface_caches_leave_faces_as_they_were() {
+    // The hole's steps and the other parts again, with surface caches kept
+    // from step to step.
+    let (reused, caches_kept) = on_kernel(|k| {
+        let mut kept = Kept::new();
+        let mut caches = SurfaceCaches::new(k);
+        let mut reused = Vec::new();
+        let mut caches_kept = Vec::new();
+        let mut parts: Vec<(String, Brep)> = [(10.0, 9.0), (12.0, 9.0), (14.0, 10.0), (10.0, 9.0)]
+            .into_iter()
+            .map(|(x, r)| (format!("hole at {x}, radius {r}"), holed(k, x, r).unwrap()))
+            .collect();
+        parts.push(("boss 12".into(), bossed(k, 12.0).unwrap()));
+        parts.push(("boss 14".into(), bossed(k, 14.0).unwrap()));
+        for (name, part) in &parts {
+            for params in [final_params(), preview_params()] {
+                reused.push(reuse_some_with(
+                    name,
+                    part,
+                    &params,
+                    &mut kept,
+                    Some(&mut caches),
+                ));
+                caches_kept.push(caches.len());
+            }
+        }
+        (reused, caches_kept)
+    });
+    assert_eq!(&reused[..2], &[0, 0]);
+    assert!(
+        reused[2..4].iter().all(|&n| n >= 8),
+        "faces reused per step: {reused:?}"
+    );
+    // Faces next to the moving hole and the growing boss leave their
+    // caches for the next step; going back to the first hole reuses every
+    // face, which leaves the store as it was.
+    assert_eq!(
+        caches_kept[..2],
+        [0, 0],
+        "nothing is kept beside every face"
+    );
+    assert!(
+        [2, 3, 4, 5, 6, 7, 10, 11]
+            .iter()
+            .all(|&i| caches_kept[i] > 0),
+        "caches kept per step: {caches_kept:?}"
+    );
 }

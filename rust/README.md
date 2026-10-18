@@ -147,9 +147,18 @@ and order of the faces across it. A face keyed as one an earlier
 triangles. `tessellate_some` checks the faces it sets up and returns `None`
 when one refines, for the caller to tessellate the whole solid instead.
 
+A face's surface cache (`SmTessSrfCache`), a subdivision of its surface to the
+parameters, depends only on the surface and the parameters, and is often the
+largest part of setting a face up. With a `SurfaceCaches` store,
+`tessellate_some` keeps the caches of faces it set up only to split shared
+edges, and faces whose surfaces are identical take them later rather than
+building their own (`SmTessSrfCacheStore`, the second kernel patch). In a drag
+the faces around the moving ones keep theirs from step to step.
+
 `tests/tessellation.rs` checks every face against `Brep::tessellate`, partial
-meshes against whole ones, and kept faces standing in across edits, both ways,
-and that `tessellate_some` declines faces whose boundaries need refining.
+meshes against whole ones, and kept faces standing in across edits, both ways
+and with surface caches kept, and that `tessellate_some` declines faces whose
+boundaries need refining.
 
 ## Build cache
 
