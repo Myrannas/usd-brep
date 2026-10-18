@@ -1418,6 +1418,38 @@ fn offset_faces_on_curved_faces() {
 }
 
 #[test]
+fn edges_read_after_an_offset_and_a_fillet() {
+    // A boss raised by a sweep, the far end trimmed, then the boss's rim
+    // rounded: the fillet leaves the seam's range an ulp past its line's
+    // domain, which SmApiEvaluateCurve refuses to evaluate.
+    let (edges, manifold) = on_kernel(|k| {
+        let mut part = Brep::cuboid(k, [-100.0, -60.0, -40.0], [200.0, 120.0, 80.0])?
+            .union(Brep::cylinder(k, [-50.0, 0.0, 40.0], 15.0, 20.0)?)?;
+        let boss_top = FaceQuery::OnPlane {
+            point: [0.0, 0.0, 60.0],
+            normal: UP,
+        };
+        let boss_top = part.find_faces(&boss_top, &Tolerance::default())?;
+        let sweep = part.sweep_face(boss_top[0], 10.0)?;
+        part = part.union(sweep.prism)?;
+        part.merge_faces()?;
+        let end = part.find_faces(&side(neg(X)), &Tolerance::default())?;
+        let rim = EdgeQuery::OnCircle {
+            center: [-50.0, 0.0, 40.0],
+            axis: UP,
+            radius: 15.0,
+        };
+        let part = part
+            .offset_faces(&end, -10.0)?
+            .fillet(&[EdgeBlend::round(rim, 3.0)], &options())?;
+        Ok::<_, Error>((part.edges()?.len(), part.is_manifold()?))
+    })
+    .unwrap();
+    assert_eq!(edges, 17);
+    assert!(manifold);
+}
+
+#[test]
 fn offset_faces_refuses_rather_than_return_a_wrong_solid() {
     // Moves the kernel gets wrong today. Each must either come back exact or
     // fail with a clean error, never as a broken or inconsistent solid:

@@ -418,12 +418,16 @@ sm_status describe_edge(const SmEdge* edge, const FaceIndex& face_index, sm_edge
     double t1 = 0.0;
     SmApiStatus status = SmApiEdgeParameterRange(edge, t0, t1);
     if (status != SM_SUCCESS) return status;
+    // A fillet can leave an edge's range an ulp past its curve's domain, which
+    // SmApiEvaluateCurve rejects, so samples stay inside both.
+    const SmExtent1d domain = edge->GetCurve() ? edge->GetCurve()->GetNaturalInterval() : SmExtent1d(t0, t1);
     for (int k = 0; k < SM_EDGE_SAMPLES; ++k) {
         SmVector3d point;
         SmVector3d* point_out = &point;
         SmVector3d* no_derivative = nullptr;
         SmVector3d* no_second = nullptr;
-        const double t = t0 + (t1 - t0) * k / (SM_EDGE_SAMPLES - 1);
+        const double t =
+            std::min(std::max(t0 + (t1 - t0) * k / (SM_EDGE_SAMPLES - 1), domain.GetMin()), domain.GetMax());
         status = SmApiEvaluateCurve(edge->GetCurve(), t, point_out, no_derivative, no_second);
         if (status != SM_SUCCESS) return status;
         put3(info.points[k], point);
