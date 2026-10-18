@@ -4,8 +4,8 @@
   the `cc` crate, plus a C shim (`smlib-sys/shim`), and exposes the shim through
   committed bindgen bindings.
 - `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, booleans,
-  face sweeps, face merging, fillets, chamfers, volume, manifold check, face
-  and edge queries, labels) and `Mesh`, a tessellation that keeps its links to
+  face sweeps, face offsets, face merging, fillets, chamfers, volume, manifold
+  check, face and edge queries, labels) and `Mesh`, a tessellation that keeps its links to
   the B-rep: per-triangle face ids, per-vertex surface (u, v), per-face
   surface parameters, per-edge polylines, and every face's and edge's label.
 
@@ -76,6 +76,38 @@ id, a role string and an index) to a face or edge as an SMLib attribute
 `Brep::faces`, `Brep::edges` and `Mesh` report the labels. `tests/labels.rs`
 checks them through booleans that split faces, fillets, chamfers, sweeps and
 merges.
+
+## Offset faces
+
+`Brep::offset_faces(faces, distance)` moves the faces at the given indices
+(from `Brep::faces`, or `Brep::find_faces` with a `FaceQuery`: `OnPlane`,
+`Facing`, `Kind`, `Labelled`, `And` / `Or` / `Not`) along their outward
+normals, the way Parasolid's face offset does: every other neighbour is
+extended or trimmed along its own surface, so a chamfer grows or shrinks and
+a drafted wall keeps its draft. Planes move flat, holes and bosses change
+radius, cones slide along their axis, spheres and tori change radius. Fillets
+and corner blends on a moved plane move with it, staying tangent to
+everything they touch: they rise with a raised top, slide along a drafted
+wall, follow two pushed faces at once.
+
+It is `SmBrep::LocalOperation`, the kernel's own replace-a-face local
+operation on the offset executive, reimplemented in the shim, with three
+kernel patches (see `PATCHES.md`). The topology never changes, so every face
+and edge keeps its label and its index. The result is checked: a move that
+would make a face vanish fails (`SHIM_ERR_CHANGED_TOPOLOGY`, or
+`SHIM_ERR_BROKE_SOLID` when the kernel gets that far), and any result that
+isn't manifold, has gaps over the brep's tolerance, or whose own
+volume disagrees with its tessellation's fails with `SHIM_ERR_BROKE_SOLID`.
+Blends on a moved curved face (a rounded hole rim) fail with
+`SHIM_ERR_UNSUPPORTED_FACE`, and so, for now, do fillets sliding along drafted
+walls and a few moves of sphere faces that the kernel gets wrong.
+
+`Brep::tapered_prism`, `Brep::cone` and `Brep::torus` build drafted prisms,
+frustums and rings.
+
+```sh
+cargo run --release -p smlib --example offset_face   # timings
+```
 
 ## Build cache
 

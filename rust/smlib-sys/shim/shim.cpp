@@ -10,6 +10,8 @@
 #include <new>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <SmApiBrep.h>
@@ -34,6 +36,9 @@
 #include <SmFilletExecutive.h>
 #include <SmFilletSolver.h>
 #include <SmFilletStandardSolver.h>
+#include <SmLine.h>
+#include <SmOffsetExecutive.h>
+#include <SmOffsetGeometryCreation.h>
 #include <SmPlane.h>
 #include <SmPoly.h>
 #include <SmPrimitiveCreation.h>
@@ -41,6 +46,7 @@
 #include <SmSurfOfRevolution.h>
 #include <SmSurfTypes.h>
 #include <SmTorus.h>
+#include <SmVertex.h>
 
 struct sm_mesh {
     std::vector<float> positions;
@@ -519,10 +525,17 @@ const double PLANAR_TOLERANCE = 1e-7;
 
 // The normal of a planar face pointing out of the solid, if it's planar. A
 // plane's normal is the same everywhere, so it's evaluated mid-domain and then
-// oriented as outward_normal orients it.
+// oriented as outward_normal orients it. SmSurface::IsPlanar bounds the
+// surface with a box no thinner than about 1e-5, so a NURBS surface whose
+// control points share a plane (a tapered extrusion's walls) is checked
+// directly (plane_of).
+bool plane_of(const SmSurface* surface, SmPoint3d& point, SmVector3d& normal);
+
 bool outward_plane(const SmFace* face, double normal[3]) {
     const SmSurface* surface = face->GetSurface();
-    if (!surface || !surface->IsPlanar(PLANAR_TOLERANCE)) return false;
+    SmPoint3d on_plane;
+    SmVector3d plane_normal;
+    if (!surface || (!surface->IsPlanar(PLANAR_TOLERANCE) && !plane_of(surface, on_plane, plane_normal))) return false;
     const SmExtent2d domain = face->GetUVDomain();
     const SmVector2d middle(0.5 * (domain.GetUMin() + domain.GetUMax()), 0.5 * (domain.GetVMin() + domain.GetVMax()));
     SmVector3d direction;
@@ -668,6 +681,996 @@ sm_status sweep_face(const SmBrep& brep, SmFace* face, double distance, SmBrep*&
     }
     prism = result.release();
     return SM_SUCCESS;
+}
+
+// The largest distance from a vertex to its edges or faces, or from an edge
+// to its faces (SmBrep::ValidateAndUpdateTolerances, validating only).
+sm_status largest_gap(SmBrep& brep, double& out) {
+    SmBoolean violated = FALSE;
+    double trim = 0.0;
+    double vertex_edge = 0.0;
+    double vertex_face = 0.0;
+    double edge_face = 0.0;
+    const SmStatus status = brep.ValidateAndUpdateTolerances(TRUE, violated, trim, vertex_edge, vertex_face, NULL,
+                                                             SM_LEVEL_0, NULL, NULL, NULL, NULL, NULL, NULL,
+                                                             &edge_face, NULL);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    out = std::max({vertex_edge, vertex_face, edge_face});
+    return SM_SUCCESS;
+}
+
+// Whether the brep's own volume (SmApiBrepComputeVolume, from its faces' trim
+// curves) agrees with the volume enclosed by its tessellation. The offset
+// executive can return a solid that tessellates right and passes the gap
+// checks but whose trims disagree with its edges; mass properties, and
+// booleans after them, then go wrong. Seen with fillets sliding along drafted
+// walls: 20% short. Agreement is to 2%, above a coarse mesh's chord error and
+// well inside that.
+sm_status volume_agrees(SmBrep& brep, bool& agrees) {
+    agrees = false;
+    double volume = 0.0;
+    SmApiStatus status = SmApiBrepComputeVolume(&brep, 1e-4, volume);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    SmTessellationParams quality;
+    // Coarse, by angle alone: an exact solid's mesh is within about 1% of
+    // its volume.
+    quality.dChordHeightTol = 0.0;
+    quality.dCurveAngleTolDeg = 15.0;
+    quality.dSurfaceAngleTolDeg = 15.0;
+    quality.dMaxEdgeLength = 0.0;
+    quality.dMaxAspectRatio = 0.0;
+    SmPolyBrep* poly = nullptr;
+    status = SmApiTessellate(&brep, poly, quality);
+    if (status != SM_SUCCESS || !poly) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    const std::unique_ptr<SmPolyBrep, PolyBrepDeleter> owned(poly);
+    SmTArray<SmPolyFace*> polygons;
+    poly->GetPolyFaces(polygons);
+    double enclosed = 0.0;
+    SmTArray<SmPolyLoop*> loops;
+    SmTArray<SmPolyEdge*> corners;
+    for (ULONG i = 0; i < polygons.GetSize(); ++i) {
+        loops.RemoveAll();
+        polygons[i]->GetPolyLoops(loops);
+        for (ULONG l = 0; l < loops.GetSize(); ++l) {
+            corners.RemoveAll();
+            loops[l]->GetPolyEdges(corners);
+            if (corners.GetSize() < 3) continue;
+            const SmPoint3d first = corners[0]->GetStartPolyVertex()->GetPoint();
+            for (ULONG k = 1; k + 1 < corners.GetSize(); ++k) {
+                const SmPoint3d b = corners[k]->GetStartPolyVertex()->GetPoint();
+                const SmPoint3d c = corners[k + 1]->GetStartPolyVertex()->GetPoint();
+                enclosed += SmVector3d(first.x, first.y, first.z).Dot(SmVector3d(b.x, b.y, b.z) * SmVector3d(c.x, c.y, c.z)) / 6.0;
+            }
+        }
+    }
+    agrees = std::fabs(volume - enclosed) <= 2e-2 * std::fabs(enclosed);
+    return SM_SUCCESS;
+}
+
+// Runs a local operation and holds it to what it promises: the same faces and
+// edges, still a manifold solid, every vertex and edge on its faces to the
+// brep's tolerance, and a volume its own tessellation agrees with. The offset
+// executive can report success while failing any of them.
+template <typename F>
+sm_status keeping_topology(SmBrep& brep, F&& operation) {
+    const bool was_solid = is_manifold_solid(brep);
+    const ULONG faces = brep.GetNumFaces();
+    const ULONG edges = brep.GetNumEdges();
+    const sm_status status = operation();
+    if (status != SM_SUCCESS) return status;
+    if (was_solid && !is_manifold_solid(brep)) return SM_SHIM_ERR_BROKE_SOLID;
+    if (brep.GetNumFaces() != faces || brep.GetNumEdges() != edges) return SM_SHIM_ERR_CHANGED_TOPOLOGY;
+    double gap = 0.0;
+    sm_status measured = largest_gap(brep, gap);
+    if (measured != SM_SUCCESS) return measured;
+    if (gap > brep.GetTolerance()) return SM_SHIM_ERR_BROKE_SOLID;
+    bool agrees = false;
+    measured = volume_agrees(brep, agrees);
+    if (measured != SM_SUCCESS) return measured;
+    return agrees ? SM_SUCCESS : SM_SHIM_ERR_BROKE_SOLID;
+}
+
+// The plane a surface lies on, if it is planar: SmPlane, or a NURBS surface
+// whose control points all lie on one plane (such as a tapered extrusion's
+// walls), which makes it exactly flat. SmSurface::IsPlanar only bounds the
+// surface with a box, about 1e-5 thick at best, so it just proposes the plane.
+bool plane_of(const SmSurface* surface, SmPoint3d& point, SmVector3d& normal) {
+    if (surface->GetType() == SmPlane_TYPE) {
+        const SmAxis2Placement& placement = static_cast<const SmPlane*>(surface)->GetPosition();
+        point = placement.GetOrigin();
+        normal = placement.GetZAxis();
+        return true;
+    }
+    if (surface->GetType() != SmBSplineSurface_TYPE || !surface->IsPlanar(1e-3, &point, &normal)) return false;
+    ULONG u_count = 0;
+    ULONG v_count = 0;
+    SmTArray<SmPoint3d> poles;
+    SmTArray<double> weights;
+    if (static_cast<const SmBSplineSurface*>(surface)->GetControlPointNet(u_count, v_count, poles, weights) !=
+        SM_SUCCESS) {
+        return false;
+    }
+    for (ULONG i = 0; i < weights.GetSize(); ++i) {
+        if (!(weights[i] > 0.0)) return false;
+    }
+    for (ULONG i = 0; i < poles.GetSize(); ++i) {
+        if (std::fabs((poles[i] - point).Dot(normal)) > 1e-9 * (1.0 + (poles[i] - point).Length())) return false;
+    }
+    return true;
+}
+
+bool is_cylinder(const SmSurface* surface) {
+    const SM_TYPE type = surface->GetType();
+    return type == SmCylinder_TYPE || (type == SmCone_TYPE && static_cast<const SmCone*>(surface)->IsCylinder());
+}
+
+// Whether translating the surface along `direction` leaves it where it is: a
+// plane containing the direction, or a cylinder along it.
+bool invariant_under(const SmSurface* surface, const SmVector3d& direction) {
+    SmPoint3d point;
+    SmVector3d normal;
+    if (plane_of(surface, point, normal)) return std::fabs(normal.Dot(direction)) < 1e-9;
+    if (is_cylinder(surface)) {
+        const SmVector3d axis = static_cast<const SmCone*>(surface)->GetPosition().GetZAxis();
+        return 1.0 - std::fabs(axis.Dot(direction)) < 1e-12;
+    }
+    return false;
+}
+
+// Whether a face smoothly joined to a moving face is a blend that can ride
+// along with it: a round (cylinder, sphere or torus, as the fillet executive
+// makes them), or any other curved face that SmFace::IdentifyFillet takes
+// for a fillet, such as the surface of revolution on a hole's rim.
+bool is_blend(const SmFace* face, double tolerance) {
+    const SmSurface* surface = face->GetSurface();
+    const SM_TYPE type = surface->GetType();
+    if (is_cylinder(surface) || type == SmSphere_TYPE || type == SmTorus_TYPE) return true;
+    SmPoint3d point;
+    SmVector3d normal;
+    if (plane_of(surface, point, normal)) return false;
+    SmBoolean fillet = FALSE;
+    ULONG section = 0;
+    ULONG solver = 0;
+    SmSurfParamType rails = SM_SP_NEITHER;
+    double radius = 0.0;
+    double distance = 0.0;
+    SmTArray<SmEdge*> low;
+    SmTArray<SmEdge*> high;
+    return face->IdentifyFillet(tolerance, 1.0, TRUE, TRUE, fillet, section, solver, rails, radius, distance, low,
+                                high) == SM_SUCCESS &&
+           fillet;
+}
+
+// Whether the two faces meet smoothly along the edge: their outward normals
+// agree at its midpoint.
+bool smooth_edge(const SmEdge* edge, const SmFace* a, const SmFace* b) {
+    double t0 = 0.0;
+    double t1 = 0.0;
+    if (SmApiEdgeParameterRange(edge, t0, t1) != SM_SUCCESS) return false;
+    SmVector3d mid;
+    SmVector3d* point_out = &mid;
+    SmVector3d* no_derivative = nullptr;
+    SmVector3d* no_second = nullptr;
+    if (SmApiEvaluateCurve(edge->GetCurve(), 0.5 * (t0 + t1), point_out, no_derivative, no_second) != SM_SUCCESS) {
+        return false;
+    }
+    double na[3];
+    double nb[3];
+    const SmPoint3d at(mid.x, mid.y, mid.z);
+    if (!outward_normal(a, at, na) || !outward_normal(b, at, nb)) return false;
+    return na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2] > std::cos(0.5 * SM_PI / 180.0);
+}
+
+// The faces smoothly joined to `face` across its edges, each once.
+std::vector<SmFace*> smooth_neighbours(SmFace* face) {
+    std::vector<SmFace*> out;
+    SmTArray<SmEdge*> edges;
+    face->GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        const EdgeFaces sides = faces_of(edges[i]);
+        if (sides.use_count != 2) continue;
+        SmFace* other = sides.faces[0] == face ? sides.faces[1] : sides.faces[0];
+        if (!other || other == face || std::find(out.begin(), out.end(), other) != out.end()) continue;
+        if (smooth_edge(edges[i], face, other)) out.push_back(other);
+    }
+    return out;
+}
+
+// How an offset changes one face's surface.
+struct Motion {
+    enum Kind {
+        kKept,    // left as it is
+        kShift,   // translated by `shift`: picked planes and cones, and the blends on them
+        kOffset,  // replaced by its offset: other picked curved faces
+    };
+    Kind kind = kKept;
+    SmVector3d shift = SmVector3d(0.0, 0.0, 0.0);
+};
+
+using Motions = std::unordered_map<const SmFace*, Motion>;
+
+Motion motion_of(const Motions& motions, const SmFace* face) {
+    const auto found = motions.find(face);
+    return found == motions.end() ? Motion() : found->second;
+}
+
+// One linear condition on a blend's translation v: normal . v == value.
+struct Row {
+    SmVector3d normal;
+    double value;
+};
+
+// What a blend's translation v must satisfy to stay tangent to a neighbour
+// whose surface moves by `shift`: v - shift must leave the neighbour's
+// surface in place. A plane allows any move within it, a cylinder any move
+// along its axis, anything else none.
+void tangency_rows(const SmSurface* surface, const SmVector3d& shift, std::vector<Row>& rows) {
+    SmPoint3d point;
+    SmVector3d normal;
+    if (plane_of(surface, point, normal)) {
+        rows.push_back({normal, normal.Dot(shift)});
+        return;
+    }
+    if (is_cylinder(surface)) {
+        const SmVector3d axis = static_cast<const SmCone*>(surface)->GetPosition().GetZAxis();
+        SmVector3d across = std::fabs(axis.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
+        across = across - axis * across.Dot(axis);
+        across = across / across.Length();
+        const SmVector3d other = axis * across;  // cross product
+        rows.push_back({across, across.Dot(shift)});
+        rows.push_back({other, other.Dot(shift)});
+        return;
+    }
+    for (const SmVector3d& e : {SmVector3d(1.0, 0.0, 0.0), SmVector3d(0.0, 1.0, 0.0), SmVector3d(0.0, 0.0, 1.0)}) {
+        rows.push_back({e, e.Dot(shift)});
+    }
+}
+
+// The shortest v meeting every row, or false when the rows conflict.
+bool solve_rows(const std::vector<Row>& rows, double tolerance, SmVector3d& v) {
+    std::vector<Row> basis;  // orthonormal normals, with values scaled to match
+    for (const Row& row : rows) {
+        SmVector3d a = row.normal;
+        double b = row.value;
+        for (const Row& e : basis) {
+            const double k = a.Dot(e.normal);
+            a = a - e.normal * k;
+            b -= k * e.value;
+        }
+        const double length = a.Length();
+        if (length < 1e-9) {
+            if (std::fabs(b) > tolerance) return false;
+            continue;
+        }
+        basis.push_back({a / length, b / length});
+    }
+    v = SmVector3d(0.0, 0.0, 0.0);
+    for (const Row& e : basis) v = v + e.normal * e.value;
+    return true;
+}
+
+// The face's outward unit normal at a point inside it.
+sm_status outward_normal_inside(const SmFace* face, SmPoint3d& inside, SmVector3d& normal) {
+    const SmApiStatus status = SmApiFaceInternalPoint(face, inside);
+    if (status != SM_SUCCESS) return status;
+    double n[3];
+    if (!outward_normal(face, inside, n)) return SM_ERR;
+    normal = SmVector3d(n[0], n[1], n[2]);
+    return SM_SUCCESS;
+}
+
+// Works out how every face changes when the picked faces move `distance`
+// along their outward normals:
+//
+// - A picked plane is translated by distance x its normal, and a picked cone
+//   along its axis (its offset is that translation); any other picked curved
+//   face is replaced by its offset.
+// - Blends joined to a moving face through smooth edges (fillets, the
+//   corners between them) are translated by the shortest move that keeps
+//   them tangent to every neighbour, layer by layer outward from the picked
+//   faces: a fillet between a moved top and a kept wall slides along the
+//   wall. A blend that the move leaves in place, such as a vertical fillet
+//   under a raised top, stretches like a wall instead.
+//
+// Every other face keeps its surface and is extended or trimmed along it.
+//
+// Refused (SM_SHIM_ERR_UNSUPPORTED_FACE): blends on a picked curved face,
+// whose new shape a translation can't give, and blends no translation keeps
+// tangent to all their neighbours.
+sm_status plan_offset(const SmTArray<SmFace*>& picked, double distance, double tolerance, Motions& motions) {
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        SmPoint3d inside;
+        SmVector3d normal;
+        const sm_status status = outward_normal_inside(picked[i], inside, normal);
+        if (status != SM_SUCCESS) return status;
+        Motion motion;
+        SmPoint3d on_plane;
+        SmVector3d plane_normal;
+        const SmSurface* surface = picked[i]->GetSurface();
+        if (plane_of(surface, on_plane, plane_normal)) {
+            motion.kind = Motion::kShift;
+            motion.shift = normal * distance;
+        } else if (surface->GetType() == SmCone_TYPE && !static_cast<const SmCone*>(surface)->IsCylinder()) {
+            // A cone's offset is the cone slid along its axis, by whatever
+            // moves each point `distance` along the normal: d / (n . axis),
+            // the same everywhere on it. Its apex lands on the new apex.
+            const SmVector3d axis = static_cast<const SmCone*>(surface)->GetPosition().GetZAxis();
+            motion.kind = Motion::kShift;
+            motion.shift = axis * (distance / normal.Dot(axis));
+        } else {
+            motion.kind = Motion::kOffset;
+        }
+        motions[picked[i]] = motion;
+    }
+
+    const double slack = tolerance * (1.0 + std::fabs(distance));
+    std::vector<SmFace*> blends;
+    std::vector<SmFace*> layer;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) layer.push_back(picked[i]);
+    std::unordered_map<const SmFace*, bool> seen;
+    for (SmFace* face : layer) seen[face] = true;
+    while (!layer.empty()) {
+        std::vector<SmFace*> next;
+        for (SmFace* face : layer) {
+            const Motion moving = motion_of(motions, face);
+            for (SmFace* other : smooth_neighbours(face)) {
+                if (seen[other] || !is_blend(other, tolerance)) continue;
+                if (moving.kind == Motion::kShift && moving.shift.Length() > 0.0 &&
+                    invariant_under(other->GetSurface(), moving.shift / moving.shift.Length())) {
+                    continue;
+                }
+                if (moving.kind == Motion::kOffset) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+                seen[other] = true;
+                next.push_back(other);
+            }
+        }
+        // Each blend from what its already-placed neighbours require; blends
+        // further out aren't placed yet and are checked below.
+        Motions placed;
+        for (SmFace* blend : next) {
+            std::vector<Row> rows;
+            for (SmFace* other : smooth_neighbours(blend)) {
+                const bool pending = std::find(next.begin(), next.end(), other) != next.end() ||
+                                     (is_blend(other, tolerance) && !seen[other] && motions.count(other) == 0);
+                if (pending) continue;
+                const Motion motion = motion_of(motions, other);
+                if (motion.kind == Motion::kOffset) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+                tangency_rows(other->GetSurface(), motion.shift, rows);
+            }
+            Motion motion;
+            motion.kind = Motion::kShift;
+            if (!solve_rows(rows, slack, motion.shift)) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+            placed[blend] = motion;
+        }
+        for (const auto& entry : placed) motions[entry.first] = entry.second;
+        blends.insert(blends.end(), next.begin(), next.end());
+        layer = next;
+    }
+
+    // Every blend must now be tangent to all its neighbours.
+    for (SmFace* blend : blends) {
+        const SmVector3d v = motions[blend].shift;
+        for (SmFace* other : smooth_neighbours(blend)) {
+            const Motion motion = motion_of(motions, other);
+            if (motion.kind == Motion::kOffset) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+            std::vector<Row> rows;
+            tangency_rows(other->GetSurface(), motion.shift, rows);
+            for (const Row& row : rows) {
+                if (std::fabs(row.normal.Dot(v) - row.value) > slack) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+            }
+        }
+    }
+
+    return SM_SUCCESS;
+}
+
+// A copy of the face's surface translated by `shift`.
+//
+// A cone slid along its axis keeps its old height band, which no longer
+// reaches the faces it meets: the executive would then trim it on its G1
+// extension, a NURBS surface, rather than the cone. So a cone's band is
+// widened by the slide on both sides.
+sm_status translated_surface(const SmFace* face, const SmVector3d& shift, SmSurface*& out) {
+    const SmSurface* surface = face->GetSurface();
+    if (!surface) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+    SmSurface* moved = nullptr;
+    SmStatus status = surface->Copy(*SmApiGetOrCreateContext(), moved);
+    if (status != SM_SUCCESS) return status;
+    SmAxis2Placement placement;
+    placement.Translate(shift);
+    status = moved->Transform(placement);
+    if (status == SM_SUCCESS && moved->GetType() == SmCone_TYPE && !static_cast<SmCone*>(moved)->IsCylinder()) {
+        SmCone* cone = static_cast<SmCone*>(moved);
+        const double slide = std::fabs(shift.Dot(cone->GetPosition().GetZAxis()));
+        SmExtent2d band = moved->GetSTEPUVDomain();
+        double low = band.GetVMin() - 2.0 * slide;
+        double high = band.GetVMax() + 2.0 * slide;
+        // Never past the apex.
+        SmBoolean cylinder = FALSE;
+        SmPoint3d apex;
+        double apex_height = 0.0;
+        if (cone->GetApex(cylinder, apex, apex_height) == SM_SUCCESS) {
+            if (apex_height <= band.GetVMin()) low = std::max(low, apex_height);
+            if (apex_height >= band.GetVMax()) high = std::min(high, apex_height);
+        }
+        band.SetMinMax(band.GetUMin(), low, band.GetUMax(), high);
+        status = cone->AdjustSTEPUVDomain(band);
+    }
+    if (status != SM_SUCCESS) {
+        delete moved;
+        return status;
+    }
+    out = moved;
+    return SM_SUCCESS;
+}
+
+// The face's surface offset `distance` outward (SmSurface::CreateOffsetSurface,
+// as the solid offset makes them: exact for analytic surfaces, so a cylinder,
+// sphere or torus changes radius), checked to pass through the face's inside
+// point moved along its outward normal.
+sm_status offset_surface(const SmFace* face, double distance, double tolerance, SmSurface*& out) {
+    SmPoint3d inside;
+    SmVector3d normal;
+    sm_status status = outward_normal_inside(face, inside, normal);
+    if (status != SM_SUCCESS) return status;
+    const SmPoint3d target = inside + normal * distance;
+    const SmSurface* surface = face->GetSurface();
+    const SmContext& context = *SmApiGetOrCreateContext();
+    // The surface's own normal may point in or out; try outward first.
+    SmPoint3d closest;
+    SmTArray<SmPoint2d> uvs;
+    double gap = 0.0;
+    SmVector3d own;
+    if (SmApiSurfaceClosestPoint(surface, inside, closest, uvs, gap) != SM_SUCCESS || uvs.GetSize() == 0 ||
+        SmApiEvaluateSurfaceNormal(surface, SmVector2d(uvs[0].x, uvs[0].y), own) != SM_SUCCESS) {
+        return SM_ERR;
+    }
+    const double sign = own.Dot(normal) >= 0.0 ? 1.0 : -1.0;
+    SmSurface* offset = nullptr;
+    status = static_cast<sm_status>(surface->CreateOffsetSurface(context, sign * distance, tolerance / 10.0, offset));
+    if (status != SM_SUCCESS || !offset) {
+        delete offset;
+        return status != SM_SUCCESS ? status : SM_SHIM_ERR_UNSUPPORTED_FACE;
+    }
+    uvs.RemoveAll();
+    if (SmApiSurfaceClosestPoint(offset, target, closest, uvs, gap) != SM_SUCCESS || gap > tolerance) {
+        delete offset;
+        return SM_SHIM_ERR_UNSUPPORTED_FACE;
+    }
+    out = offset;
+    return SM_SUCCESS;
+}
+
+// Whether the face's surface, after its own motion, is also where `shift`
+// would put it: the motion is `shift`, or the difference moves the surface
+// within itself.
+bool lands_like(const SmFace* face, const Motion& motion, const SmVector3d& shift) {
+    if (motion.kind == Motion::kOffset) return false;
+    const SmVector3d difference = shift - motion.shift;
+    const double length = difference.Length();
+    return length <= 1e-12 || invariant_under(face->GetSurface(), difference / length);
+}
+
+// SmBrep::LocalOperation's geometry, except for edges that move rigidly.
+//
+// An edge moves rigidly by v when every face at both of its ends lands where
+// v would put it: it moves by v, or v moves it within its own surface (a
+// wall under a raised fillet, the stretched fillet beside a pushed wall).
+// The new edge is then exactly the old one moved by v, ends and all, so
+// nothing needs intersecting. Each face's copy of the edge (its old trim
+// curve lifted onto its new surface) is right already where the face itself
+// moved by v; elsewhere it is replaced with the moved edge here.
+//
+// Mating such edges instead re-intersects surfaces whose intersection is
+// known. That loses precision, fails outright where two equal fillets meet
+// at a corner (their cylinders touch tangentially at its tip), and on tangent
+// edges between a moved face and a kept one lifts whichever side's old trim
+// curve comes first in pointer order, which is the old edge half the time.
+class RigidMoveGeometry : public SmLocalOperationGeometryCreation {
+public:
+    RigidMoveGeometry(double distance, double tolerance, SmTArray<SmFace*>& faces, SmTArray<SmSurface*>& surfaces,
+                      const Motions& motions)
+        : SmLocalOperationGeometryCreation(distance, tolerance, faces, surfaces), m_motions(motions) {}
+
+    SmStatus EdgeuseOffset(const SmContext& context, SmOffsetExecutive* executive, const SmEdgeuse* original,
+                           const SmEdgeuse* other_original, SmEdgeuse* offset, SmEdgeuse* radial_offset,
+                           SmSurface*& new_surface, SmTArray<SmCurve*>& trims, SmTArray<SmOrientType>& orients,
+                           SmSSIData& self_intersections, SmMarkType mark) override {
+        if (!m_prepared) {
+            m_prepared = true;
+            move_rigid_edges(context, executive, original->GetFace()->GetBrep(), mark);
+        }
+        if (m_moved.count(original->GetEdge())) {
+            new_surface = NULL;
+            self_intersections.m_v3DCurves.ReSet();
+            self_intersections.m_vUVCurves1.ReSet();
+            self_intersections.m_vUVCurves2.ReSet();
+            self_intersections.m_vCurveTypes.ReSet();
+            self_intersections.m_vDeviations.ReSet();
+            return SM_SUCCESS;
+        }
+        return SmLocalOperationGeometryCreation::EdgeuseOffset(context, executive, original, other_original, offset,
+                                                               radial_offset, new_surface, trims, orients,
+                                                               self_intersections, mark);
+    }
+
+private:
+    // The v the edge moves rigidly by, tried as each of its faces' shifts.
+    bool rigid_shift(const SmEdge* edge, SmVector3d& out) const {
+        std::vector<const SmFace*> around;
+        const SmVertex* ends[2] = {edge->GetStartVertex(), edge->GetOtherVertex(edge->GetStartVertex())};
+        for (const SmVertex* end : ends) {
+            if (!end) continue;
+            SmTArray<SmFace*> faces;
+            end->GetFaces(faces);
+            for (ULONG i = 0; i < faces.GetSize(); ++i) around.push_back(faces[i]);
+        }
+        const EdgeFaces sides = faces_of(edge);
+        for (const SmFace* side : sides.faces) {
+            if (!side) continue;
+            const Motion candidate = motion_of(m_motions, side);
+            if (candidate.kind == Motion::kOffset) return false;
+            bool rigid = true;
+            for (const SmFace* face : around) {
+                rigid = rigid && lands_like(face, motion_of(m_motions, face), candidate.shift);
+            }
+            if (rigid) {
+                out = candidate.shift;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The original edge moved by `shift`, with its trim curve on the copy's
+    // (extended) surface, or false if the curve won't drop onto it whole.
+    bool moved_copy(const SmContext& context, SmOffsetExecutive* executive, const SmEdgeuse* original,
+                    SmEdgeuse* copy, const SmVector3d& shift, SmCurve*& curve, SmBSplineCurve*& uv) const {
+        curve = nullptr;
+        uv = nullptr;
+        SmBSplineCurve* moved = original->GetEdge()->CreateTrimmedNURBSCurve(context);
+        if (!moved) return false;
+        SmAxis2Placement placement;
+        placement.Translate(shift);
+        SmSurface* extended = nullptr;
+        SmExtent2d domain;
+        SmTArray<SmBSplineCurve*> drops;
+        double drop = 0.0;
+        double deviation = 0.0;
+        // The original edge may sit looser on its faces than the brep's
+        // tolerance (fillet mitres do): it moves no less precise than it was.
+        const double tolerance = std::max(copy->GetEdge()->GetTolerance(), original->GetEdge()->GetTolerance());
+        if (moved->Transform(placement) != SM_SUCCESS ||
+            executive->GetCreateExtendedSurface(copy->GetFace()->GetSurface(), domain, extended) != SM_SUCCESS ||
+            !extended ||
+            extended->DropAndTrimCurve(context, domain, *moved, moved->GetNaturalInterval(), tolerance / 3.0, drop,
+                                       deviation, drops, TRUE, TRUE) != SM_SUCCESS ||
+            drops.GetSize() != 1 || drop > tolerance) {
+            delete moved;
+            for (ULONG i = 0; i < drops.GetSize(); ++i) delete drops[i];
+            return false;
+        }
+        curve = moved;
+        uv = drops[0];
+        return true;
+    }
+
+    // Puts the moved edge on every copy of `edge` whose face didn't itself
+    // move by `shift`; all or nothing.
+    bool move_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge, const SmVector3d& shift) {
+        SmTArray<SmEdgeuse*> uses;
+        edge->GetEdgeuses(uses);
+        std::vector<std::pair<SmEdgeuse*, SmEdgeuse*>> sides;  // (original, its copy)
+        for (ULONG i = 0; i < uses.GetSize(); ++i) {
+            SmEdgeuse* copy = executive->GetOffsetEdgeuse(uses[i]);
+            if (copy) sides.emplace_back(uses[i], copy);
+        }
+        if (sides.size() < 2) return false;
+        std::vector<SmCurve*> curves(sides.size(), nullptr);
+        std::vector<SmBSplineCurve*> uvs(sides.size(), nullptr);
+        bool ready = true;
+        for (size_t i = 0; i < sides.size() && ready; ++i) {
+            const Motion motion = motion_of(m_motions, sides[i].first->GetFace());
+            if ((motion.shift - shift).Length() <= 1e-12) continue;
+            ready = moved_copy(context, executive, sides[i].first, sides[i].second, shift, curves[i], uvs[i]);
+        }
+        for (size_t i = 0; i < sides.size() && ready; ++i) {
+            if (!curves[i]) continue;
+            SmBoolean delete_curve = FALSE;
+            SmBoolean delete_uv = FALSE;
+            const SmStatus status =
+                ReplaceEdgeCurves(sides[i].second, curves[i], uvs[i], sides[i].first, delete_curve, delete_uv);
+            if (delete_curve) delete curves[i];
+            if (delete_uv) delete uvs[i];
+            curves[i] = nullptr;
+            uvs[i] = nullptr;
+            ready = status == SM_SUCCESS;
+        }
+        for (size_t i = 0; i < sides.size(); ++i) {
+            delete curves[i];
+            delete uvs[i];
+        }
+        return ready;
+    }
+
+    // Before the executive mates any edge, moves every rigid one and marks its
+    // edgeuses as mated. Its neighbours then find its moved ends whichever
+    // order the executive's pointer-keyed maps give: a tangent neighbour that
+    // isn't marked yet is trimmed against its old trim curve instead, which
+    // puts it back at the old corner.
+    void move_rigid_edges(const SmContext& context, SmOffsetExecutive* executive, SmBrep* brep, SmMarkType mark) {
+        if (!brep) return;
+        aim_vertices(*brep);
+        SmTArray<SmEdge*> edges;
+        brep->GetEdges(edges);
+        for (ULONG i = 0; i < edges.GetSize(); ++i) {
+            SmVector3d shift;
+            if (!rigid_shift(edges[i], shift) || !move_copies(context, executive, edges[i], shift)) continue;
+            m_moved.insert(edges[i]);
+            SmTArray<SmEdgeuse*> uses;
+            edges[i]->GetEdgeuses(uses);
+            for (ULONG j = 0; j < uses.GetSize(); ++j) uses[j]->Mark(mark);
+        }
+    }
+
+    // Where an edge's end goes is chosen among candidate points by nearness to
+    // the original vertex (TrimExtendedEdge), which after a long move can be
+    // the wrong one: a stretched fillet's end 10 mm from a pushed wall picked
+    // the far side of the moved fillet's cylinder. So, once the executive has
+    // built its faces (it reads the original brep's vertices only as such
+    // references from then on), each vertex that every face around it would
+    // carry the same way is moved to where it will land, until restore().
+    void aim_vertices(SmBrep& brep) {
+        SmTArray<SmVertex*> vertices;
+        brep.GetVertices(vertices);
+        for (ULONG i = 0; i < vertices.GetSize(); ++i) {
+            SmPoint3d aimed;
+            if (!predict_vertex(vertices[i], aimed)) continue;
+            if ((aimed - vertices[i]->GetPoint()).Length() <= 1e-12) continue;
+            m_aimed.emplace_back(vertices[i], vertices[i]->GetPoint());
+            vertices[i]->SetPoint(aimed);
+        }
+    }
+
+    // Where a vertex will land. When every face around it lands as one shift
+    // would put it, that shift; otherwise the point the moved planes and
+    // straight edges around it agree on: each planar face's plane after its
+    // motion, and each straight edge whose two faces both land as its moved
+    // copy would (a tangent line under a sliding fillet, a wall's edge left
+    // in place), as a line. False when they don't pin one point.
+    bool predict_vertex(const SmVertex* vertex, SmPoint3d& out) const {
+        const SmPoint3d old = vertex->GetPoint();
+        SmTArray<SmFace*> around;
+        vertex->GetFaces(around);
+        for (ULONG j = 0; j < around.GetSize(); ++j) {
+            if (motion_of(m_motions, around[j]).kind == Motion::kOffset) return false;
+        }
+        for (ULONG j = 0; j < around.GetSize(); ++j) {
+            const Motion candidate = motion_of(m_motions, around[j]);
+            bool lands = true;
+            for (ULONG k = 0; k < around.GetSize() && lands; ++k) {
+                lands = lands_like(around[k], motion_of(m_motions, around[k]), candidate.shift);
+            }
+            if (lands) {
+                out = old + candidate.shift;
+                return true;
+            }
+        }
+        std::vector<Row> rows;
+        for (ULONG j = 0; j < around.GetSize(); ++j) {
+            SmPoint3d point;
+            SmVector3d normal;
+            if (!plane_of(around[j]->GetSurface(), point, normal)) continue;
+            const SmVector3d shift = motion_of(m_motions, around[j]).shift;
+            rows.push_back({normal, normal.Dot(point + shift)});
+        }
+        SmTArray<SmEdge*> edges;
+        vertex->GetEdges(edges);
+        for (ULONG j = 0; j < edges.GetSize(); ++j) {
+            SmVector3d direction;
+            if (!straight(edges[j], direction)) continue;
+            const EdgeFaces sides = faces_of(edges[j]);
+            if (!sides.faces[0] || !sides.faces[1]) continue;
+            for (const SmFace* side : sides.faces) {
+                const Motion candidate = motion_of(m_motions, side);
+                if (!lands_like(sides.faces[0], motion_of(m_motions, sides.faces[0]), candidate.shift) ||
+                    !lands_like(sides.faces[1], motion_of(m_motions, sides.faces[1]), candidate.shift)) {
+                    continue;
+                }
+                SmVector3d across = std::fabs(direction.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
+                across = across - direction * across.Dot(direction);
+                across = across / across.Length();
+                const SmVector3d other = direction * across;  // cross product
+                const SmPoint3d through = old + candidate.shift;
+                rows.push_back({across, across.Dot(through)});
+                rows.push_back({other, other.Dot(through)});
+                break;
+            }
+        }
+        // Least squares: the normal equations, solved by Cramer's rule.
+        double m[3][3] = {{0.0}};
+        double b[3] = {0.0};
+        for (const Row& row : rows) {
+            const double n[3] = {row.normal.x, row.normal.y, row.normal.z};
+            for (int r = 0; r < 3; ++r) {
+                b[r] += n[r] * row.value;
+                for (int c = 0; c < 3; ++c) m[r][c] += n[r] * n[c];
+            }
+        }
+        auto det = [](const double a[3][3]) {
+            return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+                   a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        };
+        const double d = det(m);
+        if (std::fabs(d) < 1e-6) return false;
+        double p[3];
+        for (int c = 0; c < 3; ++c) {
+            double a[3][3];
+            for (int r = 0; r < 3; ++r) {
+                for (int k = 0; k < 3; ++k) a[r][k] = k == c ? b[r] : m[r][k];
+            }
+            p[c] = det(a) / d;
+        }
+        const SmPoint3d solved(p[0], p[1], p[2]);
+        for (const Row& row : rows) {
+            if (std::fabs(row.normal.Dot(solved) - row.value) > 1e-6 * (1.0 + std::fabs(row.value))) return false;
+        }
+        out = solved;
+        return true;
+    }
+
+    // Whether the edge is a straight segment, and its direction.
+    static bool straight(const SmEdge* edge, SmVector3d& direction) {
+        double t0 = 0.0;
+        double t1 = 0.0;
+        if (SmApiEdgeParameterRange(edge, t0, t1) != SM_SUCCESS) return false;
+        SmVector3d points[3];
+        for (int k = 0; k < 3; ++k) {
+            SmVector3d* point_out = &points[k];
+            SmVector3d* no_derivative = nullptr;
+            SmVector3d* no_second = nullptr;
+            if (SmApiEvaluateCurve(edge->GetCurve(), t0 + (t1 - t0) * k / 2.0, point_out, no_derivative, no_second) !=
+                SM_SUCCESS) {
+                return false;
+            }
+        }
+        const SmVector3d span = points[2] - points[0];
+        const double length = span.Length();
+        if (length <= 0.0) return false;
+        direction = span / length;
+        const SmVector3d off = points[1] - points[0];
+        return (off - direction * off.Dot(direction)).Length() <= 1e-9 * (1.0 + length);
+    }
+
+public:
+    // Puts the original brep's vertices back.
+    void restore() {
+        for (auto& aimed : m_aimed) aimed.first->SetPoint(aimed.second);
+        m_aimed.clear();
+    }
+
+private:
+    bool m_prepared = false;
+    std::unordered_set<const SmEdge*> m_moved;
+    std::vector<std::pair<SmVertex*, SmPoint3d>> m_aimed;
+    const Motions& m_motions;
+};
+
+// SmBrep::LocalOperation with RigidMoveGeometry: gives each face in `moved`
+// its surface in `surfaces`, which it takes, and every other face a copy of
+// its own, then rebuilds the brep from the offset executive's result. The
+// brep is untouched unless this succeeds.
+// Whether every edge of the face lies on the surface, sampled, and none is a
+// seam (used twice by the face), whose trim curves rebuilding by projection
+// would put on one side of the seam.
+bool edges_lie_on(const SmFace* face, const SmSurface* surface, double tolerance) {
+    SmTArray<SmEdge*> edges;
+    face->GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        const EdgeFaces sides = faces_of(edges[i]);
+        if (sides.faces[0] == sides.faces[1]) return false;
+        double t0 = 0.0;
+        double t1 = 0.0;
+        if (SmApiEdgeParameterRange(edges[i], t0, t1) != SM_SUCCESS) return false;
+        for (int k = 0; k <= 4; ++k) {
+            SmVector3d point;
+            SmVector3d* point_out = &point;
+            SmVector3d* no_derivative = nullptr;
+            SmVector3d* no_second = nullptr;
+            if (SmApiEvaluateCurve(edges[i]->GetCurve(), t0 + (t1 - t0) * k / 4.0, point_out, no_derivative,
+                                   no_second) != SM_SUCCESS) {
+                return false;
+            }
+            SmPoint3d closest;
+            SmTArray<SmPoint2d> uvs;
+            double gap = 0.0;
+            if (SmApiSurfaceClosestPoint(surface, SmPoint3d(point.x, point.y, point.z), closest, uvs, gap) !=
+                    SM_SUCCESS ||
+                gap > tolerance) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Whether the surface is one of the kinds plan_offset recognises: SMLib's
+// IsAnalytic also counts any surface of extrusion or revolution.
+bool canonical(const SmSurface* surface) {
+    const SM_TYPE type = surface->GetType();
+    return type == SmPlane_TYPE || type == SmCylinder_TYPE || type == SmCone_TYPE || type == SmSphere_TYPE ||
+           type == SmTorus_TYPE;
+}
+
+// After the executive, a face it left on an extension of one of the
+// `analytic` surfaces gets that surface back. The executive only keeps the
+// original where the new trims fit its domain to SM_EFF_ZERO, and an offset
+// cone's can spill past it by a hair; it stretches a cylinder along its axis
+// by making it a surface of extrusion. The trims are rebuilt from the edges,
+// so only where every edge lies on the analytic surface and none is a seam;
+// elsewhere the face keeps the extension, which has the same shape.
+void restore_analytic_surfaces(SmBrep& brep, const std::vector<const SmSurface*>& analytic) {
+    if (analytic.empty()) return;
+    const SmContext& context = *brep.GetContext();
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const SmSurface* current = faces[i]->GetSurface();
+        if (!current || canonical(current)) continue;
+        SmPoint3d inside;
+        SmVector3d normal;
+        if (outward_normal_inside(faces[i], inside, normal) != SM_SUCCESS) continue;
+        for (const SmSurface* candidate : analytic) {
+            SmPoint3d closest;
+            SmTArray<SmPoint2d> uvs;
+            double gap = 0.0;
+            if (SmApiSurfaceClosestPoint(candidate, inside, closest, uvs, gap) != SM_SUCCESS || uvs.GetSize() == 0 ||
+                gap > brep.GetTolerance()) {
+                continue;
+            }
+            SmVector3d candidate_normal;
+            SmVector3d current_normal;
+            SmTArray<SmPoint2d> current_uvs;
+            double current_gap = 0.0;
+            if (SmApiEvaluateSurfaceNormal(candidate, SmVector2d(uvs[0].x, uvs[0].y), candidate_normal) != SM_SUCCESS ||
+                SmApiSurfaceClosestPoint(current, inside, closest, current_uvs, current_gap) != SM_SUCCESS ||
+                current_uvs.GetSize() == 0 ||
+                SmApiEvaluateSurfaceNormal(current, SmVector2d(current_uvs[0].x, current_uvs[0].y), current_normal) !=
+                    SM_SUCCESS ||
+                candidate_normal.Dot(current_normal) < 0.999) {
+                continue;
+            }
+            if (!edges_lie_on(faces[i], candidate, brep.GetTolerance())) continue;
+            SmSurface* copy = nullptr;
+            if (candidate->Copy(context, copy) != SM_SUCCESS || !copy) continue;
+            if (brep.ReplaceSurface(faces[i], copy, FALSE, NULL, TRUE) != SM_SUCCESS) continue;
+            break;
+        }
+    }
+}
+
+sm_status rigid_local_operation(SmBrep& brep, const SmTArray<SmFace*>& moved, SmTArray<SmSurface*>& surfaces,
+                                const Motions& motions, double reach) {
+    // Copies of the analytic offsets, to restore afterwards.
+    std::vector<std::unique_ptr<SmSurface>> owned;
+    std::vector<const SmSurface*> analytic;
+    for (ULONG i = 0; i < moved.GetSize(); ++i) {
+        if (motion_of(motions, moved[i]).kind != Motion::kOffset || !surfaces[i]->IsAnalytic()) continue;
+        SmSurface* copy = nullptr;
+        if (surfaces[i]->Copy(*brep.GetContext(), copy) == SM_SUCCESS && copy) {
+            owned.emplace_back(copy);
+            analytic.push_back(copy);
+        }
+    }
+    // And of the kept cylinders, longer by twice the reach at each end, for
+    // the ones the executive stretches along their axis (the fillet beside a
+    // pushed wall): left as surfaces of extrusion, the next offset wouldn't
+    // take them for blends.
+    {
+        SmTArray<SmFace*> kept;
+        brep.GetFaces(kept);
+        for (ULONG i = 0; i < kept.GetSize(); ++i) {
+            ULONG index = 0;
+            const SmSurface* surface = kept[i]->GetSurface();
+            if (moved.FindElement(kept[i], index) || !surface || !is_cylinder(surface)) continue;
+            SmSurface* copy = nullptr;
+            if (surface->Copy(*brep.GetContext(), copy) != SM_SUCCESS || !copy) continue;
+            std::unique_ptr<SmSurface> longer(copy);
+            SmExtent2d band = copy->GetSTEPUVDomain();
+            band.SetMinMax(band.GetUMin(), band.GetVMin() - 2.0 * reach, band.GetUMax(), band.GetVMax() + 2.0 * reach);
+            if (static_cast<SmCone*>(copy)->AdjustSTEPUVDomain(band) != SM_SUCCESS) continue;
+            analytic.push_back(copy);
+            owned.push_back(std::move(longer));
+        }
+    }
+    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
+    const SmContext* context = brep.GetContext();
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    SmTArray<SmSurface*> all_surfaces;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        ULONG index = 0;
+        if (moved.FindElement(faces[i], index)) {
+            all_surfaces.Add(surfaces[index]);
+            continue;
+        }
+        SmSurface* copy = nullptr;
+        const SmStatus status = faces[i]->GetSurface()->CopyAndAddAnalytics(*context, copy);
+        if (status != SM_SUCCESS || !copy) {
+            for (ULONG j = 0; j < all_surfaces.GetSize(); ++j) {
+                if (!surfaces.FindElement(all_surfaces[j], index)) delete all_surfaces[j];
+            }
+            for (ULONG j = 0; j < surfaces.GetSize(); ++j) delete surfaces[j];
+            return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+        }
+        all_surfaces.Add(copy);
+    }
+
+    SmExtent3d box;
+    brep.CalculateBoundingBox(box);
+    SmPoint3d centre;
+    double radius = 0.0;
+    box.ComputeSphereBound(centre, radius);
+    // The distance only sizes the surface extensions, at five times it:
+    // LocalOperation's 2.5 x the bounding radius, or far enough for the move.
+    RigidMoveGeometry geometry(std::max(radius / 2.0, reach), brep.GetTolerance() / 2.0, faces, all_surfaces,
+                               motions);
+    SmOffsetExecutive executive(*context, SM_OO_LOCAL_OPERATION, geometry, &brep);
+    SmTArray<SmFace*> no_shell_faces;
+    executive.SetShellFaces(no_shell_faces);
+    executive.SetExtendConvexEdges(TRUE);
+    SmBrep* result = nullptr;
+    // The executive deletes its working brep, on failure too. On failure the
+    // surfaces it hadn't yet given a face leak, as in LocalOperation.
+    const SmStatus status = executive.DoExtendedOffset(result);
+    geometry.restore();
+    if (status != SM_SUCCESS || !result) {
+        delete result;
+        return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    }
+    const std::unique_ptr<SmBrep> rebuilt(result);
+    SmTArray<SmFace*> old_faces;
+    brep.GetFaces(old_faces);
+    SmStatus moved_status = brep.RemoveFaces(old_faces);
+    if (moved_status != SM_SUCCESS) return static_cast<sm_status>(moved_status);
+    SmTArray<SmFace*> new_faces;
+    rebuilt->GetFaces(new_faces);
+    moved_status = rebuilt->CopyFaces(new_faces, &brep);
+    if (moved_status != SM_SUCCESS) return static_cast<sm_status>(moved_status);
+    restore_analytic_surfaces(brep, analytic);
+    return SM_SUCCESS;
+}
+
+// Moves the picked faces `distance` along their outward normals (see
+// plan_offset), re-intersecting every other neighbour along its own surface.
+sm_status offset_faces(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance) {
+    Motions motions;
+    sm_status result = plan_offset(picked, distance, brep.GetTolerance(), motions);
+    if (result != SM_SUCCESS) return result;
+
+    SmTArray<SmFace*> changed;
+    SmTArray<SmSurface*> surfaces;
+    double reach = std::fabs(distance);
+    for (const auto& entry : motions) {
+        SmFace* face = const_cast<SmFace*>(entry.first);
+        const Motion& motion = entry.second;
+        SmSurface* surface = nullptr;
+        if (motion.kind == Motion::kShift) {
+            result = translated_surface(face, motion.shift, surface);
+            reach = std::max(reach, motion.shift.Length());
+        } else if (motion.kind == Motion::kOffset) {
+            result = offset_surface(face, distance, brep.GetTolerance(), surface);
+        } else {
+            continue;
+        }
+        if (result != SM_SUCCESS) {
+            for (ULONG j = 0; j < surfaces.GetSize(); ++j) delete surfaces[j];
+            return result;
+        }
+        changed.Add(face);
+        surfaces.Add(surface);
+    }
+    return rigid_local_operation(brep, changed, surfaces, motions, reach);
 }
 
 }  // namespace
@@ -944,6 +1947,78 @@ void sm_swept_faces_free(sm_swept_face* faces) { delete[] faces; }
 sm_status sm_brep_merge_faces(sm_brep* brep) {
     if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
     return guarded([&] { return static_cast<sm_status>(brep_of(brep)->RemoveTopologicalEdgesAndVertices()); });
+}
+
+sm_status sm_brep_create_tapered_prism(const sm_vec3* points, size_t count, double height, double draft_deg,
+                                       sm_brep** out) {
+    if (!points || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (count < 3) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return guarded([&] {
+        SmTArray<SmCurve*> sides;
+        struct Free {
+            SmTArray<SmCurve*>& curves;
+            ~Free() {
+                for (ULONG i = 0; i < curves.GetSize(); ++i) delete curves[i];
+            }
+        } free_sides{sides};
+        for (size_t i = 0; i < count; ++i) {
+            const sm_vec3& a = points[i];
+            const sm_vec3& b = points[(i + 1) % count];
+            SmLine* side = nullptr;
+            const SmApiStatus status = SmApiCreateLineSegment(SmPoint3d(a.x, a.y, a.z), SmPoint3d(b.x, b.y, b.z), side);
+            if (status != SM_SUCCESS) return status;
+            sides.Add(side);
+        }
+        SmBrep* brep = nullptr;
+        const SmApiStatus status = SmApiCreateTaperExtrude(sides, height, draft_deg, 3, FALSE, brep);
+        if (status != SM_SUCCESS) return status;
+        *out = handle_of(brep);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_create_cone(sm_vec3 base_center, double base_radius, double top_radius, double height,
+                              sm_brep** out) {
+    if (!out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmBrep* brep = nullptr;
+        const SmApiStatus status = SmApiCreateCone(SmVector3d(base_center.x, base_center.y, base_center.z),
+                                                   base_radius, top_radius, height, brep);
+        if (status != SM_SUCCESS) return status;
+        *out = handle_of(brep);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_create_torus(sm_vec3 center, double major_radius, double minor_radius, sm_brep** out) {
+    if (!out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmBrep* brep = nullptr;
+        const SmApiStatus status =
+            SmApiCreateTorus(SmVector3d(center.x, center.y, center.z), major_radius, minor_radius, brep);
+        if (status != SM_SUCCESS) return status;
+        *out = handle_of(brep);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_offset_faces(sm_brep* brep, const uint32_t* faces, size_t count, double distance) {
+    if (!brep || (count > 0 && !faces)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!std::isfinite(distance) || count == 0) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmTArray<SmFace*> all;
+        target->GetFaces(all);
+        SmTArray<SmFace*> picked;
+        std::vector<bool> taken(all.GetSize(), false);
+        for (size_t i = 0; i < count; ++i) {
+            if (faces[i] >= all.GetSize() || taken[faces[i]]) return SM_SHIM_ERR_BAD_FACE;
+            taken[faces[i]] = true;
+            picked.Add(all[faces[i]]);
+        }
+        if (distance == 0.0) return SM_SUCCESS;
+        return keeping_topology(*target, [&] { return offset_faces(*target, picked, distance); });
+    });
 }
 
 sm_status sm_brep_tessellate(sm_brep* brep, const sm_tessellation_params* params, sm_mesh** out) {

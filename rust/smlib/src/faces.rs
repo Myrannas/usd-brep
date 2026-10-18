@@ -1,10 +1,13 @@
 //! Faces as places to put things: their geometry, frames to place solids in,
-//! and prisms swept from them.
+//! prisms swept from them, and queries that pick them.
+
+use std::ops::Not;
 
 use smlib_sys as sys;
 
 use crate::brep::Brep;
-use crate::label::Label;
+use crate::edges::Tolerance;
+use crate::label::{Label, LabelMatch};
 use crate::mesh::{Face, Surface};
 
 /// Where a B-rep face is, for finding faces and placing solids on them. For
@@ -146,6 +149,172 @@ impl SweptFace {
             },
         }
     }
+}
+
+/// The kind of surface a face lies on, for [`FaceQuery::Kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SurfaceKind {
+    /// A plane.
+    Plane,
+    /// A circular cylinder.
+    Cylinder,
+    /// A circular cone.
+    Cone,
+    /// A sphere.
+    Sphere,
+    /// A torus.
+    Torus,
+    /// A NURBS surface.
+    Nurbs,
+    /// Any other surface class.
+    Other,
+}
+
+impl SurfaceKind {
+    /// The kind of `surface`.
+    pub fn of(surface: &Surface) -> SurfaceKind {
+        match surface {
+            Surface::Plane { .. } => SurfaceKind::Plane,
+            Surface::Cylinder { .. } => SurfaceKind::Cylinder,
+            Surface::Cone { .. } => SurfaceKind::Cone,
+            Surface::Sphere { .. } => SurfaceKind::Sphere,
+            Surface::Torus { .. } => SurfaceKind::Torus,
+            Surface::Nurbs { .. } => SurfaceKind::Nurbs,
+            Surface::Other { .. } => SurfaceKind::Other,
+        }
+    }
+}
+
+/// A test that picks faces by where they are or what they're labelled, for
+/// [`Brep::find_faces`](crate::Brep::find_faces). Face indices change with
+/// every operation; a query finds the faces again.
+///
+/// Directions needn't be unit length but must be non-zero. Combine queries
+/// with [`and`](FaceQuery::and), [`or`](FaceQuery::or) and `!`.
+///
+/// ```
+/// use smlib::FaceQuery;
+///
+/// // The top face of a box whose top is at z = 20.
+/// let top = FaceQuery::OnPlane { point: [0.0, 0.0, 20.0], normal: [0.0, 0.0, 1.0] };
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub enum FaceQuery {
+    /// Every face.
+    All,
+    /// Planar faces lying on the plane through `point` with normal `normal`,
+    /// facing out along `normal`.
+    OnPlane {
+        /// A point on the plane.
+        point: [f64; 3],
+        /// The plane's normal, pointing out of the solid.
+        normal: [f64; 3],
+    },
+    /// Planar faces whose outward normal is along `direction`.
+    Facing {
+        /// The outward direction.
+        direction: [f64; 3],
+    },
+    /// Faces on a surface of this kind.
+    Kind(SurfaceKind),
+    /// Faces whose label passes.
+    Labelled(LabelMatch),
+    /// Faces every query picks.
+    And(Vec<FaceQuery>),
+    /// Faces any query picks.
+    Or(Vec<FaceQuery>),
+    /// Faces the query doesn't pick.
+    Not(Box<FaceQuery>),
+}
+
+impl FaceQuery {
+    /// Faces both `self` and `other` pick.
+    pub fn and(self, other: FaceQuery) -> FaceQuery {
+        match self {
+            FaceQuery::And(mut all) => {
+                all.push(other);
+                FaceQuery::And(all)
+            }
+            first => FaceQuery::And(vec![first, other]),
+        }
+    }
+
+    /// Faces either `self` or `other` picks.
+    pub fn or(self, other: FaceQuery) -> FaceQuery {
+        match self {
+            FaceQuery::Or(mut any) => {
+                any.push(other);
+                FaceQuery::Or(any)
+            }
+            first => FaceQuery::Or(vec![first, other]),
+        }
+    }
+
+    /// Whether the query picks this face.
+    pub fn matches(&self, face: &FaceGeometry, tolerance: &Tolerance) -> bool {
+        let along = |d: [f64; 3]| {
+            face.normal
+                .is_some_and(|n| angle_deg(n, d) <= tolerance.angle_deg)
+        };
+        match self {
+            FaceQuery::All => true,
+            FaceQuery::OnPlane { point, normal } => {
+                // A point on the face's plane: the plane's own origin, or for
+                // a planar NURBS face the middle of its bounds.
+                let on_plane = match face.surface {
+                    Surface::Plane { origin, .. } => origin,
+                    _ => face.bounds_centre(),
+                };
+                along(*normal)
+                    && dot(
+                        sub(on_plane, *point),
+                        scale(*normal, 1.0 / dot(*normal, *normal).sqrt()),
+                    )
+                    .abs()
+                        <= tolerance.length
+            }
+            FaceQuery::Facing { direction } => along(*direction),
+            FaceQuery::Kind(kind) => SurfaceKind::of(&face.surface) == *kind,
+            FaceQuery::Labelled(pattern) => face.label.as_ref().is_some_and(|l| pattern.matches(l)),
+            FaceQuery::And(all) => all.iter().all(|q| q.matches(face, tolerance)),
+            FaceQuery::Or(any) => any.iter().any(|q| q.matches(face, tolerance)),
+            FaceQuery::Not(query) => !query.matches(face, tolerance),
+        }
+    }
+
+    /// Why the query can't be evaluated, if it can't.
+    pub(crate) fn problem(&self) -> Option<&'static str> {
+        let finite = |v: &[f64]| v.iter().all(|c| c.is_finite());
+        let direction = |d: [f64; 3]| finite(&d) && dot(d, d) > 0.0;
+        match self {
+            FaceQuery::All | FaceQuery::Kind(_) | FaceQuery::Labelled(_) => None,
+            FaceQuery::OnPlane { point, normal } => (!finite(point) || !direction(*normal))
+                .then_some("plane needs a finite point and a non-zero normal"),
+            FaceQuery::Facing { direction: d } => {
+                (!direction(*d)).then_some("direction must be finite and non-zero")
+            }
+            FaceQuery::And(queries) | FaceQuery::Or(queries) => {
+                queries.iter().find_map(FaceQuery::problem)
+            }
+            FaceQuery::Not(query) => query.problem(),
+        }
+    }
+}
+
+impl Not for FaceQuery {
+    type Output = FaceQuery;
+
+    fn not(self) -> FaceQuery {
+        match self {
+            FaceQuery::Not(query) => *query,
+            query => FaceQuery::Not(Box::new(query)),
+        }
+    }
+}
+
+fn angle_deg(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let cos = dot(a, b) / (dot(a, a).sqrt() * dot(b, b).sqrt());
+    cos.clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {

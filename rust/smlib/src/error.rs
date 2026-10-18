@@ -61,6 +61,8 @@ impl Status {
             2022 => "SHIM_ERR_NOT_PLANAR",
             2023 => "SHIM_ERR_BAD_FRAME",
             2024 => "SHIM_ERR_BAD_SWEEP",
+            2025 => "SHIM_ERR_UNSUPPORTED_FACE",
+            2026 => "SHIM_ERR_CHANGED_TOPOLOGY",
             _ => return None,
         })
     }

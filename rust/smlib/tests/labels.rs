@@ -6,6 +6,7 @@
 //! thread.
 
 use std::collections::BTreeMap;
+use std::f64::consts::PI;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -544,4 +545,162 @@ fn edge_queries_pick_by_direction_label_and_index() {
     // box's twelve edges, two by index.
     let seams = edges.iter().filter(|e| e.faces[0] == e.faces[1]).count();
     assert_eq!(picked, [4 + seams, 4, 1, 12, 2]);
+}
+
+#[test]
+fn offsets_keep_every_label_in_place() {
+    // Offsets change no topology, so every face and edge keeps its label, on
+    // the face or edge it was on: the moved faces, the rounds that ride on
+    // them and the walls that stretch.
+    type Edges = Vec<(Option<Label>, [Option<Label>; 2])>;
+    let edges_of = |solid: &Brep| -> Edges {
+        let mut edges: Edges = solid
+            .edges()
+            .unwrap()
+            .into_iter()
+            .map(|e| {
+                let mut faces = e.face_labels.clone();
+                faces.sort();
+                (e.label.clone(), faces)
+            })
+            .collect();
+        edges.sort();
+        edges
+    };
+    let (before, pushed, moved, edges_before, edges_pushed, edges_moved) = on_kernel(move |k| {
+        let block = labelled_box(k, BLOCK, [0.0; 3], [100.0, 60.0, 40.0]);
+        let hole = labelled_cylinder(
+            k,
+            2,
+            10.0,
+            40.0,
+            &Frame::new([0.0, 0.0, -20.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]).unwrap(),
+        );
+        let part = block.difference(hole).unwrap();
+        let top_edges = EdgeQuery::MidpointOnPlane {
+            point: [0.0, 0.0, 20.0],
+            normal: [0.0, 0.0, 1.0],
+        }
+        .and(!EdgeQuery::Between {
+            a: LabelMatch::role(2, "side"),
+            b: LabelMatch::role(BLOCK, "+Z"),
+        });
+        let mut part = part
+            .fillet(
+                &[EdgeBlend::round(top_edges, 8.0)],
+                &FilletOptions::default(),
+            )
+            .unwrap();
+        for face in part.faces().unwrap() {
+            if face.label.is_none() {
+                part.set_face_label(
+                    face.index,
+                    &Label::new(3, "round").with_index(face.index as u32),
+                )
+                .unwrap();
+            }
+        }
+        for edge in part.edges().unwrap() {
+            if edge.label.is_none() {
+                part.set_edge_label(
+                    edge.index,
+                    &Label::new(3, "rail").with_index(edge.index as u32),
+                )
+                .unwrap();
+            }
+        }
+        let before = measure(&part);
+        let edges_before = edges_of(&part);
+        let wall = find(&before, BLOCK, "+X")[0].index;
+        let part = part.offset_faces(&[wall], 10.0).unwrap();
+        let pushed = measure(&part);
+        let edges_pushed = edges_of(&part);
+        let top = find(&pushed, BLOCK, "+Z")[0].index;
+        let hole_wall = find(&pushed, 2, "side")[0].index;
+        let part = part.offset_faces(&[top, hole_wall], 2.0).unwrap();
+        let moved = measure(&part);
+        let edges_moved = edges_of(&part);
+        (
+            before,
+            pushed,
+            moved,
+            edges_before,
+            edges_pushed,
+            edges_moved,
+        )
+    });
+    assert_eq!(before.len(), 11, "{:?}", labels(&before));
+    assert!(!labels(&before).contains_key("-"), "every face labelled");
+    assert_eq!(labels(&pushed), labels(&before));
+    assert_eq!(labels(&moved), labels(&before));
+    assert_eq!(
+        edges_pushed, edges_before,
+        "edges keep their labels and faces"
+    );
+    assert_eq!(
+        edges_moved, edges_before,
+        "edges keep their labels and faces"
+    );
+
+    // The labelled faces are where the moves put them.
+    let wall = find(&pushed, BLOCK, "+X")[0];
+    assert!(
+        (wall.centroid[0] - 60.0).abs() < 1e-4,
+        "{:?}",
+        wall.centroid
+    );
+    let far = find(&pushed, BLOCK, "+Y")[0];
+    assert!(
+        far.area > find(&before, BLOCK, "+Y")[0].area + 10.0 * 32.0 - 1e-6,
+        "the +Y wall stretched"
+    );
+    let top = find(&moved, BLOCK, "+Z")[0];
+    assert!((top.centroid[2] - 22.0).abs() < 1e-4, "{:?}", top.centroid);
+    match find(&moved, 2, "side")[0].surface {
+        Surface::Cylinder { radius, .. } => assert!((radius - 8.0).abs() < 1e-9, "{radius}"),
+        ref other => panic!("the hole's wall is {other:?}"),
+    }
+    // Each round rode with what it rounds. The push carried the +X one out
+    // 10 and stretched the two along it by 10; the top's move lifted them
+    // all by 2. (Centroids come out good to 1e-6 here, areas to a relative
+    // 2e-6.)
+    let close = |a: [f64; 3], b: [f64; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-4);
+    let same_area = |a: f64, b: f64| (a - b).abs() < 1e-5 * b;
+    let rounds = before
+        .iter()
+        .filter(|f| f.label.as_ref().is_some_and(|l| l.role == "round"));
+    for old in rounds {
+        let same = |faces: &[Face]| faces.iter().find(|f| f.label == old.label).unwrap().clone();
+        let (out, up) = (same(&pushed), same(&moved));
+        let c = old.centroid;
+        match old.surface {
+            Surface::Cylinder { axis, .. } if axis[0].abs() > 0.5 => {
+                assert!(
+                    same_area(out.area, old.area + 10.0 * 4.0 * PI),
+                    "{:?} stretched",
+                    old.label
+                );
+            }
+            _ if c[0] > 0.0 => assert!(
+                close(out.centroid, [c[0] + 10.0, c[1], c[2]]),
+                "{:?}",
+                old.label
+            ),
+            _ => assert!(close(out.centroid, c), "{:?}", old.label),
+        }
+        let c = out.centroid;
+        assert!(
+            close(up.centroid, [c[0], c[1], c[2] + 2.0]),
+            "{:?}: {c:?} -> {:?}",
+            old.label,
+            up.centroid
+        );
+        assert!(
+            same_area(up.area, out.area),
+            "{:?}: {} -> {}",
+            old.label,
+            out.area,
+            up.area
+        );
+    }
 }

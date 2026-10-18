@@ -7,7 +7,7 @@ use smlib_sys as sys;
 
 use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
-use crate::faces::{FaceCentroid, FaceGeometry, Frame, Sweep, SweptFace};
+use crate::faces::{FaceCentroid, FaceGeometry, FaceQuery, Frame, Sweep, SweptFace};
 use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
@@ -83,6 +83,60 @@ impl Brep {
         Brep::from_raw(OP, out)
     }
 
+    /// A solid frustum standing on `base_center`, along +z, with the given
+    /// base and top radii; one of them may be 0 for a cone
+    /// (`SmApiCreateCone`).
+    pub fn cone(
+        _kernel: &Kernel,
+        base_center: [f64; 3],
+        base_radius: f64,
+        top_radius: f64,
+        height: f64,
+    ) -> Result<Brep, Error> {
+        const OP: &str = "SmApiCreateCone";
+        check_point(OP, base_center)?;
+        let radius_ok = |r: f64| r.is_finite() && r >= 0.0;
+        if !radius_ok(base_radius) || !radius_ok(top_radius) || base_radius + top_radius <= 0.0 {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "radii must be finite, not negative, and not both zero",
+            });
+        }
+        check_positive(OP, height, "height must be finite and positive")?;
+        let mut out = ptr::null_mut();
+        // SAFETY: as in `cuboid`.
+        let status = unsafe {
+            sys::sm_brep_create_cone(vec3(base_center), base_radius, top_radius, height, &mut out)
+        };
+        Error::check(OP, status)?;
+        Brep::from_raw(OP, out)
+    }
+
+    /// A solid ring around the +z axis through `center` (`SmApiCreateTorus`).
+    pub fn torus(
+        _kernel: &Kernel,
+        center: [f64; 3],
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> Result<Brep, Error> {
+        const OP: &str = "SmApiCreateTorus";
+        check_point(OP, center)?;
+        check_positive(OP, minor_radius, "minor radius must be finite and positive")?;
+        if !(major_radius.is_finite() && major_radius > minor_radius) {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "major radius must be finite and larger than the minor radius",
+            });
+        }
+        let mut out = ptr::null_mut();
+        // SAFETY: as in `cuboid`.
+        let status = unsafe {
+            sys::sm_brep_create_torus(vec3(center), major_radius, minor_radius, &mut out)
+        };
+        Error::check(OP, status)?;
+        Brep::from_raw(OP, out)
+    }
+
     /// A solid sphere (`SmApiCreateSphere`).
     pub fn sphere(_kernel: &Kernel, center: [f64; 3], radius: f64) -> Result<Brep, Error> {
         const OP: &str = "SmApiCreateSphere";
@@ -91,6 +145,50 @@ impl Brep {
         let mut out = ptr::null_mut();
         // SAFETY: as in `cuboid`.
         let status = unsafe { sys::sm_brep_create_sphere(vec3(center), radius, &mut out) };
+        Error::check(OP, status)?;
+        Brep::from_raw(OP, out)
+    }
+
+    /// A prism over the closed polygon through `base` (in order, in one
+    /// plane), `height` along the polygon's normal, with its walls leaning in
+    /// by `draft_deg` (0 to under 90) from that direction and sharp corners
+    /// (`SmApiCreateTaperExtrude`). Its tapered walls are planar NURBS
+    /// surfaces. The kernel has no outward draft: angles over 90 mirror back.
+    pub fn tapered_prism(
+        _kernel: &Kernel,
+        base: &[[f64; 3]],
+        height: f64,
+        draft_deg: f64,
+    ) -> Result<Brep, Error> {
+        const OP: &str = "SmApiCreateTaperExtrude";
+        if base.len() < 3 {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "the base needs at least three points",
+            });
+        }
+        for &point in base {
+            check_point(OP, point)?;
+        }
+        check_positive(OP, height, "height must be finite and positive")?;
+        if !(0.0..90.0).contains(&draft_deg) {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "draft angle must be from 0 to under 90 degrees",
+            });
+        }
+        let points: Vec<sys::sm_vec3> = base.iter().map(|&p| vec3(p)).collect();
+        let mut out = ptr::null_mut();
+        // SAFETY: points holds points.len() values; a fresh brep comes out.
+        let status = unsafe {
+            sys::sm_brep_create_tapered_prism(
+                points.as_ptr(),
+                points.len(),
+                height,
+                draft_deg,
+                &mut out,
+            )
+        };
         Error::check(OP, status)?;
         Brep::from_raw(OP, out)
     }
@@ -382,6 +480,85 @@ impl Brep {
         // SAFETY: self is a live brep on the kernel thread.
         let status = unsafe { sys::sm_brep_merge_faces(self.raw.as_ptr()) };
         Error::check("SmBrep::RemoveTopologicalEdgesAndVertices", status)
+    }
+
+    /// The indices in [`faces`](Brep::faces) of the faces `query` picks.
+    pub fn find_faces(
+        &self,
+        query: &FaceQuery,
+        tolerance: &Tolerance,
+    ) -> Result<Vec<usize>, Error> {
+        if let Some(reason) = query.problem() {
+            return Err(Error::InvalidArgument {
+                operation: "FaceQuery",
+                reason,
+            });
+        }
+        Ok(self
+            .faces()?
+            .iter()
+            .filter(|face| query.matches(face, tolerance))
+            .map(|face| face.index)
+            .collect())
+    }
+
+    /// Moves the faces at `faces` (indices in [`faces`](Brep::faces)) the
+    /// signed `distance` along their outward normals, as Parasolid's face
+    /// offset does: each other neighbour is extended or trimmed along its own
+    /// surface to meet the moved faces, so a chamfer grows or shrinks and a
+    /// drafted wall keeps its draft. A picked plane is translated, and a
+    /// picked cone slides along its axis (its offset is that translation);
+    /// other curved faces (cylinders, spheres, tori, NURBS) take their offset
+    /// surface, so a hole or a boss changes radius. Blends on a picked plane
+    /// or cone (fillets along its edges, the corners between them) are
+    /// translated by the shortest move that keeps them tangent to all their
+    /// neighbours: on a raised top they rise and the walls stretch, against a
+    /// drafted wall they slide along it, between two picked faces they follow
+    /// both.
+    ///
+    /// The topology doesn't change, so every face and edge keeps its
+    /// [`Label`]: the moved faces and the neighbours that stretch alike. A
+    /// move that would shrink a face to nothing fails with
+    /// `SHIM_ERR_BROKE_SOLID` or `SHIM_ERR_CHANGED_TOPOLOGY`, never a broken
+    /// solid: the kernel's result is checked for manifoldness, the same faces
+    /// and edges, gaps within the brep's tolerance, and a volume its own
+    /// tessellation agrees with. `SHIM_ERR_UNSUPPORTED_FACE`: a picked curved
+    /// face other than a cone has blends on it (their new shape isn't a
+    /// translation), no translation keeps a blend tangent to all its
+    /// neighbours, or a surface has no offset. Some moves the kernel still
+    /// gets wrong, and refuses (`SHIM_ERR_BROKE_SOLID`): fillets sliding along
+    /// drafted walls, and some moves of faces cut by spheres (see
+    /// `PATCHES.md`).
+    ///
+    /// Built on `SmBrep::LocalOperation`. `faces` must be non-empty and
+    /// distinct (`SHIM_ERR_BAD_FACE` otherwise); a zero distance leaves the
+    /// brep as it is. Consumed and dropped on failure, as
+    /// [`fillet`](Brep::fillet).
+    pub fn offset_faces(self, faces: &[usize], distance: f64) -> Result<Brep, Error> {
+        const OP: &str = "SmBrep::LocalOperation";
+        if !distance.is_finite() {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "offset distance must be finite",
+            });
+        }
+        if faces.is_empty() {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "no faces to offset",
+            });
+        }
+        let indices: Vec<u32> = faces
+            .iter()
+            .map(|&face| u32::try_from(face).unwrap_or(u32::MAX))
+            .collect();
+        // SAFETY: self is a live brep on the kernel thread; indices holds
+        // indices.len() values.
+        let status = unsafe {
+            sys::sm_brep_offset_faces(self.raw.as_ptr(), indices.as_ptr(), indices.len(), distance)
+        };
+        Error::check(OP, status)?;
+        Ok(self)
     }
 
     /// How many edges `query` picks.

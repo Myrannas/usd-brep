@@ -1,6 +1,7 @@
 //! The demo's cases on a 100 × 60 × 40 mm box centred on the origin, Z up,
 //! in kernel millimetres: four booleans, then fillets and chamfers on edges
-//! picked by geometric queries.
+//! picked by geometric queries, then offset faces checked against the same
+//! part built directly at the new size.
 //!
 //! The test harness runs each test on its own thread, but the kernel belongs
 //! to one thread, so every test sends its kernel work to a shared kernel
@@ -13,8 +14,8 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use smlib::{
-    Brep, Continuity, EdgeBlend, EdgeQuery, Error, FilletOptions, Kernel, Mesh, Surface,
-    TessellationParams, Tolerance,
+    Brep, Continuity, EdgeBlend, EdgeQuery, Error, FaceQuery, FilletOptions, Kernel, Mesh, Surface,
+    SurfaceKind, TessellationParams, Tolerance,
 };
 
 const L: f64 = 100.0;
@@ -742,4 +743,750 @@ fn oversized_fillet_fails_cleanly() {
     println!("radius 25 on a 40 mm box: {outcome}");
     let built = build(block);
     assert_volume("box after a failed fillet", built.volume, BOX_VOLUME);
+}
+
+// Offset faces. Each case moves the top face of a part and compares the
+// result with the same part built directly at the new height (the reference)
+// and with its analytic volume.
+
+/// Volumes for the offset oracles: tighter than the kernel's default, since
+/// the criterion is 1e-6.
+const PRECISE: f64 = 1e-8;
+
+fn box_of_height(k: &Kernel, h: f64) -> Result<Brep, Error> {
+    Brep::cuboid(k, [-L / 2.0, -W / 2.0, -H / 2.0], [L, W, h])
+}
+
+/// The top face of a part `h` tall standing on the box's base.
+fn top_at(h: f64) -> FaceQuery {
+    FaceQuery::OnPlane {
+        point: [0.0, 0.0, -H / 2.0 + h],
+        normal: UP,
+    }
+}
+
+/// The four edges around the top of a part `h` tall.
+fn top_edges_at(h: f64) -> EdgeQuery {
+    EdgeQuery::MidpointOnPlane {
+        point: [0.0, 0.0, -H / 2.0 + h],
+        normal: UP,
+    }
+}
+
+/// A box `h` tall with 45° chamfers of leg `c` on its four top edges.
+fn chamfered_box(k: &Kernel, h: f64, c: f64) -> Result<Brep, Error> {
+    box_of_height(k, h)?.chamfer(&top_edges_at(h), c * 2f64.sqrt(), &Tolerance::default())
+}
+
+/// The chamfered box's volume: each top edge loses a prism of section c²/2,
+/// and adjacent prisms overlap by c³/3 at each mitred corner.
+fn chamfered_box_volume(h: f64, c: f64) -> f64 {
+    L * W * h - c * c * (L + W) + 4.0 * c.powi(3) / 3.0
+}
+
+/// A box `h` tall with rounds of radius `r` on its four top edges.
+fn top_rounded_box(k: &Kernel, h: f64, r: f64) -> Result<Brep, Error> {
+    box_of_height(k, h)?.fillet(&[EdgeBlend::round(top_edges_at(h), r)], &options())
+}
+
+/// The filleted box's volume: each top edge loses a spandrel of (1 − π/4)r²,
+/// and adjacent spandrels overlap by (5/3 − π/2)r³ at each mitred corner.
+fn top_rounded_box_volume(h: f64, r: f64) -> f64 {
+    L * W * h - (1.0 - PI / 4.0) * r * r * 2.0 * (L + W) + 4.0 * r.powi(3) * (5.0 / 3.0 - PI / 2.0)
+}
+
+/// A frustum on the box's base, `h` tall, its walls leaning in by
+/// `draft_deg`.
+fn drafted_block(k: &Kernel, h: f64, draft_deg: f64) -> Result<Brep, Error> {
+    let (x, y, z) = (L / 2.0, W / 2.0, -H / 2.0);
+    let base = [[-x, -y, z], [x, -y, z], [x, y, z], [-x, y, z]];
+    Brep::tapered_prism(k, &base, h, draft_deg)
+}
+
+fn drafted_block_volume(h: f64, draft_deg: f64) -> f64 {
+    let t = draft_deg.to_radians().tan();
+    L * W * h - (L + W) * t * h * h + 4.0 / 3.0 * t * t * h.powi(3)
+}
+
+/// A box `h` tall with a hole of radius `r` through it at the origin.
+fn holed_box(k: &Kernel, h: f64, r: f64) -> Result<Brep, Error> {
+    box_of_height(k, h)?.difference(Brep::cylinder(k, [0.0, 0.0, -H / 2.0], r, h)?)
+}
+
+struct Offset {
+    built: Built,
+    precise_volume: f64,
+}
+
+fn build_offset(make: impl FnOnce(&Kernel) -> Result<Brep, Error> + Send + 'static) -> Offset {
+    on_kernel(move |k| {
+        let brep = make(k).expect("building the case");
+        Offset {
+            precise_volume: brep.volume(PRECISE).unwrap(),
+            built: Built {
+                manifold: brep.is_manifold().unwrap(),
+                volume: brep.volume(RELATIVE_ACCURACY).unwrap(),
+                brep_faces: brep.face_count(),
+                brep_edges: brep.edge_count(),
+                mesh: brep.tessellate(&TessellationParams::default()).unwrap(),
+            },
+        }
+    })
+}
+
+/// Offsets the top face of `part` (`H` tall) by `d` and holds it to the
+/// brief's criteria against the part built `H + d` tall: see
+/// [`assert_offset_case`].
+fn assert_offset(name: &str, d: f64, part: fn(&Kernel, f64) -> Result<Brep, Error>, analytic: f64) {
+    assert_offset_case(
+        &format!("{name} d={d:+}"),
+        move |k| part(k, H)?.offset_where(&top_at(H), d),
+        move |k| part(k, H + d),
+        Some(analytic),
+    );
+}
+
+/// Holds an offset to the brief's criteria against `reference`, the same part
+/// built directly at its new size, and its analytic volume when there is one:
+/// manifold, the same face and edge counts, volume within 1e-6, and the mesh
+/// checks.
+fn assert_offset_case(
+    name: &str,
+    moved: impl FnOnce(&Kernel) -> Result<Brep, Error> + Send + 'static,
+    reference: impl FnOnce(&Kernel) -> Result<Brep, Error> + Send + 'static,
+    analytic: Option<f64>,
+) -> Built {
+    let moved = build_offset(moved);
+    let reference = build_offset(reference);
+    let vs_reference = (moved.precise_volume - reference.precise_volume) / reference.precise_volume;
+    let vs_analytic = analytic.map(|a| (moved.precise_volume - a) / a);
+    println!(
+        "| {name} | {}/{} faces, {}/{} edges | {:.4} | {:.4} | {} | {vs_reference:+.1e} | {} |",
+        moved.built.brep_faces,
+        reference.built.brep_faces,
+        moved.built.brep_edges,
+        reference.built.brep_edges,
+        moved.precise_volume,
+        reference.precise_volume,
+        analytic.map_or("-".into(), |a| format!("{a:.4}")),
+        vs_analytic.map_or("-".into(), |e| format!("{e:+.1e}")),
+    );
+    assert!(moved.built.manifold, "{name}: not manifold");
+    assert!(reference.built.manifold, "{name}: reference not manifold");
+    assert_eq!(
+        moved.built.brep_faces, reference.built.brep_faces,
+        "{name}: faces"
+    );
+    assert_eq!(
+        moved.built.brep_edges, reference.built.brep_edges,
+        "{name}: edges"
+    );
+    assert!(
+        vs_reference.abs() < 1e-6,
+        "{name}: {vs_reference:e} off the reference"
+    );
+    if let Some(error) = vs_analytic {
+        assert!(error.abs() < 1e-6, "{name}: {error:e} off analytic");
+    }
+    assert_mesh(name, &moved.built);
+    moved.built
+}
+
+fn status_name(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::Kernel { status, .. } => status.name(),
+        _ => None,
+    }
+}
+
+/// Offsets the faces a query picks: [`Brep::find_faces`] then
+/// [`Brep::offset_faces`].
+trait OffsetWhere: Sized {
+    fn offset_where(self, query: &FaceQuery, distance: f64) -> Result<Brep, Error>;
+}
+
+impl OffsetWhere for Brep {
+    fn offset_where(self, query: &FaceQuery, distance: f64) -> Result<Brep, Error> {
+        let faces = self.find_faces(query, &Tolerance::default())?;
+        self.offset_faces(&faces, distance)
+    }
+}
+
+#[test]
+fn face_queries_pick_by_geometry() {
+    let tol = Tolerance::default();
+    let counts = on_kernel(move |k| {
+        let block = block(k).unwrap();
+        let count = |b: &Brep, q: FaceQuery| b.find_faces(&q, &tol).unwrap().len();
+        let rounded = top_rounded_box(k, H, 8.0).unwrap();
+        let drafted = drafted_block(k, H, 5.0).unwrap();
+        [
+            count(&block, FaceQuery::All),
+            count(&block, top_at(H)),
+            count(&block, top_at(H + 1.0)),
+            count(
+                &block,
+                FaceQuery::OnPlane {
+                    point: [0.0, 0.0, H / 2.0],
+                    normal: neg(UP),
+                },
+            ),
+            count(&block, FaceQuery::Facing { direction: X }),
+            count(&block, FaceQuery::Kind(SurfaceKind::Plane)),
+            count(
+                &block,
+                !FaceQuery::Facing { direction: UP }.or(FaceQuery::Facing { direction: neg(UP) }),
+            ),
+            count(&rounded, FaceQuery::Kind(SurfaceKind::Cylinder)),
+            count(&rounded, top_at(H)),
+            // A drafted block's walls are planar NURBS surfaces: they have
+            // normals, so Facing finds them.
+            count(
+                &drafted,
+                FaceQuery::Facing {
+                    direction: [5f64.to_radians().cos(), 0.0, 5f64.to_radians().sin()],
+                },
+            ),
+        ]
+    });
+    assert_eq!(counts, [6, 1, 0, 0, 1, 6, 4, 4, 1, 1]);
+    let error = on_kernel(move |k| {
+        block(k)
+            .unwrap()
+            .find_faces(
+                &FaceQuery::Facing {
+                    direction: [0.0; 3],
+                },
+                &tol,
+            )
+            .unwrap_err()
+    });
+    assert!(matches!(error, Error::InvalidArgument { .. }), "{error:?}");
+}
+
+#[test]
+fn offset_face_plain_walls() {
+    for d in [10.0, -10.0] {
+        assert_offset("plain box", d, box_of_height, L * W * (H + d));
+    }
+}
+
+#[test]
+fn offset_face_grows_and_shrinks_chamfers() {
+    // The chamfer planes extend along their own geometry: legs of 2 become
+    // 2 + d. The reference is chamfered with those legs.
+    for d in [10.0, -1.0] {
+        assert_offset(
+            "chamfered box",
+            d,
+            |k, h| chamfered_box(k, h, 2.0 + (h - H)),
+            chamfered_box_volume(H + d, 2.0 + d),
+        );
+    }
+}
+
+#[test]
+fn offset_face_carries_fillets() {
+    // The rounds ride on the face; the walls they lean on stretch to follow.
+    for d in [10.0, -10.0] {
+        assert_offset(
+            "filleted box",
+            d,
+            |k, h| top_rounded_box(k, h, 8.0),
+            top_rounded_box_volume(H + d, 8.0),
+        );
+    }
+}
+
+#[test]
+fn offset_face_carries_fillets_at_every_distance() {
+    // The offset executive's iteration order follows pointer order, so a
+    // fragile result shows up as a scattering of failures across distances.
+    let results = on_kernel(|k| {
+        (-31..=31)
+            .filter(|&i| i != 0)
+            .map(|i| {
+                let d = i as f64;
+                let moved = top_rounded_box(k, H, 8.0)
+                    .and_then(|part| part.offset_where(&top_at(H), d))
+                    .and_then(|b| Ok((b.is_manifold()?, b.face_count(), b.volume(PRECISE)?)));
+                (d, moved)
+            })
+            .collect::<Vec<_>>()
+    });
+    for (d, moved) in results {
+        let (manifold, faces, volume) = moved.unwrap_or_else(|e| panic!("d={d}: {e}"));
+        let error =
+            (volume - top_rounded_box_volume(H + d, 8.0)) / top_rounded_box_volume(H + d, 8.0);
+        assert!(
+            manifold && faces == 10 && error.abs() < 1e-6,
+            "d={d}: manifold {manifold}, {faces} faces, {error:e}"
+        );
+    }
+}
+
+#[test]
+fn offset_face_extends_drafted_walls() {
+    for d in [10.0, -10.0] {
+        assert_offset(
+            "drafted block 5°",
+            d,
+            |k, h| drafted_block(k, h, 5.0),
+            drafted_block_volume(H + d, 5.0),
+        );
+    }
+}
+
+#[test]
+fn offset_face_around_a_hole() {
+    // The hole's wall runs along the move, so it simply extends; a round on
+    // its rim rides along like the box's fillets.
+    for d in [10.0, -10.0] {
+        let r = 10.0;
+        assert_offset(
+            "holed box",
+            d,
+            |k, h| holed_box(k, h, 10.0),
+            (L * W - PI * r * r) * (H + d),
+        );
+        assert_offset(
+            "holed box, rounded rim",
+            d,
+            |k, h| {
+                let rim = EdgeQuery::OnCircle {
+                    center: [0.0, 0.0, -H / 2.0 + h],
+                    axis: UP,
+                    radius: 10.0,
+                };
+                holed_box(k, h, 10.0)?.fillet(&[EdgeBlend::round(rim, 3.0)], &options())
+            },
+            {
+                // As in rounded_hole_rim.
+                let spandrel = (1.0 - PI / 4.0) * 9.0;
+                let centroid = r + (10.0 - 3.0 * PI) / (12.0 - 3.0 * PI) * 3.0;
+                (L * W - PI * r * r) * (H + d) - 2.0 * PI * centroid * spandrel
+            },
+        );
+    }
+}
+
+#[test]
+fn offset_face_fails_cleanly_when_a_face_would_vanish() {
+    // Each move would shrink a face to nothing: the chamfers (legs 2) from
+    // d = -2, the walls under the fillets from d = -32, the box's walls at
+    // d = -40, the drafted block's top past its apex (about d = +303). The
+    // kernel hands back an open or inside-out solid; the shim refuses it.
+    let outcomes = on_kernel(move |k| {
+        let attempts: Vec<(&str, f64, Result<Brep, Error>)> = vec![
+            ("chamfered box", -2.5, chamfered_box(k, H, 2.0)),
+            ("chamfered box", -10.0, chamfered_box(k, H, 2.0)),
+            ("filleted box", -32.0, top_rounded_box(k, H, 8.0)),
+            ("filleted box", -35.0, top_rounded_box(k, H, 8.0)),
+            ("plain box", -40.0, box_of_height(k, H)),
+            ("plain box", -45.0, box_of_height(k, H)),
+            ("drafted block", 340.0, drafted_block(k, H, 5.0)),
+        ];
+        attempts
+            .into_iter()
+            .map(|(name, d, part)| {
+                let outcome = part
+                    .unwrap()
+                    .offset_where(&top_at(H), d)
+                    .map(|b| b.face_count());
+                (name, d, outcome)
+            })
+            .collect::<Vec<_>>()
+    });
+    for (name, d, outcome) in outcomes {
+        println!("{name} d={d:+}: {outcome:?}");
+        let error = outcome.expect_err("a vanishing face must not come back as a solid");
+        assert!(
+            matches!(
+                status_name(&error),
+                Some("SHIM_ERR_BROKE_SOLID" | "SHIM_ERR_CHANGED_TOPOLOGY")
+            ),
+            "{name} d={d}: {error}"
+        );
+    }
+    // The kernel still works, and a move just short of vanishing is exact.
+    assert_offset(
+        "chamfered box",
+        -1.99,
+        |k, h| chamfered_box(k, h, 2.0 + (h - H)),
+        chamfered_box_volume(H - 1.99, 0.01),
+    );
+    assert_offset(
+        "drafted block 5°",
+        300.0,
+        |k, h| drafted_block(k, h, 5.0),
+        drafted_block_volume(H + 300.0, 5.0),
+    );
+}
+
+#[test]
+fn offset_face_rejects_what_it_cannot_move() {
+    let errors = on_kernel(move |k| {
+        let rim = EdgeQuery::OnCircle {
+            center: [0.0, 0.0, H / 2.0],
+            axis: UP,
+            radius: 10.0,
+        };
+        let rounded_rim = holed_box(k, H, 10.0)
+            .unwrap()
+            .fillet(&[EdgeBlend::round(rim, 3.0)], &options())
+            .unwrap();
+        let top = block(k)
+            .unwrap()
+            .find_faces(&top_at(H), &Tolerance::default())
+            .unwrap()[0];
+        [
+            block(k).unwrap().offset_faces(&[], 5.0),
+            block(k).unwrap().offset_where(&top_at(H + 1.0), 5.0),
+            block(k).unwrap().offset_faces(&[top], f64::NAN),
+            block(k).unwrap().offset_faces(&[6], 5.0),
+            block(k).unwrap().offset_faces(&[top, top], 5.0),
+            // A round on a picked curved face: its new shape isn't a
+            // translation of the old one.
+            rounded_rim.offset_where(&FaceQuery::Kind(SurfaceKind::Cylinder), 1.0),
+        ]
+        .map(|r| r.map(|_| ()).unwrap_err())
+    });
+    let [none, none_picked, nan, out_of_range, repeated, rounded_rim] = errors;
+    for error in [none, none_picked, nan] {
+        assert!(matches!(error, Error::InvalidArgument { .. }), "{error:?}");
+    }
+    for error in [out_of_range, repeated] {
+        assert_eq!(status_name(&error), Some("SHIM_ERR_BAD_FACE"), "{error}");
+    }
+    assert_eq!(
+        status_name(&rounded_rim),
+        Some("SHIM_ERR_UNSUPPORTED_FACE"),
+        "{rounded_rim}"
+    );
+
+    // Zero is a no-op.
+    let built = build(|k| block(k)?.offset_where(&top_at(H), 0.0));
+    assert_volume("offset by zero", built.volume, BOX_VOLUME);
+}
+
+/// A box from its minimum and maximum corners.
+fn span(k: &Kernel, min: [f64; 3], max: [f64; 3]) -> Result<Brep, Error> {
+    Brep::cuboid(k, min, [max[0] - min[0], max[1] - min[1], max[2] - min[2]])
+}
+
+/// The face of a box whose outward normal is `normal`.
+fn side(normal: [f64; 3]) -> FaceQuery {
+    FaceQuery::Facing { direction: normal }.and(FaceQuery::Kind(SurfaceKind::Plane))
+}
+
+/// The box's walls: its planar faces facing sideways.
+fn walls() -> FaceQuery {
+    side(X).or(side(neg(X))).or(side(Y)).or(side(neg(Y)))
+}
+
+/// A box spanning `min` to `max` with rounds of radius `r` on its top edges.
+fn rounded_span(k: &Kernel, min: [f64; 3], max: [f64; 3], r: f64) -> Result<Brep, Error> {
+    let top = EdgeQuery::MidpointOnPlane {
+        point: [0.0, 0.0, max[2]],
+        normal: UP,
+    };
+    span(k, min, max)?.fillet(&[EdgeBlend::round(top, r)], &options())
+}
+
+const LO: [f64; 3] = [-L / 2.0, -W / 2.0, -H / 2.0];
+
+#[test]
+fn offset_faces_moves_several_planes() {
+    assert_offset_case(
+        "plain box, top and +X d=+10",
+        move |k| block(k)?.offset_where(&top_at(H).or(side(X)), 10.0),
+        |k| span(k, LO, [60.0, 30.0, 30.0]),
+        Some(110.0 * 60.0 * 50.0),
+    );
+    assert_offset_case(
+        "plain box, every face d=-5",
+        move |k| block(k)?.offset_where(&FaceQuery::All, -5.0),
+        |k| span(k, [-45.0, -25.0, -15.0], [45.0, 25.0, 15.0]),
+        Some(90.0 * 50.0 * 30.0),
+    );
+    assert_offset_case(
+        "chamfered box, top and bottom d=+10",
+        move |k| chamfered_box(k, H, 2.0)?.offset_where(&top_at(H).or(side(neg(UP))), 10.0),
+        |k| {
+            let top = EdgeQuery::MidpointOnPlane {
+                point: [0.0, 0.0, 30.0],
+                normal: UP,
+            };
+            span(k, [-50.0, -30.0, -30.0], [50.0, 30.0, 30.0])?.chamfer(
+                &top,
+                12.0 * 2f64.sqrt(),
+                &Tolerance::default(),
+            )
+        },
+        Some(chamfered_box_volume(H + 20.0, 12.0)),
+    );
+    assert_offset_case(
+        "filleted box, top and bottom d=+10",
+        move |k| top_rounded_box(k, H, 8.0)?.offset_where(&top_at(H).or(side(neg(UP))), 10.0),
+        |k| rounded_span(k, [-50.0, -30.0, -30.0], [50.0, 30.0, 30.0], 8.0),
+        Some(top_rounded_box_volume(H + 20.0, 8.0)),
+    );
+}
+
+/// The volume of a box `l` × `w` × `h` with rounds of radius `r` on its top
+/// edges, as top_rounded_box_volume.
+fn rounded_span_volume(l: f64, w: f64, h: f64, r: f64) -> f64 {
+    l * w * h - (1.0 - PI / 4.0) * r * r * 2.0 * (l + w) + 4.0 * r.powi(3) * (5.0 / 3.0 - PI / 2.0)
+}
+
+#[test]
+fn offset_faces_pushes_filleted_walls() {
+    // A wall under a fillet: the fillet slides out with it and the top and the
+    // other fillets stretch. Two picked faces: the fillet between them moves
+    // with both.
+    for d in [10.0, -5.0] {
+        assert_offset_case(
+            &format!("filleted box, +X wall d={d:+}"),
+            move |k| top_rounded_box(k, H, 8.0)?.offset_where(&side(X), d),
+            move |k| rounded_span(k, LO, [50.0 + d, 30.0, 20.0], 8.0),
+            Some(rounded_span_volume(L + d, W, H, 8.0)),
+        );
+        assert_offset_case(
+            &format!("filleted box, top and +X wall d={d:+}"),
+            move |k| top_rounded_box(k, H, 8.0)?.offset_where(&top_at(H).or(side(X)), d),
+            move |k| rounded_span(k, LO, [50.0 + d, 30.0, 20.0 + d], 8.0),
+            Some(rounded_span_volume(L + d, W, H + d, 8.0)),
+        );
+    }
+    assert_offset_case(
+        "filleted box, top and every wall d=+5",
+        move |k| top_rounded_box(k, H, 8.0)?.offset_where(&top_at(H).or(walls()), 5.0),
+        |k| rounded_span(k, [-55.0, -35.0, -20.0], [55.0, 35.0, 25.0], 8.0),
+        Some(rounded_span_volume(L + 10.0, W + 10.0, H + 5.0, 8.0)),
+    );
+    // One offset after another, as a feature tree applies them: the fillets
+    // the first offset stretched are still rounds the next one carries.
+    let fillets = on_kernel(|k| {
+        let part = top_rounded_box(k, H, 8.0)?.offset_where(&side(X), 10.0)?;
+        part.find_faces(
+            &FaceQuery::Kind(SurfaceKind::Cylinder),
+            &Tolerance::default(),
+        )
+    })
+    .unwrap();
+    assert_eq!(fillets.len(), 4, "the stretched fillets stay cylinders");
+    assert_offset_case(
+        "filleted box, +X wall d=+10, then top d=+5, then -Y wall d=+4",
+        move |k| {
+            top_rounded_box(k, H, 8.0)?
+                .offset_where(&side(X), 10.0)?
+                .offset_where(&top_at(H), 5.0)?
+                .offset_where(&side(neg(Y)), 4.0)
+        },
+        |k| rounded_span(k, [-50.0, -34.0, -20.0], [60.0, 30.0, 25.0], 8.0),
+        Some(rounded_span_volume(L + 10.0, W + 4.0, H + 5.0, 8.0)),
+    );
+    for d in [5.0, -5.0] {
+        let all = |k: &Kernel, h: f64| {
+            box_of_height(k, h)?.fillet(&[EdgeBlend::round(EdgeQuery::All, 8.0)], &options())
+        };
+        assert_offset_case(
+            &format!("fully rounded box, top d={d:+}"),
+            move |k| all(k, H)?.offset_where(&top_at(H), d),
+            move |k| all(k, H + d),
+            None,
+        );
+    }
+}
+
+#[test]
+fn offset_face_moves_a_drafted_wall() {
+    // A drafted wall itself: its base edge moves out by d / cos(5°).
+    let wall = FaceQuery::Facing {
+        direction: [5f64.to_radians().cos(), 0.0, 5f64.to_radians().sin()],
+    };
+    assert_offset_case(
+        "drafted block, +X wall d=+5",
+        move |k| drafted_block(k, H, 5.0)?.offset_where(&wall, 5.0),
+        |k| {
+            let (x, y, z) = (L / 2.0 + 5.0 / 5f64.to_radians().cos(), W / 2.0, -H / 2.0);
+            Brep::tapered_prism(
+                k,
+                &[[-L / 2.0, -y, z], [x, -y, z], [x, y, z], [-L / 2.0, y, z]],
+                H,
+                5.0,
+            )
+        },
+        None,
+    );
+}
+
+#[test]
+fn offset_faces_on_curved_faces() {
+    // A curved face takes its offset surface: holes and bosses change radius,
+    // a cone slides along its axis, a sphere or torus changes radius.
+    let cylinder = FaceQuery::Kind(SurfaceKind::Cylinder);
+    for (d, r) in [(2.0, 8.0), (-2.0, 12.0)] {
+        let c = cylinder.clone();
+        assert_offset_case(
+            &format!("hole wall d={d:+}"),
+            move |k| holed_box(k, H, 10.0)?.offset_where(&c, d),
+            move |k| holed_box(k, H, r),
+            Some((L * W - PI * r * r) * H),
+        );
+    }
+    let c = cylinder.clone();
+    assert_offset_case(
+        "hole wall and top d=+2",
+        move |k| holed_box(k, H, 10.0)?.offset_where(&c.or(top_at(H)), 2.0),
+        |k| holed_box(k, H + 2.0, 8.0),
+        Some((L * W - PI * 64.0) * (H + 2.0)),
+    );
+    let boss =
+        |k: &Kernel, r: f64, h: f64| block(k)?.union(Brep::cylinder(k, [0.0, 0.0, H / 2.0], r, h)?);
+    for (d, r) in [(2.0, 14.0), (-2.0, 10.0)] {
+        let c = cylinder.clone();
+        assert_offset_case(
+            &format!("boss side d={d:+}"),
+            move |k| boss(k, 12.0, 20.0)?.offset_where(&c, d),
+            move |k| boss(k, r, 20.0),
+            Some(BOX_VOLUME + PI * r * r * 20.0),
+        );
+    }
+    assert_offset_case(
+        "boss top d=+5",
+        move |k| boss(k, 12.0, 20.0)?.offset_where(&top_at(H + 20.0), 5.0),
+        move |k| boss(k, 12.0, 25.0),
+        Some(BOX_VOLUME + PI * 144.0 * 25.0),
+    );
+    // A frustum, radius 20 to 10 over 30: its side moves out d / cos α, and
+    // stays a cone (the offset is the cone slid along its axis).
+    for d in [2.0, -2.0] {
+        let grow = d / (10.0f64 / 30.0).atan().cos();
+        let (r1, r2) = (20.0 + grow, 10.0 + grow);
+        let built = assert_offset_case(
+            &format!("frustum side d={d:+}"),
+            move |k| {
+                Brep::cone(k, [0.0; 3], 20.0, 10.0, 30.0)?
+                    .offset_where(&FaceQuery::Kind(SurfaceKind::Cone), d)
+            },
+            move |k| Brep::cone(k, [0.0; 3], r1, r2, 30.0),
+            Some(PI * 30.0 / 3.0 * (r1 * r1 + r1 * r2 + r2 * r2)),
+        );
+        assert!(
+            surface_kinds(&built.mesh).contains(&"cone"),
+            "frustum d={d}: {:?}",
+            surface_kinds(&built.mesh)
+        );
+    }
+    // A 45° countersink widened by 1: the cone slides down by √2.
+    let sink = |k: &Kernel, apex: f64| {
+        block(k)?.difference(Brep::cone(
+            k,
+            [0.0, 0.0, apex],
+            0.0,
+            H / 2.0 + 1.0 - apex,
+            H / 2.0 + 1.0 - apex,
+        )?)
+    };
+    assert_offset_case(
+        "countersink d=-1",
+        move |k| sink(k, 10.0)?.offset_where(&FaceQuery::Kind(SurfaceKind::Cone), -1.0),
+        move |k| sink(k, 10.0 - 2f64.sqrt()),
+        None,
+    );
+    let ball = |k: &Kernel, r: f64, h: f64| {
+        box_of_height(k, h)?.intersection(Brep::sphere(k, [0.0; 3], r)?)
+    };
+    let sphere = FaceQuery::Kind(SurfaceKind::Sphere);
+    assert_offset_case(
+        "box cut by a sphere, sphere faces d=+2",
+        move |k| ball(k, 55.0, H)?.offset_where(&sphere, 2.0),
+        move |k| ball(k, 57.0, H),
+        None,
+    );
+    // A 10 mm tube: thinner ones mesh coarser than assert_mesh allows at the
+    // default 15°, offset or not.
+    for (d, r) in [(1.0, 11.0), (-1.0, 9.0)] {
+        assert_offset_case(
+            &format!("torus d={d:+}"),
+            move |k| Brep::torus(k, [0.0; 3], 30.0, 10.0)?.offset_where(&FaceQuery::All, d),
+            move |k| Brep::torus(k, [0.0; 3], 30.0, r),
+            Some(2.0 * PI * PI * 30.0 * r * r),
+        );
+    }
+}
+
+#[test]
+fn offset_faces_refuses_rather_than_return_a_wrong_solid() {
+    // Moves the kernel gets wrong today. Each must either come back exact or
+    // fail with a clean error, never as a broken or inconsistent solid:
+    //
+    // - fillets sliding along drafted walls: the executive's result
+    //   tessellates right but its own volume is 20-30% off;
+    // - a box cut by a sphere, its sphere faces moved in, or its top moved
+    //   up: the executive leaves the solid open.
+    type Make = Box<dyn FnOnce(&Kernel) -> Result<Brep, Error> + Send>;
+    let rounded_drafted = |k: &Kernel, h: f64| {
+        drafted_block(k, h, 5.0)?.fillet(&[EdgeBlend::round(top_edges_at(h), 3.0)], &options())
+    };
+    let ball = |k: &Kernel, r: f64, h: f64| {
+        box_of_height(k, h)?.intersection(Brep::sphere(k, [0.0; 3], r)?)
+    };
+    let cases: Vec<(String, Make, Make)> = vec![
+        (
+            "drafted block with rounded top, d=+10".into(),
+            Box::new(move |k| rounded_drafted(k, H)?.offset_where(&top_at(H), 10.0)),
+            Box::new(move |k| rounded_drafted(k, H + 10.0)),
+        ),
+        (
+            "drafted block with rounded top, d=-10".into(),
+            Box::new(move |k| rounded_drafted(k, H)?.offset_where(&top_at(H), -10.0)),
+            Box::new(move |k| rounded_drafted(k, H - 10.0)),
+        ),
+        (
+            "box cut by a sphere, sphere faces d=-2".into(),
+            Box::new(move |k| {
+                ball(k, 55.0, H)?.offset_where(&FaceQuery::Kind(SurfaceKind::Sphere), -2.0)
+            }),
+            Box::new(move |k| ball(k, 53.0, H)),
+        ),
+        (
+            "box cut by a sphere, top d=+5".into(),
+            Box::new(move |k| ball(k, 55.0, H)?.offset_where(&top_at(H), 5.0)),
+            Box::new(move |k| ball(k, 55.0, H + 5.0)),
+        ),
+    ];
+    for (name, moved, reference) in cases {
+        let outcome = on_kernel(move |k| {
+            let reference = reference(k).unwrap().volume(PRECISE).unwrap();
+            moved(k).map(|b| {
+                (
+                    b.is_manifold().unwrap(),
+                    b.volume(PRECISE).unwrap(),
+                    reference,
+                )
+            })
+        });
+        match outcome {
+            Ok((manifold, volume, reference)) => {
+                let error = (volume - reference) / reference;
+                println!("{name}: exact, {error:+.1e}");
+                assert!(
+                    manifold && error.abs() < 1e-6,
+                    "{name}: manifold {manifold}, {error:e} off"
+                );
+            }
+            Err(error) => {
+                println!("{name}: refused, {error}");
+                assert!(
+                    matches!(
+                        status_name(&error),
+                        Some("SHIM_ERR_BROKE_SOLID" | "SHIM_ERR_CHANGED_TOPOLOGY")
+                    ),
+                    "{name}: {error}"
+                );
+            }
+        }
+    }
 }

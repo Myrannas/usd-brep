@@ -39,6 +39,8 @@ static const sm_status SM_SHIM_ERR_BAD_LABEL = 2021;           /* a label's role
 static const sm_status SM_SHIM_ERR_NOT_PLANAR = 2022;          /* the operation needs a planar face */
 static const sm_status SM_SHIM_ERR_BAD_FRAME = 2023;           /* placement axes aren't unit and perpendicular */
 static const sm_status SM_SHIM_ERR_BAD_SWEEP = 2024;           /* a zero sweep distance, or a sweep that isn't a solid */
+static const sm_status SM_SHIM_ERR_UNSUPPORTED_FACE = 2025;    /* the face, or a blend on it, can't be moved this way */
+static const sm_status SM_SHIM_ERR_CHANGED_TOPOLOGY = 2026;    /* the move would make a face vanish (or appear) */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -259,8 +261,23 @@ sm_status sm_brep_create_box(sm_vec3 origin, double length, double width, double
 /* SmApiCreateCylinder: base_center is the centre of the base; the axis is +z. */
 sm_status sm_brep_create_cylinder(sm_vec3 base_center, double radius, double height, sm_brep **out);
 
+/* SmApiCreateCone: a frustum standing on base_center along +z, with the given
+ * base and top radii (either may be 0 for a point). */
+sm_status sm_brep_create_cone(sm_vec3 base_center, double base_radius, double top_radius, double height,
+                              sm_brep **out);
+
+/* SmApiCreateTorus: a ring around the +z axis through center. */
+sm_status sm_brep_create_torus(sm_vec3 center, double major_radius, double minor_radius, sm_brep **out);
+
 /* SmApiCreateSphere. */
 sm_status sm_brep_create_sphere(sm_vec3 center, double radius, sm_brep **out);
+
+/* SmApiCreateTaperExtrude: extrudes the closed polygon through `points` (in
+ * order, in one plane) by `height` along the polygon's normal, its walls
+ * leaning in by `draft_deg` (0 to under 90) from that direction, with both
+ * ends capped and sharp corners. */
+sm_status sm_brep_create_tapered_prism(const sm_vec3 *points, size_t count, double height, double draft_deg,
+                                       sm_brep **out);
 
 /* SmApiBrepCopy: a deep copy. */
 sm_status sm_brep_copy(const sm_brep *brep, sm_brep **out);
@@ -355,6 +372,28 @@ void sm_swept_faces_free(sm_swept_face *faces);
  * (SmBrep::RemoveTopologicalEdgesAndVertices). The shape is unchanged. Labels
  * follow sm_label's merge rule. */
 sm_status sm_brep_merge_faces(sm_brep *brep);
+
+/* Moves the faces at the given indices of the brep's face list `distance`
+ * along their outward normals (negative moves them inward), in place, as a
+ * Parasolid face offset does: every other neighbour is extended or trimmed
+ * along its own surface to meet them. Picked planes are translated, picked
+ * cones slid along their axis, and other picked curved faces replaced by their
+ * offsets (SmSurface::CreateOffsetSurface). Blends on a picked plane or cone
+ * (fillets, corner blends) are translated by the shortest move that keeps
+ * them tangent to all their neighbours. Built on SmBrep::LocalOperation; see
+ * shim.cpp.
+ *
+ * The brep keeps its faces and edges, so a move that would make a face vanish
+ * fails, with SM_SHIM_ERR_CHANGED_TOPOLOGY or SM_SHIM_ERR_BROKE_SOLID (the
+ * kernel returned an open solid, one whose vertices or edges are off their
+ * faces by more than the brep's tolerance, or one whose volume its own
+ * tessellation disagrees with). SM_SHIM_ERR_UNSUPPORTED_FACE: a picked curved
+ * face other than a cone has blends on it, no translation keeps a blend
+ * tangent to all its neighbours, or a surface has no offset.
+ * SM_SHIM_ERR_BAD_FACE: an index is out of range or repeated. The brep is
+ * unchanged when the kernel itself fails; after a check fails it may be
+ * modified, so the caller should discard it. */
+sm_status sm_brep_offset_faces(sm_brep *brep, const uint32_t *faces, size_t count, double distance);
 
 /* SmApiTessellate plus SmApiTessellateBoundaries, copied into an sm_mesh
  * with every triangle and vertex linked back to its B-rep face. */
