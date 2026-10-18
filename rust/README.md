@@ -144,9 +144,32 @@ flags and tolerances, its vertices, and its boundary polygon after phase 1.
 Equal keys mean identical triangles. A neighbour's change that splits a
 shared edge differently changes the boundary, and so the key, of both faces.
 
+`Brep::tessellate_some` goes further and runs phase 1 for the faces asked for
+only, through `SmTess::Phase1SetupFaces` (a kernel patch, `PATCHES.md`): it
+builds surface caches for those faces and the faces sharing their edges,
+splits only their edges, and builds only their boundaries. Phase 1 acts on one
+face or one edge at a time until a boundary needs refining (its polygon
+crosses itself), so then the faces come out as a whole phase 1 leaves them. Its
+keys, from `Brep::tessellation_keys`, are taken before tessellating: the
+parameters, the face's surface, domain, tolerances and loops (curves,
+intervals, trim curves and vertices), and for each edge the surfaces, domains
+and order of the faces across it. A face keyed as one an earlier
+`tessellate_some` triangulated doesn't refine either, and gets the same
+triangles. `tessellate_some` checks the faces it sets up and returns `None`
+when one refines, for the caller to tessellate the whole solid instead.
+
+A face's surface cache (`SmTessSrfCache`), a subdivision of its surface to the
+parameters, depends only on the surface and the parameters, and is often the
+largest part of setting a face up. With a `SurfaceCaches` store,
+`tessellate_some` keeps the caches of faces it set up only to split shared
+edges, and faces whose surfaces are identical take them later rather than
+building their own (`SmTessSrfCacheStore`, the second kernel patch). In a drag
+the faces around the moving ones keep theirs from step to step.
+
 `tests/tessellation.rs` checks every face against `Brep::tessellate`, partial
-meshes against whole ones, and kept faces standing in across edits. Phase 1
-still runs for the whole solid, about 40% of a tessellation.
+meshes against whole ones, and kept faces standing in across edits, both ways
+and with surface caches kept, and that `tessellate_some` declines faces whose
+boundaries need refining.
 
 ## Build cache
 

@@ -26,6 +26,8 @@
 #include <SmEdgeuse.h>
 #include <SmAttribute.h>
 
+#include <unordered_set>
+
 class SmCurveTessDriver;
 class SmSurfaceTessDriver;
 class SmTess;
@@ -169,6 +171,11 @@ public:
 
 
   SmFace     * GetFace()        const { return m_pFace; }
+
+  // game-cad patch: moves a cache SmTess::Phase1SetupFaces built for one face,
+  // and used only to split edges, to another face whose surface is identical
+  // and a tessellation with the same parameters.
+  void SetFace(SmFace * pFace, SmSurfaceTessDriver * pSurfaceTessDriver);
   SmPolyBrep * GetTS_PolyBrep() const { return mTS_pPolyBrep ; }
 
   SmStatus ImplantUVSegment(SmPolyEdge* pSegment);
@@ -510,6 +517,27 @@ PURPOSE: The Tess (Tessellation) object provides the
 
 NOTES:
 ***********************************************************************/
+/*******************************************************************//**
+PURPOSE: game-cad patch: keeps surface caches from one SmTess::Phase1SetupFaces
+    to the next, for faces whose surfaces are identical.
+
+NOTES: Phase1SetupFaces asks the store for each face's cache before building
+    one, and gives it back the caches of faces it used only to split edges
+    those faces share, which are still as BuildTree left them.
+***********************************************************************/
+class SM_EXPORT SmTessSrfCacheStore
+{
+public:
+  virtual ~SmTessSrfCacheStore() {}
+
+  // A cache the store was given, built with the tessellation's parameters for
+  // a surface identical to pFace's, or NULL. The caller owns it.
+  virtual SmTessSrfCache * Take(SmFace * pFace) = 0;
+
+  // pFace's cache, used only to split edges: the store owns it.
+  virtual void Keep(SmFace * pFace, SmTessSrfCache * pSC) = 0;
+} ;
+
 class SM_EXPORT SmTess
 {
 private:
@@ -621,6 +649,18 @@ public:
   SmStatus CreateFaceTessCache(SmFace* pFace, SmTessSrfCache*& pSC);
 
   SmStatus     SplitFaceEdgesToUVSize    (SmFace * pFace);  // renamed from CreateFaceUVSegments()
+
+  // game-cad patch: with pOptOnlyEdgesOf, splits only pFace's edges that one
+  // of those faces also uses, as SplitFaceEdgesToUVSize(pFace) splits them,
+  // and sets rbSameAsWholeFace FALSE, splitting nothing, when one of those
+  // edgeuses has no UV trim curve: its end point would come from pFace's next
+  // edgeuse, which Phase1SetupFaces may not have split as Phase1SetupBrep does.
+  SmStatus     SplitFaceEdgesToUVSize
+  (
+    SmFace                                  * pFace,
+    const std::unordered_set<const SmFace*> * pOptOnlyEdgesOf,
+    SmBoolean                               & rbSameAsWholeFace
+  );
 
   SmStatus     FindInsideOutTopoVertices 
   (
@@ -762,6 +802,23 @@ public:
     SmTArray<SmFace*> * pOptFacesToTessellate = NULL,   ///< [in ]: Only Set up to tessellate these faces for now.                 <br>
     SmTArray<SmStatus>* pFaceStatuses = NULL // out: First error per setup face; SM_SUCCESS for successful faces
   );                                                                                                                          
+
+  // Tessellate Phase 1 for some faces only (game-cad patch): leaves those faces
+  // exactly as Phase1SetupBrep(pBrep) would, splitting only their edges and
+  // building surface caches only for them and the faces sharing their edges.
+  // That holds when Phase1SetupBrep refines no face's boundary, which this can
+  // check only for the faces given: the caller must know the rest don't, for
+  // example from an earlier run in which they were given. When
+  // rbSameAsWholeBrep comes back FALSE (refinement, or anything Phase1SetupBrep
+  // would recover from), the faces aren't set up that way and this SmTess
+  // must not tessellate them.
+  SmStatus      Phase1SetupFaces
+  (
+    SmBrep                  * pBrepUsedForTessellation, ///< [in ]: Brep to tessellate, as for Phase1SetupBrep            <br>
+    const SmTArray<SmFace*> & crFacesToTessellate,      ///< [in ]: faces of pBrepUsedForTessellation to set up           <br>
+    SmBoolean               & rbSameAsWholeBrep,        ///< [out]: TRUE = those faces are as Phase1SetupBrep leaves them <br>
+    SmTessSrfCacheStore     * pOptStore = NULL          ///< [in ]: where to take caches from and keep them, or NULL      <br>
+  );
 
   // Tessellate Phase 2 - for 1 pFace: add compatible Face->Surface tessellation to existing mTS_pPolyBrep Face->Edge->Curve tessellations.
   //   m_pTessBrep         = not modified.

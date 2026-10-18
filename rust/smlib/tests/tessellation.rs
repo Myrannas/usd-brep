@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use smlib::{
-    Brep, EdgeBlend, EdgeQuery, Error, FaceKey, FilletOptions, Kernel, Mesh, TessellationParams,
+    Brep, EdgeBlend, EdgeQuery, Error, FaceKey, FilletOptions, Kernel, Mesh, SurfaceCaches,
+    TessellationParams,
 };
 
 const L: f64 = 100.0;
@@ -405,4 +406,314 @@ fn rejects_a_flag_count_other_than_the_face_count() {
     });
     assert_eq!(faces, 6);
     assert!(too_few.is_err() && too_many.is_err());
+}
+
+/// Tessellates `part` with [`Brep::tessellate_some`], reusing the pieces
+/// `kept` has [`Brep::tessellation_keys`] keys for, and checks every face
+/// against a whole tessellation. Returns how many faces were reused, and adds
+/// the new ones.
+fn reuse_some(name: &str, part: &Brep, params: &TessellationParams, kept: &mut Kept) -> usize {
+    reuse_some_with(name, part, params, kept, None)
+}
+
+/// [`reuse_some`], keeping surface caches in `caches`.
+fn reuse_some_with(
+    name: &str,
+    part: &Brep,
+    params: &TessellationParams,
+    kept: &mut Kept,
+    caches: Option<&mut SurfaceCaches>,
+) -> usize {
+    let keys = part.tessellation_keys(params).unwrap();
+    let wanted: Vec<bool> = keys
+        .iter()
+        .map(|key| key.as_ref().is_none_or(|key| !kept.contains_key(key)))
+        .collect();
+    let mesh = part
+        .tessellate_some(params, &wanted, caches)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{name}: no face of these parts refines"));
+    assert_face_runs(name, &mesh);
+    let fresh = pieces(&mesh);
+    let whole_mesh = part.tessellate(params).unwrap();
+    assert_eq!(mesh.faces, whole_mesh.faces, "{name}: faces");
+    assert_eq!(mesh.edges, whole_mesh.edges, "{name}: edges");
+    let whole = pieces(&whole_mesh);
+    let mut reused = 0;
+    for (face, key) in keys.into_iter().enumerate() {
+        let piece = if wanted[face] {
+            fresh[face].clone()
+        } else {
+            reused += 1;
+            assert!(
+                fresh[face].triangles.is_empty(),
+                "{name}: face {face} wasn't wanted"
+            );
+            kept[key.as_ref().unwrap()].clone()
+        };
+        assert_eq!(
+            piece, whole[face],
+            "{name}: face {face} (reused: {})",
+            !wanted[face]
+        );
+        if let Some(key) = key {
+            kept.entry(key).or_insert(piece);
+        }
+    }
+    reused
+}
+
+#[test]
+fn some_faces_match_the_whole_tessellation() {
+    for (name, make) in parts() {
+        let reused = on_kernel(move |k| {
+            let part = make(k).unwrap();
+            let mut kept = Kept::new();
+            let mut reused = Vec::new();
+            for params in [final_params(), preview_params()] {
+                // Every face, then every face again from what was kept.
+                reused.push(reuse_some(name, &part, &params, &mut kept));
+                reused.push(reuse_some(name, &part, &params, &mut kept));
+            }
+            (reused, part.face_count())
+        });
+        let (reused, faces) = reused;
+        assert_eq!(reused, [0, faces, 0, faces], "{name}: faces reused");
+    }
+}
+
+#[test]
+fn some_faces_alone_match_the_whole_tessellation() {
+    for (name, make) in parts() {
+        on_kernel(move |k| {
+            let part = make(k).unwrap();
+            let params = final_params();
+            let keys = part.tessellation_keys(&params).unwrap();
+            let mut kept = Kept::new();
+            reuse_some(name, &part, &params, &mut kept);
+            // Drop every third face, so the rest are triangulated alone.
+            for (face, key) in keys.iter().enumerate() {
+                if face % 3 == 1 {
+                    kept.remove(key.as_ref().unwrap());
+                }
+            }
+            let dropped = (keys.len() + 1) / 3;
+            let reused = reuse_some(name, &part, &params, &mut kept);
+            assert_eq!(reused, keys.len() - dropped, "{name}: faces reused");
+        });
+    }
+}
+
+#[test]
+fn kept_faces_stand_in_exactly_when_tessellated_alone() {
+    // As kept_faces_stand_in_exactly_across_edits, but splitting edges only
+    // for the faces that changed.
+    let steps = [
+        (10.0, 9.0),
+        (12.0, 9.0),
+        (14.0, 9.0),
+        (14.0, 10.0),
+        (10.0, 9.0),
+        (-20.0, 9.0),
+    ];
+    let reused = on_kernel(move |k| {
+        let mut kept = Kept::new();
+        let mut reused = Vec::new();
+        for (x, r) in steps {
+            let part = holed(k, x, r).unwrap();
+            for params in [final_params(), preview_params()] {
+                reused.push(reuse_some(
+                    &format!("hole at {x}, radius {r}"),
+                    &part,
+                    &params,
+                    &mut kept,
+                ));
+            }
+        }
+        reused
+    });
+    assert_eq!(&reused[..2], &[0, 0]);
+    assert!(
+        reused[2..].iter().all(|&n| n >= 8),
+        "faces reused per step: {reused:?}"
+    );
+    let faces = on_kernel(|k| holed(k, 10.0, 9.0).unwrap().face_count());
+    assert_eq!(
+        reused[8], faces,
+        "faces reused when the hole comes back: {reused:?}"
+    );
+}
+
+#[test]
+fn kept_faces_stand_in_across_other_parts_when_tessellated_alone() {
+    let reused = on_kernel(|k| {
+        let mut kept = Kept::new();
+        let mut reused = Vec::new();
+        for (name, part) in [
+            ("boss 12", bossed(k, 12.0)),
+            ("boss 14", bossed(k, 14.0)),
+            ("sphere 55", rounded_block(k, 55.0)),
+            ("sphere 57", rounded_block(k, 57.0)),
+            ("boss 12 again", bossed(k, 12.0)),
+        ] {
+            let part = part.unwrap();
+            for params in [final_params(), preview_params()] {
+                reused.push(reuse_some(name, &part, &params, &mut kept));
+            }
+        }
+        reused
+    });
+    assert!(reused[2] >= 5, "faces reused: {reused:?}");
+    let faces = on_kernel(|k| bossed(k, 12.0).unwrap().face_count());
+    assert_eq!(&reused[8..], &[faces, faces], "faces reused: {reused:?}");
+}
+
+#[test]
+fn tessellation_keys_repeat_and_follow_the_parameters() {
+    for (name, make) in parts() {
+        let (first, second, third, coarse, whole) = on_kernel(move |k| {
+            let part = make(k).unwrap();
+            let again = make(k).unwrap();
+            let keys =
+                |brep: &Brep, params: &TessellationParams| brep.tessellation_keys(params).unwrap();
+            (
+                keys(&part, &final_params()),
+                keys(&part, &final_params()),
+                keys(&again, &final_params()),
+                keys(&part, &preview_params()),
+                part.begin_tessellation(&final_params())
+                    .unwrap()
+                    .face_keys()
+                    .unwrap(),
+            )
+        });
+        assert!(
+            first.iter().all(Option::is_some),
+            "{name}: every face has a key"
+        );
+        assert_eq!(first, second, "{name}: keys of one solid");
+        assert_eq!(first, third, "{name}: keys of the same solid built twice");
+        for (face, key) in first.iter().enumerate() {
+            assert!(
+                !coarse.contains(key) && !whole.contains(key),
+                "{name}: face {face}'s key is another's"
+            );
+        }
+    }
+}
+
+#[test]
+fn tessellate_some_rejects_a_flag_count_other_than_the_face_count() {
+    let (too_few, too_many, none) = on_kernel(|k| {
+        let part = block(k).unwrap();
+        let params = final_params();
+        (
+            part.tessellate_some(&params, &[true; 5], None).map(|_| ()),
+            part.tessellation_keys(&params).map(|keys| keys.len()),
+            part.tessellate_some(&params, &[false; 6], None).unwrap(),
+        )
+    });
+    assert!(too_few.is_err());
+    assert_eq!(too_many.unwrap(), 6);
+    let none = none.expect("nothing to refine");
+    assert_eq!(none.faces.len(), 6);
+    assert_eq!(none.triangle_count(), 0);
+}
+
+/// A disk with a hole half a millimetre from its rim, away from the rim's
+/// seam. At a coarse chord height the rim's polygon cuts across the hole's,
+/// so SMLib refines the top and bottom faces' boundaries.
+fn crowded(k: &Kernel) -> Result<Brep, Error> {
+    let disk = Brep::cylinder(k, [0.0, 0.0, 0.0], 30.0, 10.0)?;
+    let (r, angle) = (20.5, 22.5f64.to_radians());
+    disk.difference(Brep::cylinder(
+        k,
+        [r * angle.cos(), r * angle.sin(), -1.0],
+        9.0,
+        12.0,
+    )?)
+}
+
+fn coarse_params() -> TessellationParams {
+    TessellationParams {
+        chord_height: 5.0,
+        curve_angle_deg: 45.0,
+        surface_angle_deg: 45.0,
+        ..TessellationParams::default()
+    }
+}
+
+#[test]
+fn tessellate_some_declines_boundaries_that_need_refining() {
+    let (alone, together, whole) = on_kernel(|k| {
+        let part = crowded(k).unwrap();
+        let params = coarse_params();
+        let faces = part.face_count();
+        let alone: Vec<bool> = (0..faces)
+            .map(|face| {
+                let wanted: Vec<bool> = (0..faces).map(|f| f == face).collect();
+                part.tessellate_some(&params, &wanted, None)
+                    .unwrap()
+                    .is_some()
+            })
+            .collect();
+        let together = part
+            .tessellate_some(&params, &vec![true; faces], None)
+            .unwrap();
+        (alone, together.is_some(), part.tessellate(&params).unwrap())
+    });
+    // The planar ends refine; the cylinders don't.
+    assert_eq!(alone, [true, false, false, true]);
+    assert!(!together, "the ends refine with every face wanted too");
+    assert!(whole.triangle_count() > 0);
+}
+
+#[test]
+fn kept_surface_caches_leave_faces_as_they_were() {
+    // The hole's steps and the other parts again, with surface caches kept
+    // from step to step.
+    let (reused, caches_kept) = on_kernel(|k| {
+        let mut kept = Kept::new();
+        let mut caches = SurfaceCaches::new(k);
+        let mut reused = Vec::new();
+        let mut caches_kept = Vec::new();
+        let mut parts: Vec<(String, Brep)> = [(10.0, 9.0), (12.0, 9.0), (14.0, 10.0), (10.0, 9.0)]
+            .into_iter()
+            .map(|(x, r)| (format!("hole at {x}, radius {r}"), holed(k, x, r).unwrap()))
+            .collect();
+        parts.push(("boss 12".into(), bossed(k, 12.0).unwrap()));
+        parts.push(("boss 14".into(), bossed(k, 14.0).unwrap()));
+        for (name, part) in &parts {
+            for params in [final_params(), preview_params()] {
+                reused.push(reuse_some_with(
+                    name,
+                    part,
+                    &params,
+                    &mut kept,
+                    Some(&mut caches),
+                ));
+                caches_kept.push(caches.len());
+            }
+        }
+        (reused, caches_kept)
+    });
+    assert_eq!(&reused[..2], &[0, 0]);
+    assert!(
+        reused[2..4].iter().all(|&n| n >= 8),
+        "faces reused per step: {reused:?}"
+    );
+    // Faces next to the moving hole and the growing boss leave their
+    // caches for the next step; going back to the first hole reuses every
+    // face, which leaves the store as it was.
+    assert_eq!(
+        caches_kept[..2],
+        [0, 0],
+        "nothing is kept beside every face"
+    );
+    assert!(
+        [2, 3, 4, 5, 6, 7, 10, 11]
+            .iter()
+            .all(|&i| caches_kept[i] > 0),
+        "caches kept per step: {caches_kept:?}"
+    );
 }
