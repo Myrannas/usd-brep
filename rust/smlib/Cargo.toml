@@ -1,0 +1,11 @@
+[package]
+name = "smlib"
+description = "Safe Rust API over NVIDIA's SMLib B-rep kernel (USD BRep)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+smlib-sys = { path = "../smlib-sys" }
