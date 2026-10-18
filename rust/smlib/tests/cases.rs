@@ -14,8 +14,8 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use smlib::{
-    Brep, Continuity, EdgeBlend, EdgeQuery, Error, FaceQuery, FilletOptions, Kernel, Mesh, Surface,
-    SurfaceKind, TessellationParams, Tolerance,
+    Brep, Continuity, EdgeBlend, EdgeQuery, Error, FaceQuery, FilletOptions, Kernel, Label, Mesh,
+    Surface, SurfaceKind, TessellationParams, Tolerance,
 };
 
 const L: f64 = 100.0;
@@ -1654,4 +1654,177 @@ fn offset_faces_refuses_rather_than_return_a_wrong_solid() {
             }
         }
     }
+}
+
+/// A crate-sized block, its vertical edges rounded, with 16 mm bosses 6 high
+/// (`r` 8) or holes 20 deep on its top at each (x, y), as in game-cad's
+/// bugs.gcad: two stand near the front edge.
+fn crate_with(k: &Kernel, bosses: &[[f64; 3]], holes: &[[f64; 3]]) -> Result<Brep, Error> {
+    let mut part = Brep::cuboid(k, [-200.0, -150.0, -125.0], [400.0, 300.0, 265.0])?.fillet(
+        &[EdgeBlend::round(
+            EdgeQuery::ParallelTo { direction: UP },
+            20.0,
+        )],
+        &options(),
+    )?;
+    for &[x, y, r] in bosses {
+        part = part.union(Brep::cylinder(k, [x, y, 140.0], r, 6.0)?)?;
+    }
+    for &[x, y, r] in holes {
+        part = part.difference(Brep::cylinder(k, [x, y, 120.0], r, 20.0)?)?;
+    }
+    Ok(part)
+}
+
+const FRONT_PAIR: [[f64; 3]; 2] = [[-165.0, -115.0, 8.0], [165.0, -115.0, 8.0]];
+
+fn crate_front() -> FaceQuery {
+    FaceQuery::OnPlane {
+        point: [0.0, -150.0, 0.0],
+        normal: neg(Y),
+    }
+}
+
+/// The area of a disc of radius 8 at y = -115 left behind the front face
+/// moved to `y`: what remains of a front boss or hole.
+fn left_behind(y: f64) -> f64 {
+    let r: f64 = 8.0;
+    let segment = |d: f64| r * r * (d / r).acos() - d * (r * r - d * d).sqrt();
+    let from_centre = y + 115.0;
+    if from_centre <= -r {
+        PI * r * r
+    } else if from_centre >= r {
+        0.0
+    } else if from_centre >= 0.0 {
+        segment(from_centre)
+    } else {
+        PI * r * r - segment(-from_centre)
+    }
+}
+
+#[test]
+fn a_pushed_face_cuts_through_what_stands_in_its_way() {
+    // The front face pushed in under two bosses: short of them, through
+    // them, and past them. The bosses come back trimmed flush with the moved
+    // face, keeping their labels, and the rest is as if they weren't there;
+    // so with holes, cut back as notches.
+    for (holes, height) in [(false, 6.0), (true, -20.0)] {
+        for d in [-26.0, -30.0, -46.0] {
+            let (with, without, obstacles, faces, labels) = on_kernel(move |k| {
+                let (bosses, cuts): (&[[f64; 3]], &[[f64; 3]]) = if holes {
+                    (&[], &FRONT_PAIR)
+                } else {
+                    (&FRONT_PAIR, &[])
+                };
+                let mut part = crate_with(k, bosses, cuts)?;
+                for face in part.faces()? {
+                    if matches!(face.surface, Surface::Cylinder { radius, .. } if (radius - 8.0).abs() < 1e-6)
+                    {
+                        part.set_face_label(face.index, &Label::new(9, "side"))?;
+                    }
+                }
+                let front = part.find_faces(&crate_front(), &Tolerance::default())?;
+                part.set_face_label(front[0], &Label::new(1, "-Y"))?;
+                let obstacles = part.offset_obstacles(&front, d)?.len();
+                let moved = part.offset_faces(&front, d)?;
+                let plain = crate_with(k, &[], &[])?.offset_where(&crate_front(), d)?;
+                let labels: Vec<String> = moved
+                    .faces()?
+                    .iter()
+                    .filter_map(|f| f.label.as_ref().map(ToString::to_string))
+                    .collect();
+                Ok::<_, Error>((
+                    moved.volume(PRECISE)?,
+                    plain.volume(PRECISE)?,
+                    obstacles,
+                    moved.face_count(),
+                    labels,
+                ))
+            })
+            .unwrap();
+            let left = 2.0 * height * left_behind(-150.0 - d);
+            let expected = without + left;
+            println!(
+                "holes {holes} d={d:+}: {faces} faces, {with:.4} against {expected:.4}, {obstacles} in the way"
+            );
+            assert!(
+                ((with - expected) / expected).abs() < PRECISE,
+                "holes {holes} d={d}: {with} against {expected}"
+            );
+            assert_eq!(obstacles, if d == -26.0 { 0 } else { 2 }, "d={d}");
+            assert!(
+                labels.iter().any(|l| l == "1/-Y.0"),
+                "the moved face keeps its label"
+            );
+            let pieces = labels.iter().filter(|l| *l == "9/side.0").count();
+            match d {
+                -46.0 => assert_eq!(pieces, 0, "gone past the plane"),
+                _ => assert!(
+                    pieces >= 2,
+                    "the trimmed {} keep their labels: {labels:?}",
+                    if holes { "holes" } else { "bosses" }
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_pushed_face_refuses_what_it_cannot_set_aside() {
+    // A small boss stands 0.5 mm behind a front one, inside the room the
+    // front one is set aside with: the front one can't be taken out alone.
+    let (outcome, obstacles) = on_kernel(|k| {
+        let part = crate_with(k, &[[-165.0, -115.0, 8.0], [-165.0, -104.5, 2.0]], &[])?;
+        let front = part.find_faces(&crate_front(), &Tolerance::default())?;
+        let obstacles = part.offset_obstacles(&front, -30.0)?;
+        let faces = part.faces()?;
+        let radii: Vec<Vec<f64>> = obstacles
+            .iter()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|&i| match faces[i].surface {
+                        Surface::Cylinder { radius, .. } => Some(radius),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok::<_, Error>((
+            part.offset_faces(&front, -30.0).map(|b| b.face_count()),
+            radii,
+        ))
+    })
+    .unwrap();
+    let error = outcome.expect_err("the small boss is in the way");
+    assert_eq!(status_name(&error), Some("SHIM_ERR_OBSTRUCTED"), "{error}");
+    assert_eq!(
+        obstacles.len(),
+        1,
+        "only the front boss is reached: {obstacles:?}"
+    );
+    assert!(
+        obstacles[0].iter().all(|r| (r - 8.0).abs() < 1e-6),
+        "{obstacles:?}"
+    );
+}
+
+#[test]
+fn an_unchecked_offset_returns_what_the_kernel_made() {
+    // Without the push through and the checks, the local operation leaves the
+    // bosses' rims outside the lid: a solid that passes for closed but can't
+    // be tessellated. The checked offset never returns it.
+    let (unchecked, checked) = on_kernel(|k| {
+        let part = crate_with(k, &FRONT_PAIR, &[])?;
+        let front = part.find_faces(&crate_front(), &Tolerance::default())?;
+        let raw = part.try_clone()?.offset_faces_unchecked(&front, -46.0)?;
+        let unchecked = raw.tessellate(&TessellationParams::default()).map(|_| ());
+        let checked = part
+            .offset_faces(&front, -46.0)?
+            .tessellate(&TessellationParams::default())
+            .map(|_| ());
+        Ok::<_, Error>((unchecked, checked))
+    })
+    .unwrap();
+    assert!(unchecked.is_err(), "the kernel's own result tessellates");
+    checked.unwrap();
 }

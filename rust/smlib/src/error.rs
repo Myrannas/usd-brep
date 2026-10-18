@@ -63,6 +63,7 @@ impl Status {
             2024 => "SHIM_ERR_BAD_SWEEP",
             2025 => "SHIM_ERR_UNSUPPORTED_FACE",
             2026 => "SHIM_ERR_CHANGED_TOPOLOGY",
+            2027 => "SHIM_ERR_OBSTRUCTED",
             _ => return None,
         })
     }
