@@ -19,7 +19,9 @@
 #include <SmApiQueries.h>
 #include <SmApiSurfaces.h>
 
+#include <SmAttribute.h>
 #include <SmAxis2Placement.h>
+#include <SmBSplineCurve.h>
 #include <SmBSplineSurface.h>
 #include <SmBrep.h>
 #include <SmCone.h>
@@ -34,6 +36,7 @@
 #include <SmFilletStandardSolver.h>
 #include <SmPlane.h>
 #include <SmPoly.h>
+#include <SmPrimitiveCreation.h>
 #include <SmSphere.h>
 #include <SmSurfOfRevolution.h>
 #include <SmSurfTypes.h>
@@ -76,6 +79,78 @@ void put3(double out[3], const SmVector3d& v) {
     out[2] = v.z;
 }
 
+// Labels ride on SMLib's attribute system (SmAttribute.h) under one
+// application attribute id (applications use ids above 10000). The kernel
+// copies a COPY attribute onto both pieces of a split face or edge, onto
+// copies, and onto a coincident face from the other brep of a boolean.
+const ULONG LABEL_ATTRIBUTE_ID = 0x534d4c42;  // "SMLB"
+
+// A label as a generic attribute (longs: feature, index; characters: role),
+// so it also reads back from files as one. Merging is the only behaviour it
+// changes: when two labelled faces or edges merge, the survivor takes the
+// older label (the lower feature id), whichever of the two the kernel keeps.
+class LabelAttribute : public SmGenericAttribute {
+public:
+    LabelAttribute(const SmTArray<long>& longs, const SmTArray<char>& role)
+        : SmGenericAttribute(LABEL_ATTRIBUTE_ID, SM_AB_COPY, longs, SmTArray<double>(), role) {}
+    LabelAttribute(const LabelAttribute& other) : SmGenericAttribute(other) {}
+
+    SmAttribute* MakeCopy(const SmContext& context) const override { return new (context) LabelAttribute(*this); }
+
+    // SmAObject::Notify(SM_NO_MERGE_IN_BREP) calls this on the survivor's
+    // attributes with the deleted object as the second argument, and only
+    // copies the deleted object's attributes across when the survivor has
+    // none with the same id.
+    void Merge(SmAObject* survivor, SmAObject* deleted, SmAObject* result) override {
+        const SmAttribute* other =
+            deleted && deleted != survivor ? deleted->FindAttribute(LABEL_ATTRIBUTE_ID) : nullptr;
+        if (other && result == survivor && survivor && survivor->FindAttribute(LABEL_ATTRIBUTE_ID) == this &&
+            other->GetNumLongElements() >= 1 && m_vLongElements.GetSize() >= 1 &&
+            other->GetLongElementsAddress()[0] < m_vLongElements[0]) {
+            m_vLongElements.RemoveAll();
+            for (ULONG i = 0; i < other->GetNumLongElements(); ++i) {
+                m_vLongElements.Add(other->GetLongElementsAddress()[i]);
+            }
+            m_vCharacterElements.RemoveAll();
+            for (ULONG i = 0; i < other->GetNumCharacterElements(); ++i) {
+                m_vCharacterElements.Add(other->GetCharacterElementsAddress()[i]);
+            }
+        }
+        SmGenericAttribute::Merge(survivor, deleted, result);
+    }
+};
+
+sm_label read_label(const SmAObject* object) {
+    sm_label label;
+    std::memset(&label, 0, sizeof label);
+    const SmAttribute* attribute = object ? object->FindAttribute(LABEL_ATTRIBUTE_ID) : nullptr;
+    if (!attribute || attribute->GetNumLongElements() < 2 || attribute->GetNumCharacterElements() == 0) return label;
+    label.present = 1;
+    label.feature = static_cast<uint32_t>(attribute->GetLongElementsAddress()[0]);
+    label.index = static_cast<uint32_t>(attribute->GetLongElementsAddress()[1]);
+    const size_t length = std::min<size_t>(attribute->GetNumCharacterElements(), SM_LABEL_ROLE_CAPACITY - 1);
+    std::memcpy(label.role, attribute->GetCharacterElementsAddress(), length);
+    return label;
+}
+
+// The role's length, or 0 when it's empty or not NUL-terminated in its buffer.
+size_t role_length(const sm_label& label) {
+    const void* end = std::memchr(label.role, '\0', SM_LABEL_ROLE_CAPACITY);
+    return end ? static_cast<size_t>(static_cast<const char*>(end) - label.role) : 0;
+}
+
+void write_label(SmAObject& object, const sm_label& label) {
+    if (SmAttribute* old = object.FindAttribute(LABEL_ATTRIBUTE_ID)) object.RemoveAttribute(old);
+    if (!label.present) return;
+    SmTArray<long> longs;
+    longs.Add(static_cast<long>(label.feature));
+    longs.Add(static_cast<long>(label.index));
+    SmTArray<char> role;
+    const size_t length = role_length(label);
+    for (size_t i = 0; i < length; ++i) role.Add(label.role[i]);
+    object.AddAttribute(new (*object.GetContext()) LabelAttribute(longs, role));
+}
+
 void describe_placement(sm_face_info& info, const SmAxis2Placement& placement) {
     put3(info.origin, placement.GetOrigin());
     put3(info.axis, placement.GetZAxis());
@@ -85,6 +160,7 @@ void describe_placement(sm_face_info& info, const SmAxis2Placement& placement) {
 sm_face_info describe_face(const SmFace* face) {
     sm_face_info info;
     std::memset(&info, 0, sizeof info);
+    info.label = read_label(face);
     const SmExtent2d domain = face->GetUVDomain();
     info.uv_min[0] = domain.GetUMin();
     info.uv_min[1] = domain.GetVMin();
@@ -278,6 +354,7 @@ sm_status build_edges(SmBrep& brep, double angle_tol_deg, const FaceIndex& face_
         info.face_a = faces.faces[0] ? face_id(face_index, faces.faces[0]) : -1;
         info.face_b = faces.faces[1] ? face_id(face_index, faces.faces[1]) : -1;
         info.use_count = faces.use_count;
+        info.label = read_label(edges[i]);
     }
 
     SmTArray<SmPoint3d> points;
@@ -345,11 +422,14 @@ sm_status describe_edge(const SmEdge* edge, const FaceIndex& face_index, sm_edge
         if (status != SM_SUCCESS) return status;
         put3(info.points[k], point);
     }
-    status = SmApiEdgeComputeLength(edge, 1e-9, info.length);
+    status = SmApiEdgeComputeLength(edge, 1e-7, info.length);
     if (status != SM_SUCCESS) return status;
 
     const EdgeFaces faces = faces_of(edge);
     info.use_count = faces.use_count;
+    info.label = read_label(edge);
+    info.label_a = read_label(faces.faces[0]);
+    info.label_b = read_label(faces.faces[1]);
     const double* mid = info.points[SM_EDGE_SAMPLES / 2];
     const SmPoint3d midpoint(mid[0], mid[1], mid[2]);
     int32_t* ids[2] = {&info.face_a, &info.face_b};
@@ -425,6 +505,169 @@ sm_status chamfer(SmBrep& target, SmTArray<SmEdge*>& picked, double width) {
     SmTArray<SmFilletCorner*>& corners = executive.GetFilletCorners();
     for (ULONG i = 0; i < corners.GetSize(); ++i) corners[i]->SetBevel(TRUE);
     return static_cast<sm_status>(executive.DoFilleting());
+}
+
+SmFace* face_at(const SmBrep& brep, size_t index) {
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    return index < faces.GetSize() ? faces[static_cast<ULONG>(index)] : nullptr;
+}
+
+// Planarity tolerance, in model units: how far a surface's control points may
+// stray from its plane.
+const double PLANAR_TOLERANCE = 1e-7;
+
+// The normal of a planar face pointing out of the solid, if it's planar. A
+// plane's normal is the same everywhere, so it's evaluated mid-domain and then
+// oriented as outward_normal orients it.
+bool outward_plane(const SmFace* face, double normal[3]) {
+    const SmSurface* surface = face->GetSurface();
+    if (!surface || !surface->IsPlanar(PLANAR_TOLERANCE)) return false;
+    const SmExtent2d domain = face->GetUVDomain();
+    const SmVector2d middle(0.5 * (domain.GetUMin() + domain.GetUMax()), 0.5 * (domain.GetVMin() + domain.GetVMax()));
+    SmVector3d direction;
+    if (SmApiEvaluateSurfaceNormal(surface, middle, direction) != SM_SUCCESS) return false;
+    const SmBrep* brep = face->GetBrep();
+    const SmFaceuse* upward = face->GetUpwardFaceuse();
+    if (brep && upward && upward->GetShell() && brep->GetInfiniteRegion() != upward->GetShell()->GetRegion()) {
+        direction *= -1.0;
+    }
+    put3(normal, direction);
+    return true;
+}
+
+sm_status describe_face_geometry(const SmFace* face, sm_face_geometry& out) {
+    std::memset(&out, 0, sizeof out);
+    out.info = describe_face(face);
+    SmExtent3d box;
+    const SmStatus status = face->CalculateBoundingBox(box);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    put3(out.bounds_min, box.GetMin());
+    put3(out.bounds_max, box.GetMax());
+    out.planar = outward_plane(face, out.normal) ? 1 : 0;
+    if (!out.planar) out.normal[0] = out.normal[1] = out.normal[2] = 0.0;
+    return SM_SUCCESS;
+}
+
+// As SmApiFaceComputeCentroid, but without its 1e-4 accuracy floor.
+sm_status face_centroid(const SmFace* face, double accuracy, double& area, SmPoint3d& centroid) {
+    SmExtent3d box;
+    SmStatus status = face->CalculateBoundingBox(box);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    const SmPoint3d origin = box.GetMid();
+    const SmVector3d size = box.GetSize();
+    const double extent = std::max(size.z, std::max(size.x, size.y));
+    double signed_area = 0.0;
+    double unused_volume = 0.0;
+    SmTArray<SmVector3d> moments;
+    status = face->ComputePreciseProperties(SM_OT_SAME, accuracy, origin, extent * extent / 100.0, 0.0, signed_area,
+                                            unused_volume, moments, SM_PPF_AREA | SM_PPF_AREA_FIRST_MOMENTS);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    if (std::fabs(signed_area) < SM_EFF_ZERO || moments.GetSize() < 1) return SM_ERR_INVALID_INPUT;
+    area = std::fabs(signed_area);
+    centroid = origin + moments[0] / signed_area;
+    return SM_SUCCESS;
+}
+
+bool unit_vector(const sm_vec3& v) {
+    const double length = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    return std::isfinite(length) && std::fabs(length - 1.0) <= 1e-9;
+}
+
+SmPoint3d midpoint_of(const SmEdge* edge) {
+    SmPoint3d point(0.0, 0.0, 0.0);
+    const SmExtent1d interval = edge->GetInterval();
+    edge->GetCurve()->EvaluatePoint(0.5 * (interval.GetMin() + interval.GetMax()), point);
+    return point;
+}
+
+// Which edge of the swept face each side face came from. The sweep works on
+// copies of the face's edge curves, so the link is geometric: a side's edge
+// in the start cap lies on the source edge it was swept from.
+int32_t source_edge(const SmFace* side, const SmFace* start, const SmTArray<SmEdge*>& source_edges,
+                    const std::unordered_map<const SmEdge*, uint32_t>& edge_index) {
+    SmTArray<SmEdge*> side_edges;
+    side->GetEdges(side_edges);
+    SmTArray<SmEdge*> start_edges;
+    if (start) start->GetEdges(start_edges);
+    int32_t best = -1;
+    double best_distance = SM_BIG_DOUBLE;
+    for (ULONG i = 0; i < side_edges.GetSize(); ++i) {
+        ULONG unused;
+        if (start && !start_edges.FindElement(side_edges[i], unused)) continue;
+        const SmPoint3d mid = midpoint_of(side_edges[i]);
+        for (ULONG j = 0; j < source_edges.GetSize(); ++j) {
+            SmPoint3d closest;
+            double parameter = 0.0;
+            double distance = SM_BIG_DOUBLE;
+            if (SmApiCurveClosestPoint(source_edges[j]->GetCurve(), mid, closest, parameter, distance) != SM_SUCCESS) {
+                continue;
+            }
+            if (distance < best_distance) {
+                best_distance = distance;
+                const auto found = edge_index.find(source_edges[j]);
+                best = found == edge_index.end() ? -1 : static_cast<int32_t>(found->second);
+            }
+        }
+    }
+    // The copy lies on the source curve to well within the sweep's tolerance.
+    return best_distance <= 1e3 * SM_ZONE_TOL_3D ? best : -1;
+}
+
+sm_status sweep_face(const SmBrep& brep, SmFace* face, double distance, SmBrep*& prism,
+                     std::vector<sm_swept_face>& roles) {
+    double normal[3];
+    if (!outward_plane(face, normal)) return SM_SHIM_ERR_NOT_PLANAR;
+    SmPoint3d inside;
+    if (SmApiFaceInternalPoint(face, inside) != SM_SUCCESS) return SM_SHIM_ERR_NOT_PLANAR;
+    const SmVector3d direction(normal[0], normal[1], normal[2]);
+
+    const SmContext* context = SmApiGetOrCreateContext();
+    SmBSplineCurve* raw_path = nullptr;
+    SmStatus status = SmBSplineCurve::CreateLineSegment(*context, 3, inside, inside + direction * distance, raw_path);
+    if (status != SM_SUCCESS || !raw_path) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    const std::unique_ptr<SmBSplineCurve> path(raw_path);
+
+    // Translate the face's own loops along the path and cap both ends, in
+    // place rather than moved to the path's start.
+    SmSweepOptions options;
+    options.bCapEndsArg = TRUE;
+    options.bTranslationalSweep = TRUE;
+    options.bMoveToProfile = TRUE;
+    std::unique_ptr<SmBrep> result(new (*context) SmBrep());
+    SmPrimitiveCreation creator(result->GetInfiniteRegion());
+    SmTArray<SmFace*> profile;
+    profile.Add(face);
+    SmTArray<SmFace*> starts, sides, ends;
+    status = creator.CreateCurveSweepFromFaces(profile, path.get(), nullptr, nullptr, SM_ZONE_TOL_3D, &options, starts,
+                                               sides, ends);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    if (!is_manifold_solid(*result) || starts.GetSize() != 1 || ends.GetSize() != 1) return SM_SHIM_ERR_BAD_SWEEP;
+
+    SmTArray<SmEdge*> all_edges;
+    brep.GetEdges(all_edges);
+    std::unordered_map<const SmEdge*, uint32_t> edge_index;
+    for (ULONG i = 0; i < all_edges.GetSize(); ++i) edge_index.emplace(all_edges[i], i);
+    SmTArray<SmEdge*> face_edges;
+    face->GetEdges(face_edges);
+
+    SmTArray<SmFace*> faces;
+    result->GetFaces(faces);
+    roles.assign(faces.GetSize(), sm_swept_face{SM_SWEPT_SIDE, -1});
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        ULONG unused;
+        if (faces[i] == starts[0]) {
+            roles[i].role = SM_SWEPT_START;
+        } else if (faces[i] == ends[0]) {
+            roles[i].role = SM_SWEPT_END;
+        } else if (sides.FindElement(faces[i], unused)) {
+            roles[i].source_edge = source_edge(faces[i], starts[0], face_edges, edge_index);
+        } else {
+            return SM_SHIM_ERR_BAD_SWEEP;
+        }
+    }
+    prism = result.release();
+    return SM_SUCCESS;
 }
 
 }  // namespace
@@ -589,6 +832,118 @@ sm_status sm_brep_chamfer_edges(sm_brep* brep, const uint32_t* edges, size_t cou
         if (picked.GetSize() == 0) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
         return keeping_solid(*target, [&] { return chamfer(*target, picked, width); });
     });
+}
+
+sm_status sm_brep_face_geometry(const sm_brep* brep, sm_face_geometry* out, size_t capacity, size_t* count) {
+    if (!brep || !count || (capacity > 0 && !out)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmTArray<SmFace*> faces;
+        brep_of(brep)->GetFaces(faces);
+        const size_t written = std::min(capacity, static_cast<size_t>(faces.GetSize()));
+        for (size_t i = 0; i < written; ++i) {
+            const sm_status status = describe_face_geometry(faces[static_cast<ULONG>(i)], out[i]);
+            if (status != SM_SUCCESS) return status;
+        }
+        *count = faces.GetSize();
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_face_centroid(const sm_brep* brep, size_t face, double relative_accuracy, double* area,
+                                double centroid[3]) {
+    if (!brep || !area || !centroid) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!std::isfinite(relative_accuracy)) return SM_ERR_INVALID_INPUT;
+    const double accuracy = std::min(1e-1, std::max(1e-10, relative_accuracy));
+    return guarded([&] {
+        const SmFace* target = face_at(*brep_of(brep), face);
+        if (!target) return SM_SHIM_ERR_BAD_FACE;
+        double value = 0.0;
+        SmPoint3d point;
+        const sm_status status = face_centroid(target, accuracy, value, point);
+        if (status != SM_SUCCESS) return status;
+        *area = value;
+        put3(centroid, point);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_bounding_box(const sm_brep* brep, double min[3], double max[3]) {
+    if (!brep || !min || !max) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmPoint3d low;
+        SmPoint3d high;
+        const SmApiStatus status = SmApiBrepBoundingBox(brep_of(brep), FALSE, low, high);
+        if (status != SM_SUCCESS) return status;
+        put3(min, low);
+        put3(max, high);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_set_face_label(sm_brep* brep, size_t face, const sm_label* label) {
+    if (!brep || !label) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (label->present && role_length(*label) == 0) return SM_SHIM_ERR_BAD_LABEL;
+    return guarded([&] {
+        SmFace* target = face_at(*brep_of(brep), face);
+        if (!target) return SM_SHIM_ERR_BAD_FACE;
+        write_label(*target, *label);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_set_edge_label(sm_brep* brep, size_t edge, const sm_label* label) {
+    if (!brep || !label) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (label->present && role_length(*label) == 0) return SM_SHIM_ERR_BAD_LABEL;
+    return guarded([&] {
+        SmTArray<SmEdge*> edges;
+        brep_of(brep)->GetEdges(edges);
+        if (edge >= edges.GetSize()) return SM_SHIM_ERR_BAD_EDGE;
+        write_label(*edges[static_cast<ULONG>(edge)], *label);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_place(sm_brep* brep, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y_axis) {
+    if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
+    const double dot = x_axis.x * y_axis.x + x_axis.y * y_axis.y + x_axis.z * y_axis.z;
+    if (!std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) || !unit_vector(x_axis) ||
+        !unit_vector(y_axis) || std::fabs(dot) > 1e-9) {
+        return SM_SHIM_ERR_BAD_FRAME;
+    }
+    return guarded([&] {
+        const SmAxis2Placement frame(SmPoint3d(origin.x, origin.y, origin.z), SmVector3d(x_axis.x, x_axis.y, x_axis.z),
+                                     SmVector3d(y_axis.x, y_axis.y, y_axis.z));
+        return static_cast<sm_status>(SmApiTransform(brep_of(brep), frame));
+    });
+}
+
+sm_status sm_brep_sweep_face(const sm_brep* brep, size_t face, double distance, sm_brep** out, sm_swept_face** faces,
+                             size_t* face_count) {
+    if (!brep || !out || !faces || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!std::isfinite(distance) || distance == 0.0) return SM_SHIM_ERR_BAD_SWEEP;
+    return guarded([&] {
+        const SmBrep& source = *brep_of(brep);
+        SmFace* target = face_at(source, face);
+        if (!target) return SM_SHIM_ERR_BAD_FACE;
+        SmBrep* prism = nullptr;
+        std::vector<sm_swept_face> roles;
+        const sm_status status = sweep_face(source, target, distance, prism, roles);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> owned(prism);
+        std::unique_ptr<sm_swept_face[]> array(new sm_swept_face[roles.size()]);
+        std::copy(roles.begin(), roles.end(), array.get());
+        *out = handle_of(owned.release());
+        *faces = array.release();
+        *face_count = roles.size();
+        return SM_SUCCESS;
+    });
+}
+
+void sm_swept_faces_free(sm_swept_face* faces) { delete[] faces; }
+
+sm_status sm_brep_merge_faces(sm_brep* brep) {
+    if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] { return static_cast<sm_status>(brep_of(brep)->RemoveTopologicalEdgesAndVertices()); });
 }
 
 sm_status sm_brep_tessellate(sm_brep* brep, const sm_tessellation_params* params, sm_mesh** out) {

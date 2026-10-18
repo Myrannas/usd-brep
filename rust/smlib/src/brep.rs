@@ -7,9 +7,15 @@ use smlib_sys as sys;
 
 use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
+use crate::faces::{FaceCentroid, FaceGeometry, Frame, Sweep, SweptFace};
 use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::kernel::Kernel;
+use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams};
+
+/// Relative accuracy of [`Brep::face_centroid`]: placing a feature at a
+/// centroid is then exact to a tenth of a micron on a metre-sized part.
+const CENTROID_ACCURACY: f64 = 1e-7;
 
 /// A B-rep solid owned by the kernel. It is freed on drop.
 ///
@@ -200,7 +206,182 @@ impl Brep {
         };
         Error::check(OP, status)?;
         raw.truncate(count);
-        Ok(raw.iter().map(EdgeGeometry::from_raw).collect())
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| EdgeGeometry::from_raw(index, raw))
+            .collect())
+    }
+
+    /// The geometry of every face, in the brep's face order: surface, label,
+    /// bounds, and the outward normal of planar faces.
+    pub fn faces(&self) -> Result<Vec<FaceGeometry>, Error> {
+        const OP: &str = "sm_brep_face_geometry";
+        let mut raw = vec![EMPTY_FACE; self.face_count()];
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; raw has room for
+        // raw.len() faces.
+        let status = unsafe {
+            sys::sm_brep_face_geometry(self.raw.as_ptr(), raw.as_mut_ptr(), raw.len(), &mut count)
+        };
+        Error::check(OP, status)?;
+        raw.truncate(count);
+        Ok(raw
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| FaceGeometry::from_raw(index, raw))
+            .collect())
+    }
+
+    /// The area and area centroid of the face at `face` in
+    /// [`faces`](Brep::faces), integrated to a relative accuracy of 1e-7.
+    /// This costs far more than [`faces`](Brep::faces): up to milliseconds
+    /// for a face trimmed by many curves.
+    pub fn face_centroid(&self, face: usize) -> Result<FaceCentroid, Error> {
+        let (mut area, mut centroid) = (0.0, [0.0; 3]);
+        // SAFETY: self is a live brep on the kernel thread; centroid holds
+        // three doubles.
+        let status = unsafe {
+            sys::sm_brep_face_centroid(
+                self.raw.as_ptr(),
+                face,
+                CENTROID_ACCURACY,
+                &mut area,
+                centroid.as_mut_ptr(),
+            )
+        };
+        Error::check("SmFace::ComputePreciseProperties", status)?;
+        Ok(FaceCentroid { area, centroid })
+    }
+
+    /// An axis-aligned box enclosing the brep, as its minimum and maximum
+    /// corners. It may be loose around curved faces.
+    pub fn bounding_box(&self) -> Result<[[f64; 3]; 2], Error> {
+        let (mut min, mut max) = ([0.0; 3], [0.0; 3]);
+        // SAFETY: self is a live brep on the kernel thread; min and max hold
+        // three doubles each.
+        let status = unsafe {
+            sys::sm_brep_bounding_box(self.raw.as_ptr(), min.as_mut_ptr(), max.as_mut_ptr())
+        };
+        Error::check("SmApiBrepBoundingBox", status)?;
+        Ok([min, max])
+    }
+
+    /// Labels the face at `face` in [`faces`](Brep::faces), replacing any
+    /// label it has. Labels don't change the brep's shape, so face and edge
+    /// indices stay valid.
+    pub fn set_face_label(&mut self, face: usize, label: &Label) -> Result<(), Error> {
+        const OP: &str = "sm_brep_set_face_label";
+        let raw = label.to_raw(OP)?;
+        // SAFETY: self is a live brep on the kernel thread; raw outlives the
+        // call.
+        let status = unsafe { sys::sm_brep_set_face_label(self.raw.as_ptr(), face, &raw) };
+        Error::check(OP, status)
+    }
+
+    /// Removes the label from the face at `face`, if it has one.
+    pub fn remove_face_label(&mut self, face: usize) -> Result<(), Error> {
+        // SAFETY: as in `set_face_label`.
+        let status = unsafe { sys::sm_brep_set_face_label(self.raw.as_ptr(), face, &NO_LABEL) };
+        Error::check("sm_brep_set_face_label", status)
+    }
+
+    /// Labels the edge at `edge` in [`edges`](Brep::edges), as
+    /// [`set_face_label`](Brep::set_face_label) does for faces.
+    pub fn set_edge_label(&mut self, edge: usize, label: &Label) -> Result<(), Error> {
+        const OP: &str = "sm_brep_set_edge_label";
+        let raw = label.to_raw(OP)?;
+        // SAFETY: as in `set_face_label`.
+        let status = unsafe { sys::sm_brep_set_edge_label(self.raw.as_ptr(), edge, &raw) };
+        Error::check(OP, status)
+    }
+
+    /// Removes the label from the edge at `edge`, if it has one.
+    pub fn remove_edge_label(&mut self, edge: usize) -> Result<(), Error> {
+        // SAFETY: as in `set_face_label`.
+        let status = unsafe { sys::sm_brep_set_edge_label(self.raw.as_ptr(), edge, &NO_LABEL) };
+        Error::check("sm_brep_set_edge_label", status)
+    }
+
+    /// Moves the brep rigidly into `frame` (`SmApiTransform`): the point
+    /// (x, y, z) goes to `frame.to_world([x, y, z])`. Build a solid at the
+    /// origin, then place it, to put it anywhere at any angle.
+    pub fn place(&mut self, frame: &Frame) -> Result<(), Error> {
+        // SAFETY: self is a live brep on the kernel thread.
+        let status = unsafe {
+            sys::sm_brep_place(
+                self.raw.as_ptr(),
+                vec3(frame.origin),
+                vec3(frame.x_axis),
+                vec3(frame.y_axis),
+            )
+        };
+        Error::check("SmApiTransform", status)
+    }
+
+    /// Sweeps the planar face at `face` in [`faces`](Brep::faces) along its
+    /// outward normal by `distance` into a closed prism
+    /// (`SmApiCreateCurveSweepFromFaces`). A negative distance sweeps into
+    /// the solid. The brep is unchanged; combine the prism with it by
+    /// [`union`](Brep::union) or [`difference`](Brep::difference).
+    ///
+    /// The prism's faces carry no labels. [`Sweep::faces`] says which is the
+    /// start, which the end, and which edge of `face` each side was swept
+    /// from, for labelling them.
+    pub fn sweep_face(&self, face: usize, distance: f64) -> Result<Sweep, Error> {
+        const OP: &str = "SmApiCreateCurveSweepFromFaces";
+        if !distance.is_finite() || distance == 0.0 {
+            return Err(Error::InvalidArgument {
+                operation: OP,
+                reason: "sweep distance must be finite and non-zero",
+            });
+        }
+        let mut out = ptr::null_mut();
+        let mut faces = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; the outputs are
+        // written only on success.
+        let status = unsafe {
+            sys::sm_brep_sweep_face(
+                self.raw.as_ptr(),
+                face,
+                distance,
+                &mut out,
+                &mut faces,
+                &mut count,
+            )
+        };
+        Error::check(OP, status)?;
+        // SAFETY: on success faces holds count entries, which we copy and then
+        // free once.
+        let roles = unsafe {
+            let roles = if faces.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(faces, count)
+                    .iter()
+                    .map(SweptFace::from_raw)
+                    .collect()
+            };
+            sys::sm_swept_faces_free(faces);
+            roles
+        };
+        Ok(Sweep {
+            prism: Brep::from_raw(OP, out)?,
+            faces: roles,
+        })
+    }
+
+    /// Merges faces that lie on one surface into one face, and edges that lie
+    /// on one curve into one edge (`SmBrep::RemoveTopologicalEdgesAndVertices`),
+    /// without changing the shape: after a union that leaves a wall in two
+    /// coplanar pieces, it's one face again. Merged faces keep the older label
+    /// (see [`Label`]). Booleans already do this along their intersection
+    /// curves.
+    pub fn merge_faces(&mut self) -> Result<(), Error> {
+        // SAFETY: self is a live brep on the kernel thread.
+        let status = unsafe { sys::sm_brep_merge_faces(self.raw.as_ptr()) };
+        Error::check("SmBrep::RemoveTopologicalEdgesAndVertices", status)
     }
 
     /// How many edges `query` picks.
@@ -392,6 +573,34 @@ const EMPTY_EDGE: sys::sm_edge_geometry = sys::sm_edge_geometry {
     use_count: 0,
     normal_a: [0.0; 3],
     normal_b: [0.0; 3],
+    label: NO_LABEL,
+    label_a: NO_LABEL,
+    label_b: NO_LABEL,
+};
+
+const EMPTY_FACE: sys::sm_face_geometry = sys::sm_face_geometry {
+    info: sys::sm_face_info {
+        kind: 0,
+        kernel_type: 0,
+        origin: [0.0; 3],
+        axis: [0.0; 3],
+        ref_dir: [0.0; 3],
+        radius: 0.0,
+        minor_radius: 0.0,
+        half_angle_rad: 0.0,
+        degree_u: 0,
+        degree_v: 0,
+        poles_u: 0,
+        poles_v: 0,
+        rational: 0,
+        uv_min: [0.0; 2],
+        uv_max: [0.0; 2],
+        label: NO_LABEL,
+    },
+    bounds_min: [0.0; 3],
+    bounds_max: [0.0; 3],
+    planar: 0,
+    normal: [0.0; 3],
 };
 
 fn check_query(operation: &'static str, query: &EdgeQuery) -> Result<(), Error> {

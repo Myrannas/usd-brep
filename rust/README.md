@@ -3,18 +3,21 @@
 - `smlib-sys`: builds SMLib (`source/SMLib`) and SM_API (`source/SM_API`) with
   the `cc` crate, plus a C shim (`smlib-sys/shim`), and exposes the shim through
   committed bindgen bindings.
-- `smlib`: the safe API. `Kernel`, `Brep` (primitives, booleans, fillets,
-  chamfers, volume, manifold check) and `Mesh`, a tessellation that keeps its
-  links to the B-rep: per-triangle face ids, per-vertex surface (u, v),
-  per-face surface parameters and per-edge polylines.
+- `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, booleans,
+  face sweeps, face merging, fillets, chamfers, volume, manifold check, face
+  and edge queries, labels) and `Mesh`, a tessellation that keeps its links to
+  the B-rep: per-triangle face ids, per-vertex surface (u, v), per-face
+  surface parameters, per-edge polylines, and every face's and edge's label.
 
 ## Fillets and chamfers
 
-Edges are picked by geometric query, never by index, since indices change
-with every operation. An `EdgeQuery` tests each edge's `EdgeGeometry`
-(sample points, length, and the adjacent faces' outward normals at its
-midpoint): `MidpointOnPlane`, `InPlane`, `OnCircle`, `BetweenFaces` (by
-normals), `Sharp` (by the angle between normals), and `And` / `Or` / `Not`.
+Edges are picked by query, since indices change with every operation. An
+`EdgeQuery` tests each edge's `EdgeGeometry` (sample points, length, the
+adjacent faces and their labels, and their outward normals at its midpoint):
+`MidpointOnPlane`, `InPlane`, `OnCircle`, `ParallelTo` (straight edges along a
+direction), `BetweenFaces` (by normals), `Between` (by the faces' labels),
+`Sharp` (by the angle between normals), `Indices` (positions a caller found in
+`Brep::edges`, valid until the brep changes), and `And` / `Or` / `Not`.
 
 - `Brep::fillet` wraps `SmApiFilletEdgesPerEdge`: each `EdgeBlend` gives its
   edges a radius and a circular, linear or blend cross-section;
@@ -35,6 +38,44 @@ normals), `Sharp` (by the angle between normals), and `And` / `Or` / `Not`.
 ```sh
 cargo test -p smlib
 ```
+
+## Placing solids on faces
+
+- `Brep::faces` gives every face's surface, label, bounds and, for planar
+  faces, outward normal. It's cheap; `Brep::face_centroid` integrates one
+  face's area and centroid to 1e-7, which can take milliseconds on a face
+  trimmed by many curves.
+- `Brep::place` moves a solid rigidly into a `Frame` (`SmApiTransform`):
+  build a primitive at the origin, then place it on a face's frame.
+- `Brep::sweep_face` sweeps a planar face along its outward normal into a
+  closed prism (`SmApiCreateCurveSweepFromFaces`), positive outward or
+  negative inward. `Sweep::faces` says which prism face is the start cap,
+  which the end cap, and which edge of the swept face each side came from.
+  Union or subtract the prism to extrude or offset the face.
+- `Brep::merge_faces` merges faces lying on one surface and edges lying on
+  one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
+  do this along their intersection curves, so an offset face's walls come
+  back as single faces either way.
+
+## Labels
+
+`Brep::set_face_label` and `Brep::set_edge_label` attach a `Label` (a feature
+id, a role string and an index) to a face or edge as an SMLib attribute
+(`SmAttribute.h`). The kernel carries it from there:
+
+- A face or edge an operation splits passes its label to both pieces;
+  copies keep every label.
+- When two labelled faces or edges merge, the result keeps the older label,
+  the lower feature id, whichever of the two the kernel keeps. The shim's
+  attribute class overrides `SmAttribute::Merge` for this; with SMLib's
+  default the result keeps the survivor's label, and which face survives
+  depends on the order of the boolean's operands.
+- Faces and edges an operation creates from nothing have no label: a
+  fillet's or chamfer's new faces and their rails, and edges a boolean cuts.
+
+`Brep::faces`, `Brep::edges` and `Mesh` report the labels. `tests/labels.rs`
+checks them through booleans that split faces, fillets, chamfers, sweeps and
+merges.
 
 ## Build cache
 

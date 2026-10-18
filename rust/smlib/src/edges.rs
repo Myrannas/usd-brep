@@ -8,12 +8,18 @@ use std::ops::Not;
 
 use smlib_sys as sys;
 
+use crate::label::{Label, LabelMatch};
+
 /// How many points [`EdgeGeometry::samples`] holds.
 pub const EDGE_SAMPLES: usize = sys::SM_EDGE_SAMPLES as usize;
 
 /// Where a B-rep edge is: what an [`EdgeQuery`] tests.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgeGeometry {
+    /// The edge's position in the brep's edge list, which is also its index
+    /// in [`Mesh::edges`](crate::Mesh::edges). It holds until the brep next
+    /// changes shape.
+    pub index: usize,
     /// Points on the edge, evenly spaced in its curve parameter from one end
     /// to the other.
     pub samples: [[f64; 3]; EDGE_SAMPLES],
@@ -26,13 +32,24 @@ pub struct EdgeGeometry {
     pub normals: [Option<[f64; 3]>; 2],
     /// How many faces use the edge: 2 on a manifold solid.
     pub use_count: u32,
+    /// The two faces the edge joins, as indices into
+    /// [`Brep::faces`](crate::Brep::faces). A seam joins a face to itself.
+    pub faces: [Option<u32>; 2],
+    /// The edge's own label.
+    pub label: Option<Label>,
+    /// The labels of the two faces, in the order of `faces`.
+    pub face_labels: [Option<Label>; 2],
 }
 
 impl EdgeGeometry {
-    pub(crate) fn from_raw(raw: &sys::sm_edge_geometry) -> EdgeGeometry {
+    pub(crate) fn from_raw(index: usize, raw: &sys::sm_edge_geometry) -> EdgeGeometry {
         let normal = |n: [f64; 3]| (dot(n, n) > 0.5).then_some(n);
         let has = |face: i32| face >= 0;
         EdgeGeometry {
+            index,
+            faces: [raw.face_a, raw.face_b].map(|face| u32::try_from(face).ok()),
+            label: Label::from_raw(&raw.label),
+            face_labels: [Label::from_raw(&raw.label_a), Label::from_raw(&raw.label_b)],
             samples: raw.points,
             length: raw.length,
             normals: [
@@ -155,6 +172,23 @@ pub enum EdgeQuery {
         /// The smallest angle between the normals, in degrees.
         min_angle_deg: f64,
     },
+    /// Straight edges running along `direction`, either way.
+    ParallelTo {
+        /// The direction.
+        direction: [f64; 3],
+    },
+    /// Edges between a face whose [`Label`] passes `a` and one whose label
+    /// passes `b`, either way round.
+    Between {
+        /// One face's label.
+        a: LabelMatch,
+        /// The other's.
+        b: LabelMatch,
+    },
+    /// The edges at these positions in [`Brep::edges`](crate::Brep::edges),
+    /// for edges a caller has already found there. Positions hold only until
+    /// the brep next changes shape.
+    Indices(Vec<usize>),
     /// Edges every query picks.
     And(Vec<EdgeQuery>),
     /// Edges any query picks.
@@ -218,6 +252,26 @@ impl EdgeQuery {
             EdgeQuery::Sharp { min_angle_deg } => {
                 edge.bend_deg().is_some_and(|bend| bend >= *min_angle_deg)
             }
+            EdgeQuery::ParallelTo { direction } => {
+                let chord = sub(edge.end(), edge.start());
+                let length = dot(chord, chord).sqrt();
+                let straight = edge.samples.iter().all(|&p| {
+                    let offset = sub(p, edge.start());
+                    let along = dot(offset, chord) / length;
+                    near((dot(offset, offset) - along * along).max(0.0).sqrt())
+                });
+                length > tolerance.length
+                    && straight
+                    && angle_deg(chord, *direction).min(180.0 - angle_deg(chord, *direction))
+                        <= tolerance.angle_deg
+            }
+            EdgeQuery::Between { a, b } => match &edge.face_labels {
+                [Some(m), Some(n)] => {
+                    (a.matches(m) && b.matches(n)) || (a.matches(n) && b.matches(m))
+                }
+                _ => false,
+            },
+            EdgeQuery::Indices(indices) => indices.contains(&edge.index),
             EdgeQuery::And(all) => all.iter().all(|q| q.matches(edge, tolerance)),
             EdgeQuery::Or(any) => any.iter().any(|q| q.matches(edge, tolerance)),
             EdgeQuery::Not(query) => !query.matches(edge, tolerance),
@@ -245,6 +299,10 @@ impl EdgeQuery {
             EdgeQuery::Sharp { min_angle_deg } => {
                 (!min_angle_deg.is_finite()).then_some("sharp-edge angle must be finite")
             }
+            EdgeQuery::ParallelTo { direction: along } => {
+                (!direction(*along)).then_some("direction must be finite and non-zero")
+            }
+            EdgeQuery::Between { .. } | EdgeQuery::Indices(_) => None,
             EdgeQuery::And(queries) | EdgeQuery::Or(queries) => {
                 queries.iter().find_map(EdgeQuery::problem)
             }

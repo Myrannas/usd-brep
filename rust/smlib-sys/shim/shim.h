@@ -34,6 +34,11 @@ static const sm_status SM_SHIM_ERR_UNSUPPORTED_POLYGON = 2005; /* a polygon has 
 static const sm_status SM_SHIM_ERR_BAD_EDGE = 2006;            /* an edge index is out of range or repeated */
 static const sm_status SM_SHIM_ERR_BAD_FILLET = 2007;          /* a radius, section or continuity is invalid */
 static const sm_status SM_SHIM_ERR_BROKE_SOLID = 2008;         /* the kernel reported success but left a manifold solid non-manifold */
+static const sm_status SM_SHIM_ERR_BAD_FACE = 2020;            /* a face index is out of range */
+static const sm_status SM_SHIM_ERR_BAD_LABEL = 2021;           /* a label's role is empty or not NUL-terminated */
+static const sm_status SM_SHIM_ERR_NOT_PLANAR = 2022;          /* the operation needs a planar face */
+static const sm_status SM_SHIM_ERR_BAD_FRAME = 2023;           /* placement axes aren't unit and perpendicular */
+static const sm_status SM_SHIM_ERR_BAD_SWEEP = 2024;           /* a zero sweep distance, or a sweep that isn't a solid */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -70,6 +75,26 @@ enum sm_surface_kind {
     SM_SURFACE_OTHER = 6
 };
 
+/* Room for a label's role, including its terminating NUL. */
+#define SM_LABEL_ROLE_CAPACITY 64
+
+/* A caller's label on a face or edge: the feature that made it, the role it
+ * plays in that feature, and an index telling apart entities one feature
+ * makes with the same role. The kernel carries labels as attributes
+ * (SmAttribute.h): a face or edge that splits passes its label to both
+ * pieces, a copy of the brep copies them, and when two labelled faces or
+ * edges merge into one, the result keeps the label with the lower feature id
+ * (the older one). Entities a fillet or chamfer creates have none.
+ *
+ * present is 0 for no label; the other fields are then zero. role is UTF-8,
+ * NUL-terminated, and not empty. */
+typedef struct sm_label {
+    int32_t present;
+    uint32_t feature;
+    uint32_t index;
+    char role[SM_LABEL_ROLE_CAPACITY];
+} sm_label;
+
 /* One B-rep face, in the order of the brep's own face list. Which fields
  * apply depends on kind; unused fields are zero.
  *
@@ -85,7 +110,8 @@ enum sm_surface_kind {
  *   whether it has weights. Planes are NURBS-backed in SMLib but report
  *   SM_SURFACE_PLANE.
  * - uv_min, uv_max: the face's domain in its surface's (u, v).
- * - kernel_type: SMLib's surface type id (SmSurfTypes.h), for diagnostics. */
+ * - kernel_type: SMLib's surface type id (SmSurfTypes.h), for diagnostics.
+ * - label: the face's label, if any. */
 typedef struct sm_face_info {
     int32_t kind;
     int32_t kernel_type;
@@ -102,18 +128,41 @@ typedef struct sm_face_info {
     int32_t rational;
     double uv_min[2];
     double uv_max[2];
+    sm_label label;
 } sm_face_info;
+
+/* One B-rep face's geometry, in the order of the brep's own face list, for
+ * finding and placing features on faces. Cheap to compute; for a face's area
+ * and centroid, see sm_brep_face_centroid.
+ *
+ * - info: as sm_brep_tessellate reports it, with the label.
+ * - bounds_min, bounds_max: an axis-aligned box around the trimmed face. It
+ *   follows the face's boundary, so the pieces of a split face have their own
+ *   boxes, but may be loose around curves.
+ * - planar: nonzero when the face lies on a plane, whatever its surface
+ *   class (a planar NURBS surface counts).
+ * - normal: for planar faces, the unit normal pointing out of the solid;
+ *   zero otherwise. */
+typedef struct sm_face_geometry {
+    sm_face_info info;
+    double bounds_min[3];
+    double bounds_max[3];
+    int32_t planar;
+    double normal[3];
+} sm_face_geometry;
 
 /* One B-rep edge, in the order of the brep's own edge list. Its polyline is
  * edge_points[first_point .. first_point + point_count]. face_a and face_b
  * index the face list (a seam joins a face to itself); -1 when the edge has
- * fewer uses. use_count is how many faces use it (2 for a manifold solid). */
+ * fewer uses. use_count is how many faces use it (2 for a manifold solid).
+ * label is the edge's own label, if any. */
 typedef struct sm_edge_info {
     uint32_t first_point;
     uint32_t point_count;
     int32_t face_a;
     int32_t face_b;
     uint32_t use_count;
+    sm_label label;
 } sm_edge_info;
 
 /* How many points sm_edge_geometry samples along each edge. */
@@ -125,10 +174,12 @@ typedef struct sm_edge_info {
  * - points: SM_EDGE_SAMPLES points on the edge, evenly spaced in its curve
  *   parameter from one end to the other. points[SM_EDGE_SAMPLES / 2] is the
  *   parametric midpoint.
- * - length: the edge's arc length.
+ * - length: the edge's arc length, to a relative accuracy of 1e-7.
  * - face_a, face_b, use_count: as in sm_edge_info.
  * - normal_a, normal_b: the outward unit normals of face_a and face_b at the
- *   midpoint; zero when the face is absent or the normal can't be found. */
+ *   midpoint; zero when the face is absent or the normal can't be found.
+ * - label: the edge's own label; label_a, label_b: those of face_a and
+ *   face_b. */
 typedef struct sm_edge_geometry {
     double points[SM_EDGE_SAMPLES][3];
     double length;
@@ -137,7 +188,28 @@ typedef struct sm_edge_geometry {
     uint32_t use_count;
     double normal_a[3];
     double normal_b[3];
+    sm_label label;
+    sm_label label_a;
+    sm_label label_b;
 } sm_edge_geometry;
+
+/* What each face of a swept prism came from (sm_brep_sweep_face). */
+enum sm_swept_role {
+    /* The copy of the swept face where the sweep starts. */
+    SM_SWEPT_START = 0,
+    /* The copy where it ends, the swept distance away. */
+    SM_SWEPT_END = 1,
+    /* A face swept from one edge of the swept face. */
+    SM_SWEPT_SIDE = 2
+};
+
+/* One face of a swept prism, in the order of the prism's face list. For
+ * sides, source_edge is the edge of the swept face it was swept from, as an
+ * index into the source brep's edge list, or -1 when the shim couldn't tell. */
+typedef struct sm_swept_face {
+    int32_t role;
+    int32_t source_edge;
+} sm_swept_face;
 
 /* Fillet cross-sections (SmFilletSurfaceGeneratorType). */
 enum sm_fillet_section {
@@ -238,6 +310,51 @@ sm_status sm_brep_fillet_edges(sm_brep *brep, const uint32_t *edges, const doubl
  * executive's global merge off, which breaks chamfers on circular edges.
  * Failures are as for sm_brep_fillet_edges. */
 sm_status sm_brep_chamfer_edges(sm_brep *brep, const uint32_t *edges, size_t count, double width);
+
+/* Writes the geometry of the brep's first `capacity` faces to out, and the
+ * brep's face count to *count, as sm_brep_edge_geometry does for edges. Face
+ * indices hold until the brep is next changed. */
+sm_status sm_brep_face_geometry(const sm_brep *brep, sm_face_geometry *out, size_t capacity, size_t *count);
+
+/* The area and area centroid of the trimmed face at an index of the brep's
+ * face list, integrated to relative_accuracy (clamped to [1e-10, 1e-1];
+ * SmApiFaceComputeCentroid stops at 1e-4). On a planar face the centroid lies
+ * in the face's plane, though not necessarily inside the face. */
+sm_status sm_brep_face_centroid(const sm_brep *brep, size_t face, double relative_accuracy, double *area,
+                                double centroid[3]);
+
+/* Writes the brep's axis-aligned bounding box. It encloses the brep but may
+ * be loose around curved faces. */
+sm_status sm_brep_bounding_box(const sm_brep *brep, double min[3], double max[3]);
+
+/* Labels the face or edge at an index of the brep's list, replacing any label
+ * it has; a label with present = 0 removes it. Labels don't change the brep's
+ * shape or lists, so indices stay valid. */
+sm_status sm_brep_set_face_label(sm_brep *brep, size_t face, const sm_label *label);
+sm_status sm_brep_set_edge_label(sm_brep *brep, size_t edge, const sm_label *label);
+
+/* Moves the brep rigidly into a frame (SmApiTransform): the point (x, y, z)
+ * goes to origin + x * x_axis + y * y_axis + z * (x_axis × y_axis). The axes
+ * must be unit length and perpendicular to within 1e-9. */
+sm_status sm_brep_place(sm_brep *brep, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y_axis);
+
+/* Sweeps the planar face at an index of the brep's face list along its
+ * outward normal by distance (negative sweeps into the solid), making a new
+ * closed prism (SmApiCreateCurveSweepFromFaces, translational, capped). The
+ * brep is unchanged. On success *out is the prism and *faces an array of
+ * *face_count entries, one per prism face in the prism's face order, which the
+ * caller frees with sm_swept_faces_free. */
+sm_status sm_brep_sweep_face(const sm_brep *brep, size_t face, double distance, sm_brep **out,
+                             sm_swept_face **faces, size_t *face_count);
+
+/* Frees the array sm_brep_sweep_face returns. NULL is ignored. */
+void sm_swept_faces_free(sm_swept_face *faces);
+
+/* Merges faces that lie on one surface into one face, removing the edges
+ * between them, and edges that lie on one curve into one edge
+ * (SmBrep::RemoveTopologicalEdgesAndVertices). The shape is unchanged. Labels
+ * follow sm_label's merge rule. */
+sm_status sm_brep_merge_faces(sm_brep *brep);
 
 /* SmApiTessellate plus SmApiTessellateBoundaries, copied into an sm_mesh
  * with every triangle and vertex linked back to its B-rep face. */

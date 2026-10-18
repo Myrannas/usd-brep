@@ -7,7 +7,10 @@
 //! leave that thread. Tessellation output ([`Mesh`]) is plain data and can.
 //!
 //! Fillets and chamfers ([`Brep::fillet`], [`Brep::chamfer`]) pick their
-//! edges with an [`EdgeQuery`], a geometric test, never by index.
+//! edges with an [`EdgeQuery`]. Solids built at the origin can be placed on a
+//! face's [`Frame`] ([`Brep::place`]), and planar faces swept into prisms
+//! ([`Brep::sweep_face`]). Faces and edges can carry a [`Label`] that the
+//! kernel keeps through every later operation.
 //!
 //! The kernel is unit-agnostic; lengths are in whatever unit the model uses.
 //! The [`TessellationParams`] defaults assume millimetres.
@@ -34,13 +37,17 @@
 mod brep;
 mod edges;
 mod error;
+mod faces;
 mod fillet;
 mod kernel;
+mod label;
 mod mesh;
 
 pub use brep::Brep;
 pub use edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 pub use error::{Error, Status};
+pub use faces::{FaceCentroid, FaceGeometry, Frame, Sweep, SweptFace};
 pub use fillet::{Continuity, CrossSection, EdgeBlend, FilletOptions};
 pub use kernel::Kernel;
+pub use label::{Label, LabelMatch, MAX_ROLE_LEN};
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};

@@ -1,6 +1,7 @@
 use smlib_sys as sys;
 
 use crate::error::Error;
+use crate::label::Label;
 
 /// Tessellation quality controls (`SmTessellationParams`). Each is disabled
 /// by 0.
@@ -156,10 +157,12 @@ pub struct Face {
     pub uv_min: [f64; 2],
     /// The face's domain in its surface's (u, v): maximum corner.
     pub uv_max: [f64; 2],
+    /// The face's [`Label`], if it has one.
+    pub label: Option<Label>,
 }
 
 impl Face {
-    fn from_raw(raw: &sys::sm_face_info) -> Face {
+    pub(crate) fn from_raw(raw: &sys::sm_face_info) -> Face {
         let (origin, axis, ref_dir, radius) = (raw.origin, raw.axis, raw.ref_dir, raw.radius);
         let surface = match raw.kind as sys::sm_surface_kind {
             sys::SM_SURFACE_PLANE => Surface::Plane {
@@ -206,6 +209,7 @@ impl Face {
             surface,
             uv_min: raw.uv_min,
             uv_max: raw.uv_max,
+            label: Label::from_raw(&raw.label),
         }
     }
 }
@@ -302,6 +306,8 @@ pub struct Edge {
     /// How many faces use the edge: 2 on a manifold solid, more when
     /// non-manifold (only the first two are in `faces`).
     pub use_count: u32,
+    /// The edge's own [`Label`], if it has one.
+    pub label: Option<Label>,
 }
 
 impl Edge {
@@ -318,6 +324,7 @@ impl Edge {
                 .to_vec(),
             faces: [face(raw.face_a), face(raw.face_b)],
             use_count: raw.use_count,
+            label: Label::from_raw(&raw.label),
         }
     }
 }

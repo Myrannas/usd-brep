@@ -61,3 +61,31 @@ around:
   tolerance instead of the single-type branch's `dXSectTol`. Neither showed
   up in the results: box fillets come out as exact cylinders and sphere
   corners, with volumes within 1e-7 of analytic.
+
+## Notes from the labels work (no patch needed)
+
+Labels on faces and edges ride on SMLib's attribute system, and it delivered
+every notification the tests look for: attributes survive booleans (including
+faces split into pieces and faces brought over from the second operand),
+fillets, chamfers, brep copies, and the face merges after a union. No kernel
+change was needed.
+
+- SMLib's default merge rule keeps the surviving face's attribute, and which
+  face survives depends on operand order: `a ∪ b` and `b ∪ a` of two flush
+  boxes keep different labels on the merged side faces. The shim's
+  `LabelAttribute` overrides `SmAttribute::Merge` so the older label (the
+  lower feature id) wins either way.
+- Faces a fillet or chamfer creates, and edges a boolean or fillet creates,
+  arrive with no attribute. That's by design, not a missing notification:
+  they come from nothing. Callers label them after the operation.
+- `SmPrimitiveCreation::CreateCurveSweepFromFaces` sweeps copies of the
+  face's edge curves, so its side faces have no link back to the edges they
+  came from. The shim's `sm_brep_sweep_face` finds each side's source edge by
+  where its start edge lies.
+- `SmApiFaceComputeCentroid` clamps its relative accuracy to 1e-4, which puts
+  a hole placed at a face's centroid up to a few hundredths of a millimetre
+  off on a 500 mm face. The shim calls `SmFace::ComputePreciseProperties`
+  directly at 1e-7.
+- `SmSurface::IsPlanar`'s normal comes from a bounding pseudo-box and can face
+  either way, so the shim evaluates a planar face's normal from its surface
+  and orients it out of the solid by region, as `outward_normal` does.

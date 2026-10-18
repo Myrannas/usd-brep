@@ -56,6 +56,11 @@ impl Status {
             2006 => "SHIM_ERR_BAD_EDGE",
             2007 => "SHIM_ERR_BAD_FILLET",
             2008 => "SHIM_ERR_BROKE_SOLID",
+            2020 => "SHIM_ERR_BAD_FACE",
+            2021 => "SHIM_ERR_BAD_LABEL",
+            2022 => "SHIM_ERR_NOT_PLANAR",
+            2023 => "SHIM_ERR_BAD_FRAME",
+            2024 => "SHIM_ERR_BAD_SWEEP",
             _ => return None,
         })
     }
