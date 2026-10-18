@@ -54,6 +54,12 @@ cargo test -p smlib
   negative inward. `Sweep::faces` says which prism face is the start cap,
   which the end cap, and which edge of the swept face each side came from.
   Union or subtract the prism to extrude or offset the face.
+- `Brep::planar_faces` builds a sheet of planar faces from closed loops of
+  lines, arcs and circles (`PlaneCurve`) in a `Frame`'s xy plane
+  (`SmApiCreatePlanarFaces`): outer loops bound faces, loops inside them
+  holes. Every face faces the frame's z, and each curve's edge carries the
+  `BoundaryCurve`'s label, so the sides of a prism swept from a face trace
+  back to their curves through `Sweep::faces`. This is a sketch's extrude.
 - `Brep::merge_faces` merges faces lying on one surface and edges lying on
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come

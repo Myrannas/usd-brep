@@ -23,6 +23,7 @@
 #include <SmApiPrimitives.h>
 #include <SmApiQueries.h>
 #include <SmApiSurfaces.h>
+#include <SmApiTrimmedSurfaces.h>
 
 #include <SmAttribute.h>
 #include <SmAxis2Placement.h>
@@ -691,6 +692,116 @@ sm_status sweep_face(const SmBrep& brep, SmFace* face, double distance, SmBrep*&
         }
     }
     prism = result.release();
+    return SM_SUCCESS;
+}
+
+// A curve of sm_brep_create_planar_faces, made in the plane z = 0, where
+// SM_API makes its lines, arcs and circles.
+sm_status plane_curve(const sm_plane_curve& curve, SmCurve*& out) {
+    out = nullptr;
+    const SmPoint3d a(curve.a[0], curve.a[1], 0.0);
+    if (!std::isfinite(a.x) || !std::isfinite(a.y)) return SM_ERR_INVALID_INPUT;
+    const bool round = curve.kind == SM_PLANE_ARC || curve.kind == SM_PLANE_CIRCLE;
+    if (round && !(std::isfinite(curve.radius) && curve.radius > 0.0)) return SM_ERR_INVALID_INPUT;
+    SmApiStatus status = SM_ERR_INVALID_INPUT;
+    if (curve.kind == SM_PLANE_LINE) {
+        const SmPoint3d b(curve.b[0], curve.b[1], 0.0);
+        if (!std::isfinite(b.x) || !std::isfinite(b.y)) return SM_ERR_INVALID_INPUT;
+        SmLine* line = nullptr;
+        status = SmApiCreateLineSegment(a, b, line);
+        out = line;
+    } else if (curve.kind == SM_PLANE_ARC) {
+        const double sweep = std::fabs(curve.sweep_deg);
+        if (!std::isfinite(curve.start_deg) || !(sweep > 0.0 && sweep <= 360.0)) return SM_ERR_INVALID_INPUT;
+        // SmApiCreateArc runs counter-clockwise between angles in [-360, 360];
+        // the faces don't mind which way each curve runs.
+        double from = std::fmod(std::min(curve.start_deg, curve.start_deg + curve.sweep_deg), 360.0);
+        if (from < 0.0) from += 360.0;
+        if (from + sweep > 360.0) from -= 360.0;
+        SmBSplineCurve* arc = nullptr;
+        status = SmApiCreateArc(a, curve.radius, from, from + sweep, arc);
+        out = arc;
+    } else if (curve.kind == SM_PLANE_CIRCLE) {
+        SmBSplineCurve* circle = nullptr;
+        status = SmApiCreateCircle(a, curve.radius, circle);
+        out = circle;
+    }
+    if (status != SM_SUCCESS) {
+        delete out;
+        out = nullptr;
+        return static_cast<sm_status>(status);
+    }
+    return out ? SM_SUCCESS : SM_ERR;
+}
+
+// The input curve an edge of a new planar face lies on: the one it holds, or
+// failing that the one nearest its midpoint.
+long curve_of(const SmEdge* edge, const SmTArray<SmCurve*>& curves) {
+    for (ULONG i = 0; i < curves.GetSize(); ++i) {
+        if (edge->GetCurve() == curves[i]) return static_cast<long>(i);
+    }
+    const SmPoint3d mid = midpoint_of(edge);
+    long best = -1;
+    double best_distance = SM_BIG_DOUBLE;
+    for (ULONG i = 0; i < curves.GetSize(); ++i) {
+        SmPoint3d closest;
+        double parameter = 0.0;
+        double distance = SM_BIG_DOUBLE;
+        if (SmApiCurveClosestPoint(curves[i], mid, closest, parameter, distance) == SM_SUCCESS &&
+            distance < best_distance) {
+            best_distance = distance;
+            best = static_cast<long>(i);
+        }
+    }
+    return best_distance <= 1e3 * SM_ZONE_TOL_3D ? best : -1;
+}
+
+// Planar faces from curves in the plane z = 0, each facing +z, with each
+// curve's edge labelled.
+sm_status planar_faces(const sm_plane_curve* input, size_t count, SmBrep*& out) {
+    SmTArray<SmCurve*> curves;
+    // The curves are the caller's to free until the faces take them.
+    struct Free {
+        SmTArray<SmCurve*>& curves;
+        bool owned = true;
+        ~Free() {
+            for (ULONG i = 0; owned && i < curves.GetSize(); ++i) delete curves[i];
+        }
+    } free_curves{curves};
+    for (size_t i = 0; i < count; ++i) {
+        if (input[i].label.present && role_length(input[i].label) == 0) return SM_SHIM_ERR_BAD_LABEL;
+        SmCurve* curve = nullptr;
+        const sm_status status = plane_curve(input[i], curve);
+        if (status != SM_SUCCESS) return status;
+        curves.Add(curve);
+    }
+    SmBrep* raw = nullptr;
+    const SmApiStatus status = SmApiCreatePlanarFaces(curves, raw);
+    if (status != SM_SUCCESS || !raw) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    free_curves.owned = false;
+    std::unique_ptr<SmBrep> brep(raw);
+
+    SmTArray<SmEdge*> edges;
+    brep->GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        const long curve = curve_of(edges[i], curves);
+        if (curve < 0) return SM_ERR;
+        write_label(*edges[i], input[curve].label);
+    }
+    // The kernel picks each face's side from the curves; turn those facing
+    // -z over. SwapUV mirrors the surface's parameters and so its normal.
+    SmTArray<SmFace*> faces;
+    brep->GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        double normal[3];
+        if (!outward_plane(faces[i], normal)) return SM_SHIM_ERR_NOT_PLANAR;
+        if (normal[2] < 0.0) {
+            const SmStatus swapped = faces[i]->SwapUV();
+            if (swapped != SM_SUCCESS) return static_cast<sm_status>(swapped);
+            if (!outward_plane(faces[i], normal) || normal[2] < 0.0) return SM_ERR;
+        }
+    }
+    out = brep.release();
     return SM_SUCCESS;
 }
 
@@ -2240,6 +2351,29 @@ sm_status sm_brep_create_tapered_prism(const sm_vec3* points, size_t count, doub
         const SmApiStatus status = SmApiCreateTaperExtrude(sides, height, draft_deg, 3, FALSE, brep);
         if (status != SM_SUCCESS) return status;
         *out = handle_of(brep);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_create_planar_faces(const sm_plane_curve* curves, size_t count, sm_vec3 origin, sm_vec3 x_axis,
+                                      sm_vec3 y_axis, sm_brep** out) {
+    if (!curves || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    const double dot = x_axis.x * y_axis.x + x_axis.y * y_axis.y + x_axis.z * y_axis.z;
+    if (!std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) || !unit_vector(x_axis) ||
+        !unit_vector(y_axis) || std::fabs(dot) > 1e-9) {
+        return SM_SHIM_ERR_BAD_FRAME;
+    }
+    if (count == 0) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return guarded([&] {
+        SmBrep* raw = nullptr;
+        const sm_status status = planar_faces(curves, count, raw);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> brep(raw);
+        const SmAxis2Placement frame(SmPoint3d(origin.x, origin.y, origin.z), SmVector3d(x_axis.x, x_axis.y, x_axis.z),
+                                     SmVector3d(y_axis.x, y_axis.y, y_axis.z));
+        const SmApiStatus placed = SmApiTransform(brep.get(), frame);
+        if (placed != SM_SUCCESS) return static_cast<sm_status>(placed);
+        *out = handle_of(brep.release());
         return SM_SUCCESS;
     });
 }

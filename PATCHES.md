@@ -211,3 +211,31 @@ that already varied from run to run.
 - `Brep::edges` no longer integrates each edge's exact length
   (`SmApiEdgeComputeLength`, an ODE per edge), which nothing read and which
   was 9% of the rebuild. `Brep::edge_length` integrates one edge's on demand.
+
+## Notes from the sketches work (no patch needed)
+
+`Brep::planar_faces` builds faces from lines, arcs and circles in a plane, for
+a sketch's extrude to sweep with `Brep::sweep_face`. The shim's
+`sm_brep_create_planar_faces` makes the curves in the plane z = 0 with
+`SmApiCreateLineSegment`, `SmApiCreateArc` and `SmApiCreateCircle` (SM_API
+makes its arcs and circles there), the faces with `SmApiCreatePlanarFaces`,
+and then moves the sheet into the caller's frame with `SmApiTransform`.
+
+- Each new edge holds the input curve it was made from, so the shim labels
+  edges by curve pointer, with the nearest curve as a fallback.
+  `sweep_face`'s sides find their source edges by where their start edges
+  lie, so a prism's side traces back to its curve through the edge's label.
+- `SmSurface::CreatePlaneWith3DCurves` picks each face's normal from the
+  curves, not from the loops' direction: in the tests, both of two nested
+  faces came out facing -z. The shim turns such faces over with
+  `SmFace::SwapUV` (which `SmPlane` follows by its swap-UV bit), so every
+  face faces the frame's z and a positive sweep runs along it.
+- `SmApiCreateArc` runs counter-clockwise between angles in [-360, 360]; the
+  shim normalises clockwise arcs, since the faces don't mind which way a
+  curve runs.
+- `SmApiCreatePlanarFaces` doesn't refuse every bad arrangement: two
+  crossing squares, or two touching at a corner, still make faces. Callers
+  hand over loops that neither cross nor touch.
+- `CreateCurveSweepFromFaces` sweeps each loop's curves as NURBS, so every
+  side of a swept prism is a NURBS surface, planar for lines (as for
+  `sweep_face` on a solid's face).

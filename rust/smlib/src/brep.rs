@@ -7,7 +7,9 @@ use smlib_sys as sys;
 
 use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
-use crate::faces::{FaceCentroid, FaceGeometry, FaceQuery, Frame, Sweep, SweptFace};
+use crate::faces::{
+    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Sweep, SweptFace,
+};
 use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
@@ -20,6 +22,10 @@ const CENTROID_ACCURACY: f64 = 1e-7;
 
 /// Relative accuracy of [`Brep::edge_length`].
 const EDGE_LENGTH_ACCURACY: f64 = 1e-7;
+
+/// How far apart, in model units, one curve's end and the next one's start
+/// may be in a loop for [`Brep::planar_faces`].
+const LOOP_GAP: f64 = 1e-6;
 
 /// A B-rep solid owned by the kernel. It is freed on drop.
 ///
@@ -487,6 +493,81 @@ impl Brep {
         })
     }
 
+    /// Planar faces bounded by closed loops of lines, arcs and circles in
+    /// `frame`'s xy plane (`SmApiCreatePlanarFaces`), for sweeping into
+    /// prisms with [`sweep_face`](Brep::sweep_face).
+    ///
+    /// Each loop's curves run head to tail, the last back to the first; a
+    /// circle is a loop on its own. Loops mustn't cross or touch each other.
+    /// An outer loop bounds a face, a loop inside it a hole, and a loop inside
+    /// a hole another face, however deep they nest. The result is a sheet, not
+    /// a solid: one face per outer loop, with its
+    /// [`normal`](FaceGeometry::normal) along the frame's z axis whichever way
+    /// its loops run, so a positive sweep runs along z. Each curve's edge
+    /// carries the curve's label, so each side of a prism swept from a face
+    /// can be traced back to the curve it came from: through
+    /// [`SweptFace::Side`]'s `source_edge` to the edge in this sheet's
+    /// [`edges`](Brep::edges).
+    ///
+    /// The kernel's own error when the loops don't bound faces. It doesn't
+    /// catch every bad arrangement: two squares that cross still make a face,
+    /// so callers must hand over loops that don't.
+    pub fn planar_faces(
+        _kernel: &Kernel,
+        frame: &Frame,
+        loops: &[Vec<BoundaryCurve>],
+    ) -> Result<Brep, Error> {
+        const OP: &str = "SmApiCreatePlanarFaces";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
+        };
+        if loops.is_empty() || loops.iter().any(Vec::is_empty) {
+            return invalid("every loop needs at least one curve");
+        }
+        let mut raw = Vec::new();
+        for curves in loops {
+            if let Some(reason) = curves.iter().find_map(|c| c.curve.problem()) {
+                return invalid(reason);
+            }
+            let circle = |c: &BoundaryCurve| matches!(c.curve, PlaneCurve::Circle { .. });
+            if curves.len() > 1 && curves.iter().any(circle) {
+                return invalid("a circle is a loop on its own");
+            }
+            let ends: Vec<([f64; 2], [f64; 2])> = curves
+                .iter()
+                .map(|c| (c.curve.start(), c.curve.end()))
+                .collect();
+            let next = ends.iter().cycle().skip(1);
+            if ends
+                .iter()
+                .zip(next)
+                .any(|((_, end), (start, _))| gap(*end, *start) > LOOP_GAP)
+            {
+                return invalid("each loop's curves must run head to tail and close");
+            }
+            for curve in curves {
+                raw.push(curve.curve.to_raw(&curve.label, OP)?);
+            }
+        }
+        let mut out = ptr::null_mut();
+        // SAFETY: raw holds raw.len() curves; a fresh brep comes out.
+        let status = unsafe {
+            sys::sm_brep_create_planar_faces(
+                raw.as_ptr(),
+                raw.len(),
+                vec3(frame.origin),
+                vec3(frame.x_axis),
+                vec3(frame.y_axis),
+                &mut out,
+            )
+        };
+        Error::check(OP, status)?;
+        Brep::from_raw(OP, out)
+    }
+
     /// Merges faces that lie on one surface into one face, and edges that lie
     /// on one curve into one edge (`SmBrep::RemoveTopologicalEdgesAndVertices`),
     /// without changing the shape: after a union that leaves a wall in two
@@ -787,6 +868,10 @@ impl fmt::Debug for Brep {
             .field("edges", &self.edge_count())
             .finish()
     }
+}
+
+fn gap(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
 fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
