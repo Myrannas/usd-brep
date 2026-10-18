@@ -133,7 +133,10 @@ but not much else. What goes wrong, and what the shim
   a vertical fillet under a raised top) is put in the same way, as the line
   between its ends' predicted places: mated, it came from one face's lifted
   trim curve, which is off in the last digits, and which face followed the
-  mating order.
+  mating order. So is a seam (a hole's, under a pocket floor that moves): its
+  two copies are both uses of one edge of the copied face, and a curve on a
+  closed surface's seam drops onto it as a pair of UV curves, one on each
+  side, so each copy takes the one on its own original's side.
 - The executive picks each extended edge's end among candidate points by
   nearness to the original vertex, which after a long move can be the wrong
   candidate, and through an unmated tangent neighbour's old UV curve, which can
@@ -165,16 +168,17 @@ its new size and, where known, its analytic volume, within 1e-6): plain,
 chamfered, filleted and drafted tops; several faces of plain, chamfered and
 filleted boxes, including every face at once; a wall pushed under fillets,
 alone and with the top, and offsets one after another (a wall, then the top,
-then another wall); a fully rounded box's top; a drafted wall; hole walls,
-boss sides and tops, a frustum's side both ways, a countersink, a sphere-cut
-box's sphere faces moved out, a torus. Every outcome came out bit-identical
-in six processes once patch `a9a7a28` fixed the mating order; before it, the
-sphere-cut box and a top-rounded box moved at its top and walls varied in the
-last digits. Refused cleanly: fillets sliding along drafted walls (the result
-tessellates right but its own volume is 20-30% off), a sphere-cut box with its
-sphere faces moved in or its top moved up (the executive leaves it open), and
-blends on a picked curved face (a rounded hole rim; their new shape is not a
-translation).
+then another wall); a fully rounded box's top; a drafted wall; hole walls, boss
+sides and tops, a frustum's side both ways, a countersink, a sphere-cut box's
+sphere faces moved out, a torus. A hole's seam under a pocket floor moved
+either way comes out bit for bit as in the part built at its new depth. Every
+outcome came out bit-identical in six processes once patch `a9a7a28` fixed the
+mating order; before it, the sphere-cut box and a top-rounded box moved at its
+top and walls varied in the last digits. Refused cleanly: fillets sliding along
+drafted walls (the result tessellates right but its own volume is 20-30% off),
+a sphere-cut box with its sphere faces moved in or its top moved up (the
+executive leaves it open), and blends on a picked curved face (a rounded hole
+rim; their new shape is not a translation).
 
 Faces are picked by index, as everywhere else in `smlib`; `Brep::find_faces`
 turns a `FaceQuery` into indices. An offset changes no topology, so every face
