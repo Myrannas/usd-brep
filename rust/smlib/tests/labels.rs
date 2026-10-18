@@ -504,6 +504,37 @@ fn merged_faces_keep_the_older_label_whichever_survives() {
 }
 
 #[test]
+fn merged_faces_of_one_feature_keep_the_lower_index() {
+    // As above, but both boxes are one feature's, told apart by index: the
+    // merged faces take the lower index in either order.
+    for lower_first in [true, false] {
+        let faces = on_kernel(move |k| {
+            let label = |solid: &mut Brep, index: u32| {
+                for face in solid.faces().unwrap() {
+                    let role = axis_role(face.normal.unwrap());
+                    let label = Label::new(BLOCK, role).with_index(index);
+                    solid.set_face_label(face.index, &label).unwrap();
+                }
+            };
+            let mut a = Brep::cuboid(k, [-40.0, -15.0, -10.0], [40.0, 30.0, 20.0]).unwrap();
+            let mut b = Brep::cuboid(k, [0.0, -15.0, -10.0], [40.0, 30.0, 20.0]).unwrap();
+            label(&mut a, 3);
+            label(&mut b, 8);
+            let mut part = if lower_first { a.union(b) } else { b.union(a) }.unwrap();
+            part.merge_faces().unwrap();
+            measure(&part)
+        });
+        let counts = labels(&faces);
+        let expected = ["1/+X.8", "1/+Y.3", "1/+Z.3", "1/-X.3", "1/-Y.3", "1/-Z.3"];
+        assert_eq!(
+            counts.keys().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "lower_first {lower_first}"
+        );
+    }
+}
+
+#[test]
 fn edge_queries_pick_by_direction_label_and_index() {
     let (picked, edges) = on_kernel(|k| {
         let block = labelled_box(k, BLOCK, [0.0; 3], [100.0, 60.0, 40.0]);

@@ -104,7 +104,8 @@ const ULONG LABEL_ATTRIBUTE_ID = 0x534d4c42;  // "SMLB"
 // A label as a generic attribute (longs: feature, index; characters: role),
 // so it also reads back from files as one. Merging is the only behaviour it
 // changes: when two labelled faces or edges merge, the survivor takes the
-// older label (the lower feature id), whichever of the two the kernel keeps.
+// older label (the lower feature id, then the lower index), whichever of the
+// two the kernel keeps.
 class LabelAttribute : public SmGenericAttribute {
 public:
     LabelAttribute(const SmTArray<long>& longs, const SmTArray<char>& role)
@@ -121,8 +122,9 @@ public:
         const SmAttribute* other =
             deleted && deleted != survivor ? deleted->FindAttribute(LABEL_ATTRIBUTE_ID) : nullptr;
         if (other && result == survivor && survivor && survivor->FindAttribute(LABEL_ATTRIBUTE_ID) == this &&
-            other->GetNumLongElements() >= 1 && m_vLongElements.GetSize() >= 1 &&
-            other->GetLongElementsAddress()[0] < m_vLongElements[0]) {
+            other->GetNumLongElements() >= 2 && m_vLongElements.GetSize() >= 2 &&
+            std::make_pair(other->GetLongElementsAddress()[0], other->GetLongElementsAddress()[1]) <
+                std::make_pair(m_vLongElements[0], m_vLongElements[1])) {
             m_vLongElements.RemoveAll();
             for (ULONG i = 0; i < other->GetNumLongElements(); ++i) {
                 m_vLongElements.Add(other->GetLongElementsAddress()[i]);

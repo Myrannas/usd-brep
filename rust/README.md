@@ -74,7 +74,8 @@ id, a role string and an index) to a face or edge as an SMLib attribute
 - A face or edge an operation splits passes its label to both pieces;
   copies keep every label.
 - When two labelled faces or edges merge, the result keeps the older label,
-  the lower feature id, whichever of the two the kernel keeps. The shim's
+  the lower feature id (then the lower index, for two of one feature),
+  whichever of the two the kernel keeps. The shim's
   attribute class overrides `SmAttribute::Merge` for this; with SMLib's
   default the result keeps the survivor's label, and which face survives
   depends on the order of the boolean's operands.

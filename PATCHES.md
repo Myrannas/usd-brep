@@ -239,3 +239,8 @@ and then moves the sheet into the caller's frame with `SmApiTransform`.
 - `CreateCurveSweepFromFaces` sweeps each loop's curves as NURBS, so every
   side of a swept prism is a NURBS surface, planar for lines (as for
   `sweep_face` on a solid's face).
+- Two faces of one feature can merge too, such as the ends of an extrude's
+  adjacent regions. `LabelAttribute::Merge` compared only feature ids, so the
+  merged face kept whichever label the survivor had, and two flush boxes of
+  one feature kept a mix of both boxes' indices in one operand order. It now
+  keeps the lower (feature, index), whichever face survives.

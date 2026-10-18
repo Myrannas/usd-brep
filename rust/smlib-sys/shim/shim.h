@@ -90,7 +90,8 @@ enum sm_surface_kind {
  * (SmAttribute.h): a face or edge that splits passes its label to both
  * pieces, a copy of the brep copies them, and when two labelled faces or
  * edges merge into one, the result keeps the label with the lower feature id
- * (the older one). Entities a fillet or chamfer creates have none.
+ * (the older one), or of one feature the lower index. Entities a fillet or
+ * chamfer creates have none.
  *
  * present is 0 for no label; the other fields are then zero. role is UTF-8,
  * NUL-terminated, and not empty. */
