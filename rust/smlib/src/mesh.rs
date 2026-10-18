@@ -107,7 +107,7 @@ impl Mesh {
 
     /// Triangles as vertex index triples.
     pub fn triangles(&self) -> impl Iterator<Item = [u32; 3]> + '_ {
-        self.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]])
+        self.indices.as_chunks::<3>().0.iter().copied()
     }
 
     /// Copies a shim mesh into Rust-owned arrays.
@@ -129,15 +129,9 @@ impl Mesh {
             let uvs = slice(view.surface_uvs, view.vertex_count * 2);
             let edge_points = slice(view.edge_points, view.edge_point_count * 3);
             Mesh {
-                positions: positions
-                    .chunks_exact(3)
-                    .map(|p| [p[0], p[1], p[2]])
-                    .collect(),
-                normals: normals
-                    .chunks_exact(3)
-                    .map(|n| [n[0], n[1], n[2]])
-                    .collect(),
-                surface_uvs: uvs.chunks_exact(2).map(|uv| [uv[0], uv[1]]).collect(),
+                positions: positions.as_chunks::<3>().0.to_vec(),
+                normals: normals.as_chunks::<3>().0.to_vec(),
+                surface_uvs: uvs.as_chunks::<2>().0.to_vec(),
                 indices: slice(view.indices, view.triangle_count * 3).to_vec(),
                 face_ids: slice(view.face_ids, view.triangle_count).to_vec(),
                 faces: slice(view.faces, view.face_count)
@@ -319,9 +313,9 @@ impl Edge {
             polyline: points
                 .get(start..end)
                 .unwrap_or_default()
-                .chunks_exact(3)
-                .map(|p| [p[0], p[1], p[2]])
-                .collect(),
+                .as_chunks::<3>()
+                .0
+                .to_vec(),
             faces: [face(raw.face_a), face(raw.face_b)],
             use_count: raw.use_count,
         }
