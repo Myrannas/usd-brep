@@ -1,0 +1,20 @@
+[package]
+name = "smlib-sys"
+description = "Raw bindings to NVIDIA's SMLib B-rep kernel (USD BRep), via a C shim"
+links = "smlib"
+build = "build.rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Rerun bindgen over shim/shim.h and rewrite src/bindings.rs. Needs libclang;
+# only for when shim.h changes.
+regenerate-bindings = ["dep:bindgen"]
+
+[build-dependencies]
+cc = { version = "1.8", features = ["parallel"] }
+sha2 = "0.10"
+bindgen = { version = "0.73", optional = true, default-features = false, features = ["runtime", "prettyplease"] }

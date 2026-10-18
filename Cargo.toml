@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["rust/smlib-sys", "rust/smlib"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/Myrannas/usd-brep"
+
+# The kernel is unusably slow unoptimised, so build it at -O3 in every profile.
+# Consumers set the same override in their own workspace; opt level is part of
+# the kernel cache key.
+[profile.dev.package.smlib-sys]
+opt-level = 3
+
+# The build script hashes ~40 MB of kernel source to find its cache entry.
+[profile.dev.package.sha2]
+opt-level = 3
