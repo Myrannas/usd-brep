@@ -7,7 +7,8 @@ use smlib_sys as sys;
 
 use crate::brep::Brep;
 use crate::edges::Tolerance;
-use crate::label::{Label, LabelMatch};
+use crate::error::Error;
+use crate::label::{Label, LabelMatch, NO_LABEL};
 use crate::mesh::{Face, Surface};
 
 /// Where a B-rep face is, for finding faces and placing solids on them. For
@@ -149,6 +150,163 @@ impl SweptFace {
             },
         }
     }
+}
+
+/// A line, arc or circle in a plane, for
+/// [`Brep::planar_faces`](crate::Brep::planar_faces). Points are in the
+/// plane's own (x, y); angles are in degrees from x towards y.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PlaneCurve {
+    /// The segment from `start` to `end` (`SmApiCreateLineSegment`).
+    Line {
+        /// Where it starts.
+        start: [f64; 2],
+        /// Where it ends.
+        end: [f64; 2],
+    },
+    /// An arc from `start_deg` by `sweep_deg`, counter-clockwise when
+    /// positive (`SmApiCreateArc`).
+    Arc {
+        /// The arc's centre.
+        centre: [f64; 2],
+        /// Its radius.
+        radius: f64,
+        /// The angle it starts at.
+        start_deg: f64,
+        /// How far it turns: not 0, and at most a whole turn either way.
+        sweep_deg: f64,
+    },
+    /// A whole circle, a loop on its own (`SmApiCreateCircle`).
+    Circle {
+        /// The circle's centre.
+        centre: [f64; 2],
+        /// Its radius.
+        radius: f64,
+    },
+}
+
+impl PlaneCurve {
+    /// Where the curve starts; a circle starts and ends on its x side.
+    pub fn start(&self) -> [f64; 2] {
+        match *self {
+            PlaneCurve::Line { start, .. } => start,
+            PlaneCurve::Arc {
+                centre,
+                radius,
+                start_deg,
+                ..
+            } => on_circle(centre, radius, start_deg),
+            PlaneCurve::Circle { centre, radius } => on_circle(centre, radius, 0.0),
+        }
+    }
+
+    /// Where the curve ends.
+    pub fn end(&self) -> [f64; 2] {
+        match *self {
+            PlaneCurve::Line { end, .. } => end,
+            PlaneCurve::Arc {
+                centre,
+                radius,
+                start_deg,
+                sweep_deg,
+            } => on_circle(centre, radius, start_deg + sweep_deg),
+            PlaneCurve::Circle { centre, radius } => on_circle(centre, radius, 0.0),
+        }
+    }
+
+    /// Why the shim would refuse the curve, if it would.
+    pub(crate) fn problem(&self) -> Option<&'static str> {
+        let finite = |p: [f64; 2]| p.iter().all(|c| c.is_finite());
+        let radius_ok = |r: f64| r.is_finite() && r > 0.0;
+        match *self {
+            PlaneCurve::Line { start, end } => (!(finite(start) && finite(end)) || start == end)
+                .then_some("a line needs two different, finite ends"),
+            PlaneCurve::Arc {
+                centre,
+                radius,
+                start_deg,
+                sweep_deg,
+            } => (!(finite(centre)
+                && radius_ok(radius)
+                && start_deg.is_finite()
+                && sweep_deg != 0.0
+                && sweep_deg.abs() <= 360.0))
+                .then_some(
+                    "an arc needs a finite centre, a positive radius and a sweep of up to a turn",
+                ),
+            PlaneCurve::Circle { centre, radius } => (!(finite(centre) && radius_ok(radius)))
+                .then_some("a circle needs a finite centre and a positive radius"),
+        }
+    }
+
+    pub(crate) fn to_raw(
+        self,
+        label: &Option<Label>,
+        operation: &'static str,
+    ) -> Result<sys::sm_plane_curve, Error> {
+        let mut raw = sys::sm_plane_curve {
+            kind: 0,
+            a: [0.0; 2],
+            b: [0.0; 2],
+            radius: 0.0,
+            start_deg: 0.0,
+            sweep_deg: 0.0,
+            label: label
+                .as_ref()
+                .map_or(Ok(NO_LABEL), |l| l.to_raw(operation))?,
+        };
+        match self {
+            PlaneCurve::Line { start, end } => {
+                raw.kind = sys::SM_PLANE_LINE as i32;
+                raw.a = start;
+                raw.b = end;
+            }
+            PlaneCurve::Arc {
+                centre,
+                radius,
+                start_deg,
+                sweep_deg,
+            } => {
+                raw.kind = sys::SM_PLANE_ARC as i32;
+                raw.a = centre;
+                raw.radius = radius;
+                raw.start_deg = start_deg;
+                raw.sweep_deg = sweep_deg;
+            }
+            PlaneCurve::Circle { centre, radius } => {
+                raw.kind = sys::SM_PLANE_CIRCLE as i32;
+                raw.a = centre;
+                raw.radius = radius;
+            }
+        }
+        Ok(raw)
+    }
+}
+
+/// One curve of a planar face's boundary, for
+/// [`Brep::planar_faces`](crate::Brep::planar_faces), and the label its edge
+/// gets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundaryCurve {
+    /// The curve.
+    pub curve: PlaneCurve,
+    /// The label for the curve's edge, if any.
+    pub label: Option<Label>,
+}
+
+impl BoundaryCurve {
+    /// A curve whose edge gets `label`.
+    pub fn labelled(curve: PlaneCurve, label: Label) -> BoundaryCurve {
+        BoundaryCurve {
+            curve,
+            label: Some(label),
+        }
+    }
+}
+
+fn on_circle(centre: [f64; 2], radius: f64, angle_deg: f64) -> [f64; 2] {
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    [centre[0] + radius * cos, centre[1] + radius * sin]
 }
 
 /// The kind of surface a face lies on, for [`FaceQuery::Kind`].

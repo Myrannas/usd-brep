@@ -24,7 +24,8 @@ pub const MAX_ROLE_LEN: usize = sys::SM_LABEL_ROLE_CAPACITY as usize - 1;
 /// - When an operation splits a face or edge, both pieces keep its label.
 /// - Copies ([`Brep::try_clone`](crate::Brep::try_clone)) keep every label.
 /// - When two labelled faces or edges merge into one, the result keeps the
-///   older label: the one with the lower `feature`.
+///   older label: the one with the lower `feature`, or when both are from
+///   one feature, the lower `index`.
 /// - Faces and edges an operation creates from nothing, such as a fillet's
 ///   rounds and their rails, have no label.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

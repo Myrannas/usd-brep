@@ -90,7 +90,8 @@ enum sm_surface_kind {
  * (SmAttribute.h): a face or edge that splits passes its label to both
  * pieces, a copy of the brep copies them, and when two labelled faces or
  * edges merge into one, the result keeps the label with the lower feature id
- * (the older one). Entities a fillet or chamfer creates have none.
+ * (the older one), or of one feature the lower index. Entities a fillet or
+ * chamfer creates have none.
  *
  * present is 0 for no label; the other fields are then zero. role is UTF-8,
  * NUL-terminated, and not empty. */
@@ -280,6 +281,44 @@ sm_status sm_brep_create_sphere(sm_vec3 center, double radius, sm_brep **out);
  * ends capped and sharp corners. */
 sm_status sm_brep_create_tapered_prism(const sm_vec3 *points, size_t count, double height, double draft_deg,
                                        sm_brep **out);
+
+/* What a curve of sm_brep_create_planar_faces is. */
+enum sm_plane_curve_kind {
+    /* The segment from a to b (SmApiCreateLineSegment). */
+    SM_PLANE_LINE = 0,
+    /* The arc round centre a of radius, from start_deg (from x towards y) by
+     * sweep_deg: counter-clockwise when positive (SmApiCreateArc). */
+    SM_PLANE_ARC = 1,
+    /* The whole circle round centre a of radius, a loop on its own
+     * (SmApiCreateCircle). */
+    SM_PLANE_CIRCLE = 2
+};
+
+/* A line, arc or circle in a plane's own (x, y), and the label for its edge.
+ * Fields a kind doesn't use are ignored. */
+typedef struct sm_plane_curve {
+    int32_t kind;
+    double a[2];
+    double b[2];
+    double radius;
+    double start_deg;
+    double sweep_deg;
+    sm_label label;
+} sm_plane_curve;
+
+/* Planar faces bounded by closed loops of curves in the plane through origin
+ * spanned by x_axis and y_axis (unit and perpendicular, as for
+ * sm_brep_place): the curves are made with SmApiCreateLineSegment,
+ * SmApiCreateArc and SmApiCreateCircle in the plane's (x, y), and the faces
+ * with SmApiCreatePlanarFaces. Curves may come in any order and direction;
+ * every end must meet exactly one other curve's end, and loops mustn't cross
+ * or touch. Outer loops bound faces, loops inside them holes, and loops inside
+ * those faces again. *out is a sheet, not a solid: each face's normal is
+ * x_axis × y_axis, and each curve's edge has the curve's label (none when
+ * present is 0). SM_ERR_INVALID_INPUT for a bad curve; the kernel's status
+ * when the loops don't make faces, though it doesn't notice every crossing. */
+sm_status sm_brep_create_planar_faces(const sm_plane_curve *curves, size_t count, sm_vec3 origin, sm_vec3 x_axis,
+                                      sm_vec3 y_axis, sm_brep **out);
 
 /* SmApiBrepCopy: a deep copy. */
 sm_status sm_brep_copy(const sm_brep *brep, sm_brep **out);
