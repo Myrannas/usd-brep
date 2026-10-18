@@ -11932,14 +11932,18 @@ NOTES:
   fit to be deleted with this SmTess.
 
   Neighbouring faces' caches are deleted once their shared edges are split,
-  so only the faces given can go on to Phase2CreateFacePolygons.
+  or given to pOptStore, so only the faces given can go on to
+  Phase2CreateFacePolygons. With pOptStore, a face takes the store's cache for
+  an identical surface, if it has one, rather than building one: a cache
+  depends only on its surface and the parameters.
 
   increments an unlocked mark value
 ***********************************************************************/
 SmStatus SmTess::Phase1SetupFaces
  (SmBrep                  * pBrepUsedForTessellation, // in : Brep to tessellate, as for Phase1SetupBrep
   const SmTArray<SmFace*> & crFacesToTessellate,      // in : faces of pBrepUsedForTessellation to set up
-  SmBoolean               & rbSameAsWholeBrep)        // out: TRUE = those faces are as Phase1SetupBrep leaves them
+  SmBoolean               & rbSameAsWholeBrep,        // out: TRUE = those faces are as Phase1SetupBrep leaves them
+  SmTessSrfCacheStore     * pOptStore)                // in : where to take caches from and keep them, or NULL
 {
   // check input
   NER(pBrepUsedForTessellation);
@@ -12015,7 +12019,13 @@ SmStatus SmTess::Phase1SetupFaces
       pFace->SetIsRectangularTrim(bRectangularTrim);
       sRectangularTrim.Add(bRectangularTrim);
 
-      if (CreateFaceTessCache(pFace) != SM_SUCCESS)
+      SmTessSrfCache * pSC = pOptStore ? pOptStore->Take(pFace) : NULL;
+      if (pSC)
+        {
+          pSC->SetFace(pFace, &m_rSurfaceTess);
+          m_vCache.RelatePair(pFace, pSC);
+        }
+      else if (CreateFaceTessCache(pFace) != SM_SUCCESS)
         { return SM_SUCCESS; } // Phase1SetupBrep fails the face
     }
 
@@ -12070,8 +12080,17 @@ SmStatus SmTess::Phase1SetupFaces
   // the neighbours' caches have done their part
   for (ii=0; ii<sFaces.GetSize(); ii++)
     {
-      if (sWanted.count(sFaces[ii]) == 0)
-        { SER(Phase3DeleteFacePolygons(sFaces[ii])); }
+      SmFace * pFace = sFaces[ii];
+      if (sWanted.count(pFace) > 0)
+        { continue; }
+      SmTessSrfCache * pSC = m_vCache.GetSecond(pFace);
+      if (pOptStore && pSC)
+        {
+          m_vCache.RemovePair(pFace, pSC);
+          pOptStore->Keep(pFace, pSC);
+        }
+      else
+        { SER(Phase3DeleteFacePolygons(pFace)); }
     }
 
   // as Phase1SetupBrep
@@ -14873,6 +14892,25 @@ SmTessSrfCache::SmTessSrfCache
   m_dMinimumSideLengthRatioUV = dMinEdgeLengthRatioUV;
 
 } // end SmTessSrfCache::SmTessSrfCache constructor
+
+/*******************************************************************//**
+PURPOSE: game-cad patch: moves a cache SmTess::Phase1SetupFaces built for one
+    face, and used only to split edges, to another face whose surface is
+    identical and a tessellation with the same parameters.
+
+NOTES: The tree depends only on the surface and the parameters. The bounding
+    planes are computed again from the new surface when they're next needed.
+***********************************************************************/
+void SmTessSrfCache::SetFace
+ (SmFace              * pFace,               // in : face with a surface identical to the cache's
+  SmSurfaceTessDriver * pSurfaceTessDriver)  // in : the new tessellation's driver
+{
+  m_pFace              = pFace;
+  m_pSurfaceTessDriver = pSurfaceTessDriver;
+  m_cpSurface          = pFace->GetSurface();
+  m_sBoundingPlanes    = SmPatchBoundaryBoundingPlanes(m_cpSurface, m_sUVDomain);
+
+} // end SmTessSrfCache::SetFace
 
 /*******************************************************************//**
 PURPOSE: Destructor for the tessellating surface cache.
