@@ -13,6 +13,9 @@
 #include <SmFilletSolver.h>
 #include <SmGeomUtility.h>
 #include <SmPlane.h>
+#include <SmCone.h>
+#include <SmSphere.h>
+#include <SmTorus.h>
 // Remove Composites
 // #include <SmCEdge.h> 
 #include <SmAssertArray.h>
@@ -1299,7 +1302,7 @@ SmBoolean bDebugMe2 = FALSE;
                 }
             }
         } // end iter every sOffAdjEU
-      
+
       SmBoolean bFound = FALSE;
       double dFoundDist = SM_BIG_DOUBLE;
       double dFoundParam =0.0;
@@ -1375,6 +1378,111 @@ SmBoolean bDebugMe2 = FALSE;
   return SM_SUCCESS;
 
 } // end SmOffsetGeometryCreation::TrimExtendedEdge
+
+/*******************************************************************//**
+PURPOSE: ExtendTrimEdges() helper: distance from a point to a surface taken
+   whole, beyond any face or domain: exact for planes (planar B-splines
+   too), cylinders, cones, spheres and tori. Other surfaces are measured
+   within their own domain.
+
+NOTES: The executive's extended surfaces won't do for this: they continue a
+   surface G1 from its boundary, so a fillet's extension runs on flat into
+   the wall it is tangent to.
+***********************************************************************/
+static SmBoolean sm_DistanceToSurface
+  (const SmSurface * pSurface,  // in : surface
+   const SmPoint3d & crPoint,   // in : point
+   double          & rdDist)    // out: distance
+{
+  const SM_TYPE eType = pSurface->GetType();
+  if (eType == SmPlane_TYPE)
+    {
+      const SmAxis2Placement & crPos = ((const SmPlane *)pSurface)->GetPosition();
+      rdDist = smos_Fabs((crPoint - crPos.GetOrigin()).Dot(crPos.GetZAxis()));
+      return TRUE;
+    }
+  if (eType == SmCone_TYPE || eType == SmCylinder_TYPE)
+    {
+      const SmCone           * pCone  = (const SmCone *)pSurface;
+      const SmAxis2Placement & crPos  = pCone->GetPosition();
+      const SmVector3d         sAxis  = crPos.GetZAxis();
+      const SmVector3d         sOff   = crPoint - crPos.GetOrigin();
+      const double             dH     = sOff.Dot(sAxis);
+      const double             dRho   = (sOff - sAxis * dH).Length();
+      const double             dTan   = pCone->GetRadius(1.0) - pCone->GetRadius(0.0);
+      rdDist = smos_Fabs(dRho - pCone->GetRadius(dH)) / sqrt(1.0 + dTan * dTan);
+      return TRUE;
+    }
+  if (eType == SmSphere_TYPE)
+    {
+      const SmSphere * pSphere = (const SmSphere *)pSurface;
+      rdDist = smos_Fabs((crPoint - pSphere->GetPosition().GetOrigin()).Length() - pSphere->GetRadius());
+      return TRUE;
+    }
+  if (eType == SmTorus_TYPE)
+    {
+      const SmTorus          * pTorus = (const SmTorus *)pSurface;
+      const SmAxis2Placement & crPos  = pTorus->GetPosition();
+      const SmVector3d         sAxis  = crPos.GetZAxis();
+      const SmVector3d         sOff   = crPoint - crPos.GetOrigin();
+      const double             dH     = sOff.Dot(sAxis);
+      const double             dRho   = (sOff - sAxis * dH).Length() - pTorus->GetMajorRadius();
+      rdDist = smos_Fabs(sqrt(dRho * dRho + dH * dH) - pTorus->GetMinorRadius());
+      return TRUE;
+    }
+  // A B-spline surface whose control points share a plane is that plane.
+  SmPoint3d  sPlanePoint;
+  SmVector3d sPlaneNormal;
+  if (eType == SmBSplineSurface_TYPE && pSurface->IsPlanar(1.0e-3, &sPlanePoint, &sPlaneNormal))
+    {
+      ULONG lUCount = 0, lVCount = 0;
+      SmTArray<SmPoint3d> sPoles;
+      SmTArray<double>    sWeights;
+      SmBoolean bFlat = ((const SmBSplineSurface *)pSurface)->GetControlPointNet(lUCount, lVCount, sPoles, sWeights) == SM_SUCCESS;
+      for (ULONG ii = 0; bFlat && ii < sWeights.GetSize(); ii++) { bFlat = sWeights[ii] > 0.0; }
+      for (ULONG ii = 0; bFlat && ii < sPoles.GetSize(); ii++)
+        { bFlat = smos_Fabs((sPoles[ii] - sPlanePoint).Dot(sPlaneNormal)) <= SM_EFF_ZERO_SQRT * (1.0 + (sPoles[ii] - sPlanePoint).Length()); }
+      if (bFlat)
+        {
+          rdDist = smos_Fabs((crPoint - sPlanePoint).Dot(sPlaneNormal));
+          return TRUE;
+        }
+    }
+  SmBoolean bSuccess = FALSE, bIsMultivalued = FALSE;
+  SmPoint2d sDropUV;
+  if (   pSurface->DropPoint(crPoint, pSurface->GetNaturalUVDomain(), NULL, bSuccess, sDropUV, rdDist, bIsMultivalued) != SM_SUCCESS
+      || !bSuccess)
+    { return FALSE; }
+  return TRUE;
+} // end sm_DistanceToSurface
+
+/*******************************************************************//**
+PURPOSE: ExtendTrimEdges() helper: whether lifting the midpoint of a UV trim
+   curve onto its own face's new surface gives a point on the other face's
+   new surface, to tolerance.
+
+NOTES: In a local operation only some faces get new surfaces, so the
+   two sides of a tangent edge needn't agree on where the edge goes: the
+   old UV curve of an unmoved face lifts to the old edge, which a moved
+   neighbour no longer contains.
+***********************************************************************/
+static SmBoolean sm_LiftedMidpointIsOnOther
+  (const SmBSplineCurve & crUVCurve,         // in : UV trim curve on the old surface of pOwnSurf's face
+   const SmSurface      * pOwnSurf,          // in : that face's new surface
+   const SmSurface      * pOtherSurf,        // in : the other face's new surface
+   double                 dTol)              // in : distance tolerance
+{
+  SmPoint3d sUV, sPoint;
+  if (crUVCurve.EvaluatePoint(crUVCurve.GetNaturalInterval().Evaluate(0.5), sUV) != SM_SUCCESS)
+    { return FALSE; }
+  SmPoint2d sUV2(sUV.x, sUV.y);
+  if (   !pOwnSurf->GetNaturalUVDomain().ContainsPoint2d(sUV2, SM_EFF_ZERO)
+      || pOwnSurf->EvaluatePoint(sUV2, sPoint) != SM_SUCCESS)
+    { return FALSE; }
+  double dDist = SM_BIG_DOUBLE;
+  if (!sm_DistanceToSurface(pOtherSurf, sPoint, dDist)) { return FALSE; }
+  return dDist <= dTol ? TRUE : FALSE;
+} // end sm_LiftedMidpointIsOnOther
 
 /*******************************************************************//**
 PURPOSE:  Extend or Trim Lamina or Tangent Edges
@@ -1459,6 +1567,27 @@ static ULONG lDebugCount = 0 ;
           // pUVCurve  already set to pEdgeuse->GetUVTrimCurve();
           // bUseRadUV already set to FALSE
         }
+      // In a local operation, lift the side whose new surface carries the
+      // edge onto the other: when only one face of a tangent edge got a new
+      // surface, the unmoved side's UV curve lifts to the old edge, which the
+      // moved side doesn't contain, and the edge comes out wrong or open.
+      if (   pOtherOffsetEdgeuse != NULL
+          && pOffsetEdgeuse      != NULL
+          && cpOffsetExecutive->GetOffsetOperation() == SM_OO_LOCAL_OPERATION)
+        {
+          SmSurface *pOwnSurf   = (bUseRadUV ? pOtherOffsetEdgeuse : pOffsetEdgeuse)->GetFace()->GetSurface();
+          SmSurface *pOtherSurf = (bUseRadUV ? pOffsetEdgeuse : pOtherOffsetEdgeuse)->GetFace()->GetSurface();
+          double     dTol       = pEdgeuse->GetEdge()->GetTolerance();
+          if (   !sm_LiftedMidpointIsOnOther(*pUVCurve,      pOwnSurf,   pOtherSurf, dTol)
+              &&  sm_LiftedMidpointIsOnOther(*pOtherUVCurve, pOtherSurf, pOwnSurf,   dTol))
+            {
+              SmBSplineCurve *pTmp = pUVCurve;
+              pUVCurve      = pOtherUVCurve;
+              pOtherUVCurve = pTmp;
+              bUseRadUV     = !bUseRadUV;
+            }
+        }
+
       // refresh locals
       SmExtent1d sOrigIvl = pOtherUVCurve->GetNaturalInterval();
       SER(pOtherUVCurve->EvaluatePoint(sOrigIvl.Evaluate(0.5),sOtherMid));
