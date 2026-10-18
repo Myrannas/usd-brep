@@ -1440,7 +1440,7 @@ bool lands_like(const SmFace* face, const Motion& motion, const SmVector3d& shif
 // known. That loses precision, fails outright where two equal fillets meet
 // at a corner (their cylinders touch tangentially at its tip), and on tangent
 // edges between a moved face and a kept one lifts whichever side's old trim
-// curve comes first in pointer order, which is the old edge half the time.
+// curve the executive meets first, which is the old edge half the time.
 class RigidMoveGeometry : public SmLocalOperationGeometryCreation {
 public:
     RigidMoveGeometry(double distance, double tolerance, SmTArray<SmFace*>& faces, SmTArray<SmSurface*>& surfaces,
@@ -1498,7 +1498,10 @@ private:
     }
 
     // `curve` (owned) as the copy's edge, with its trim curve on the copy's
-    // (extended) surface, or false if the curve won't drop onto it whole.
+    // (extended) surface, or false if the curve won't drop onto it whole. A
+    // curve on a closed surface's seam drops as a pair, one on each side
+    // (u = 0 and u = 2πr on a cylinder); each of a seam's edgeuses takes the
+    // one on its original's side.
     bool dropped_copy(const SmContext& context, SmOffsetExecutive* executive, const SmEdgeuse* original,
                       SmEdgeuse* copy, SmBSplineCurve* curve, SmCurve*& out, SmBSplineCurve*& uv) const {
         out = nullptr;
@@ -1512,23 +1515,75 @@ private:
         // The original edge may sit looser on its faces than the brep's
         // tolerance (fillet mitres do): it moves no less precise than it was.
         const double tolerance = std::max(copy->GetEdge()->GetTolerance(), original->GetEdge()->GetTolerance());
+        const EdgeFaces sides = faces_of(original->GetEdge());
+        const bool seam = sides.faces[0] && sides.faces[0] == sides.faces[1];
+        const SmBSplineCurve* reference = original->GetUVTrimCurve();
+        ULONG pick = 0;
         if (executive->GetCreateExtendedSurface(copy->GetFace()->GetSurface(), domain, extended) != SM_SUCCESS ||
             !extended ||
             extended->DropAndTrimCurve(context, domain, *curve, curve->GetNaturalInterval(), tolerance / 3.0, drop,
                                        deviation, drops, TRUE, TRUE) != SM_SUCCESS ||
-            drops.GetSize() != 1 || drop > tolerance) {
+            drop > tolerance || drops.GetSize() == 0 ||
+            (seam ? !reference || drops.GetSize() > 2 || !on_side_of(*extended, domain, *reference, drops, pick)
+                  : drops.GetSize() != 1)) {
             delete curve;
             for (ULONG i = 0; i < drops.GetSize(); ++i) delete drops[i];
             return false;
         }
         out = curve;
-        uv = drops[0];
+        uv = drops[pick];
+        for (ULONG i = 0; i < drops.GetSize(); ++i) {
+            if (i != pick) delete drops[i];
+        }
         return true;
+    }
+
+    // Which of `drops` (one curve's UV curves over the same interval: one, or
+    // a seam's pair) is on the side of `surface`'s seam that `reference` is
+    // on: the one whose middle is nearest, moved by whole periods where the
+    // surface is closed over `domain` and it still lies a period away.
+    static bool on_side_of(const SmSurface& surface, const SmExtent2d& domain, const SmBSplineCurve& reference,
+                           SmTArray<SmBSplineCurve*>& drops, ULONG& pick) {
+        const SmPoint3d want = middle(reference);
+        double nearest = SM_BIG_DOUBLE;
+        for (ULONG i = 0; i < drops.GetSize(); ++i) {
+            const SmExtent1d interval = drops[i]->GetNaturalInterval();
+            if (!SM_ARE_SAME(interval.GetMin(), drops[0]->GetNaturalInterval().GetMin()) ||
+                !SM_ARE_SAME(interval.GetMax(), drops[0]->GetNaturalInterval().GetMax())) {
+                return false;
+            }
+            const double distance = (middle(*drops[i]) - want).Length();
+            if (distance < nearest) {
+                nearest = distance;
+                pick = i;
+            }
+        }
+        const SmPoint3d have = middle(*drops[pick]);
+        SmVector3d shift(0.0, 0.0, 0.0);
+        if (surface.IsClosed(domain, SM_SP_U)) {
+            shift.x = std::round((want.x - have.x) / domain.XLength()) * domain.XLength();
+        }
+        if (surface.IsClosed(domain, SM_SP_V)) {
+            shift.y = std::round((want.y - have.y) / domain.YLength()) * domain.YLength();
+        }
+        if (shift.x == 0.0 && shift.y == 0.0) return true;
+        SmAxis2Placement placement;
+        placement.Translate(shift);
+        return drops[pick]->Transform(placement) == SM_SUCCESS;
+    }
+
+    static SmPoint3d middle(const SmBSplineCurve& curve) {
+        SmPoint3d point;
+        curve.EvaluatePoint(curve.GetNaturalInterval().Evaluate(0.5), point);
+        return point;
     }
 
     // Puts a new curve on every copy of `edge` that `replace` picks, from
     // `make` (given the original edgeuse; the curve runs as the edge's own);
-    // all or nothing.
+    // all or nothing. A seam's copies are both uses of one edge of the copied
+    // face: the first puts its curve on that edge, the other only its own UV
+    // curve, which runs as the edge's new curve (ReplaceEdgeCurves reverses
+    // neither, since both run as the edge's own).
     template <typename Replace, typename Make>
     bool replace_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge, Replace&& replace,
                         Make&& make) {
@@ -1548,12 +1603,24 @@ private:
             ready = dropped_copy(context, executive, sides[i].first, sides[i].second, make(sides[i].first), curves[i],
                                  uvs[i]);
         }
+        // Whether each copy's edge took its new curve, once one copy has.
+        std::unordered_map<const SmEdge*, bool> placed;
         for (size_t i = 0; i < sides.size() && ready; ++i) {
             if (!curves[i]) continue;
+            SmEdgeuse* copy = sides[i].second;
+            const auto shared = placed.find(copy->GetEdge());
+            if (shared != placed.end()) {
+                // ReplaceEdgeCurves would double the edge's tolerance again.
+                if (shared->second) {
+                    copy->SetUVTrimCurve(uvs[i], 0.0, TRUE);
+                    uvs[i] = nullptr;
+                }
+                continue;
+            }
             SmBoolean delete_curve = FALSE;
             SmBoolean delete_uv = FALSE;
-            const SmStatus status =
-                ReplaceEdgeCurves(sides[i].second, curves[i], uvs[i], sides[i].first, delete_curve, delete_uv);
+            const SmStatus status = ReplaceEdgeCurves(copy, curves[i], uvs[i], sides[i].first, delete_curve, delete_uv);
+            placed.emplace(copy->GetEdge(), !delete_curve);
             if (delete_curve) delete curves[i];
             if (delete_uv) delete uvs[i];
             curves[i] = nullptr;
@@ -1587,16 +1654,17 @@ private:
 
     // Where a straight edge goes when it stays on its own line and only its
     // ends move along it: a wall's edge with a fillet under a raised top, or
-    // beside a pushed wall. Both its faces land as no move would put them
-    // (kept, or moved within their own surfaces), it isn't a seam, and both
-    // ends are placed (aim_vertices) on the line, in the same order. Mating
-    // such an edge lifts one face's old trim curve, which picks a side in
-    // pointer order and so varies in the last digits from run to run.
+    // beside a pushed wall, or a hole's seam under a moved floor. Both its
+    // faces land as no move would put them (kept, or moved within their own
+    // surfaces), and both ends are placed (aim_vertices) on the line, in the
+    // same order. Mating such an edge lifts the old trim curve of whichever
+    // face (or side of the seam) the executive meets first, which is off in
+    // the last digits.
     bool stretched_line(const SmContext& context, const SmEdge* edge, SmPoint3d& from, SmPoint3d& to) const {
         SmVector3d direction;
         if (!straight(edge, direction)) return false;
         const EdgeFaces sides = faces_of(edge);
-        if (!sides.faces[0] || !sides.faces[1] || sides.faces[0] == sides.faces[1]) return false;
+        if (!sides.faces[0] || !sides.faces[1]) return false;
         const SmVector3d none(0.0, 0.0, 0.0);
         for (const SmFace* side : sides.faces) {
             if (!lands_like(side, motion_of(m_motions, side), none)) return false;
@@ -1652,8 +1720,8 @@ private:
     }
 
     // Before the executive mates any edge, moves every rigid one and marks its
-    // edgeuses as mated. Its neighbours then find its moved ends whichever
-    // order the executive's pointer-keyed maps give: a tangent neighbour that
+    // edgeuses as mated. Its neighbours then find its moved ends whatever
+    // order the executive mates them in: a tangent neighbour that
     // isn't marked yet is trimmed against its old trim curve instead, which
     // puts it back at the old corner.
     void move_rigid_edges(const SmContext& context, SmOffsetExecutive* executive, SmBrep* brep, SmMarkType mark) {
@@ -2012,12 +2080,16 @@ sm_status offset_faces(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     sm_status result = plan_offset(picked, distance, brep.GetTolerance(), motions);
     if (result != SM_SUCCESS) return result;
 
+    // In the brep's face order, not the map's (by address): the analytic
+    // surfaces restored afterwards are tried in this order.
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
     SmTArray<SmFace*> changed;
     SmTArray<SmSurface*> surfaces;
     double reach = std::fabs(distance);
-    for (const auto& entry : motions) {
-        SmFace* face = const_cast<SmFace*>(entry.first);
-        const Motion& motion = entry.second;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmFace* face = faces[i];
+        const Motion motion = motion_of(motions, face);
         SmSurface* surface = nullptr;
         if (motion.kind == Motion::kShift) {
             result = translated_surface(face, motion.shift, surface);

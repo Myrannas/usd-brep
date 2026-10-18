@@ -1472,6 +1472,85 @@ fn offsets_come_out_the_same_every_time() {
 }
 
 #[test]
+fn offsets_mate_edges_in_the_same_order_every_time() {
+    // The executive mated edges in the order of a map keyed by their
+    // addresses, which also picked the side each was built from: these
+    // parts came out different in the last digits from run to run.
+    type Make = fn(&Kernel) -> Result<Brep, Error>;
+    let parts: [(&str, Make); 2] = [
+        ("box cut by a sphere, sphere faces d=+2", |k| {
+            box_of_height(k, H)?
+                .intersection(Brep::sphere(k, [0.0; 3], 55.0)?)?
+                .offset_where(&FaceQuery::Kind(SurfaceKind::Sphere), 2.0)
+        }),
+        ("filleted box, top and every wall d=+5", |k| {
+            top_rounded_box(k, H, 8.0)?.offset_where(&top_at(H).or(walls()), 5.0)
+        }),
+    ];
+    for (name, make) in parts {
+        let runs = on_kernel(move |k| {
+            let mut kept = Vec::new();
+            let mut runs = Vec::new();
+            for _ in 0..8 {
+                let moved = make(k)?;
+                let edges: Vec<_> = moved.edges()?.iter().map(|e| e.samples).collect();
+                runs.push((edges, moved.volume(PRECISE)?.to_bits()));
+                kept.push(moved);
+            }
+            Ok::<_, Error>(runs)
+        })
+        .unwrap();
+        for run in &runs[1..] {
+            assert!(*run == runs[0], "{name}: an offset came out different");
+        }
+    }
+}
+
+#[test]
+fn stretched_seams_are_exact() {
+    // A hole's seam runs from the box's base up to the floor of a pocket cut
+    // around the hole, so it stretches when the floor moves. Mated, it came
+    // from one side's lifted trim curve and moved its base end by about 1e-14;
+    // it must come out as the part built at its new depth has it.
+    let pocketed = |k: &Kernel, depth: f64| {
+        holed_box(k, H, 10.0)?.difference(Brep::cuboid(
+            k,
+            [-20.0, -20.0, H / 2.0 - depth],
+            [40.0, 40.0, depth + 1.0],
+        )?)
+    };
+    let seam = |b: &Brep| -> Result<_, Error> {
+        let seams: Vec<_> = b
+            .edges()?
+            .into_iter()
+            .filter(|e| e.faces[0].is_some() && e.faces[0] == e.faces[1])
+            .map(|e| e.samples)
+            .collect();
+        assert_eq!(seams.len(), 1, "the hole has one seam");
+        Ok(seams[0])
+    };
+    for d in [-5.0, 5.0] {
+        let (before, moved, reference) = on_kernel(move |k| {
+            let part = pocketed(k, 15.0)?;
+            let before = seam(&part)?;
+            let floor = FaceQuery::OnPlane {
+                point: [0.0, 0.0, H / 2.0 - 15.0],
+                normal: UP,
+            };
+            let moved = part.offset_where(&floor, d)?;
+            assert!(moved.is_manifold()?, "floor d={d:+}: not manifold");
+            Ok::<_, Error>((before, seam(&moved)?, seam(&pocketed(k, 15.0 - d)?)?))
+        })
+        .unwrap();
+        assert_eq!(moved, reference, "floor d={d:+}: the seam is off");
+        assert_eq!(
+            moved[0], before[0],
+            "floor d={d:+}: the seam's base end moved"
+        );
+    }
+}
+
+#[test]
 fn edges_read_after_an_offset_and_a_fillet() {
     // A boss raised by a sweep, the far end trimmed, then the boss's rim
     // rounded: the fillet leaves the seam's range an ulp past its line's

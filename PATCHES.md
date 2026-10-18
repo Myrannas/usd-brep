@@ -12,6 +12,7 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `a81ed1b` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: in a local operation, `ExtendTrimEdges` lifts a tangent edge from whichever side pointer order picks, which for a face that kept its surface is the old edge; the solid comes out open. | For `SM_OO_LOCAL_OPERATION`, lift from the side whose lifted midpoint lies on the other side's new surface, measured to the whole surface (exact for analytic surfaces and planar B-splines), not the G1-extended one. |
 | `fdc9c9b` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: when the curve replacing an open edge is closed (a plane meeting a sphere), `MateEdges` keeps the trim interval inside the curve's parameter range, which can be the far arc: an inside-out solid with no gaps. | Keep the arc nearer the original edge, re-anchoring the 3D and UV curves when it runs past the curve's seam, and only if they still agree. |
 | `c282328` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: `TrimExtendedEdge` trims against a not-yet-mated tangent neighbour's old UV curve, which in a local operation can describe the old corner. | For `SM_OO_LOCAL_OPERATION`, also offer the base vertex as a trim point when it lies on the new curve; the shim moves vertices it can place there for the operation. |
+| `a9a7a28` | `SmOffsetExecutive.cpp` | Found offsetting faces: `DoExtendedOffset` mates edges in the order of `m_vEUToEU`, an `unordered_map` keyed by edgeuse addresses, which also picks each edge's target side; the same offset gave different last digits, vertices and trim curves from one process to the next. | For `SM_OO_LOCAL_OPERATION`, mate them in the original brep's order: its edges in turn, each edge's edgeuses in turn. |
 
 `source/SM_API` is unmodified. Each patch changes only `SM_OO_LOCAL_OPERATION`
 (`SmBrep::LocalOperation` and the shim's face offset); solid offsets and
@@ -116,8 +117,10 @@ but not much else. What goes wrong, and what the shim
   onto its new surface. That suits a true offset, where every face moves with
   its parameterisation, not a wall that keeps its surface while its top edge
   moves; which side it lifts from, and whether a neighbouring tangent edge has
-  been mated yet, follow pointer-keyed map order, so results varied between
-  runs (ASLR) as well as distances. Patch `a81ed1b` fixes the side.
+  been mated yet, follow the executive's mating order, so results varied with
+  distances. Patch `a81ed1b` fixes the side. The order itself was the
+  edgeuses' addresses, so results varied between runs too (ASLR); patch
+  `a9a7a28` puts it in the brep's order.
 - Edges re-intersected when nothing about them changed shape lose precision,
   and fail where two equal fillets meet at a corner: their mitre ends at the
   corner of the face they round, where the cylinders touch tangentially, a
@@ -129,8 +132,11 @@ but not much else. What goes wrong, and what the shim
   that stays on its own line while its ends move along it (a wall's edge with
   a vertical fillet under a raised top) is put in the same way, as the line
   between its ends' predicted places: mated, it came from one face's lifted
-  trim curve, and which face followed pointer order, so the same part rebuilt
-  to different last digits, and different triangles, from run to run.
+  trim curve, which is off in the last digits, and which face followed the
+  mating order. So is a seam (a hole's, under a pocket floor that moves): its
+  two copies are both uses of one edge of the copied face, and a curve on a
+  closed surface's seam drops onto it as a pair of UV curves, one on each
+  side, so each copy takes the one on its own original's side.
 - The executive picks each extended edge's end among candidate points by
   nearness to the original vertex, which after a long move can be the wrong
   candidate, and through an unmated tangent neighbour's old UV curve, which can
@@ -163,14 +169,17 @@ its new size and, where known, its analytic volume, within 1e-6): plain,
 chamfered, filleted and drafted tops; several faces of plain, chamfered and
 filleted boxes, including every face at once; a wall pushed under fillets,
 alone and with the top, and offsets one after another (a wall, then the top,
-then another wall); a fully rounded box's top; a drafted wall; hole walls,
-boss sides and tops, a frustum's side both ways, a countersink, a sphere-cut
-box's sphere faces moved out, a torus. Every outcome was the same in eight
-processes. Refused cleanly: fillets sliding along drafted walls (the result
-tessellates right but its own volume is 20-30% off), a sphere-cut box with its
-sphere faces moved in or its top moved up (the executive leaves it open), and
-blends on a picked curved face (a rounded hole rim; their new shape is not a
-translation).
+then another wall); a fully rounded box's top; a drafted wall; hole walls, boss
+sides and tops, a frustum's side both ways, a countersink, a sphere-cut box's
+sphere faces moved out, a torus. A hole's seam under a pocket floor moved
+either way comes out bit for bit as in the part built at its new depth. Every
+outcome came out bit-identical in six processes once patch `a9a7a28` fixed the
+mating order; before it, the sphere-cut box and a top-rounded box moved at its
+top and walls varied in the last digits. Refused cleanly: fillets sliding along
+drafted walls (the result tessellates right but its own volume is 20-30% off),
+a sphere-cut box with its sphere faces moved in or its top moved up (the
+executive leaves it open), and blends on a picked curved face (a rounded hole
+rim; their new shape is not a translation).
 
 Faces are picked by index, as everywhere else in `smlib`; `Brep::find_faces`
 turns a `FaceQuery` into indices. An offset changes no topology, so every face
