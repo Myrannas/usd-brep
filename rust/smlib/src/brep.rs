@@ -12,7 +12,7 @@ use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams};
-use crate::tessellation::Tessellation;
+use crate::tessellation::{FaceKey, Tessellation};
 
 /// Relative accuracy of [`Brep::face_centroid`]: placing a feature at a
 /// centroid is then exact to a tenth of a micron on a metre-sized part.
@@ -752,6 +752,89 @@ impl Brep {
         wanted: Option<&[bool]>,
     ) -> Result<Mesh, Error> {
         self.begin_tessellation(params)?.mesh(wanted)
+    }
+
+    /// Each face's key for [`tessellate_some`](Brep::tessellate_some), in
+    /// face order, taken before tessellating: a 128-bit digest of everything
+    /// SMLib's tessellation reads for the face when no face's boundary needs
+    /// refining. That is the parameters, the brep's tolerance, the face's
+    /// surface, domain, tolerance and loops (each edge's curve, interval and
+    /// trim curves, and their vertices), and for each of its edges, the
+    /// surface, domain, tolerance and order of the other faces on it. `None`
+    /// for a face SMLib can't describe that way.
+    ///
+    /// These keys never equal [`Tessellation::face_keys`]'.
+    pub fn tessellation_keys(
+        &self,
+        params: &TessellationParams,
+    ) -> Result<Vec<Option<FaceKey>>, Error> {
+        let raw_params = params.to_raw()?;
+        let count = self.face_count();
+        let mut keys = vec![[0u64; 2]; count];
+        let mut keyed = vec![0i32; count];
+        // SAFETY: self is a live brep on the kernel thread; keys holds two
+        // words and keyed one flag for each of its count faces.
+        let status = unsafe {
+            sys::sm_brep_tessellation_keys(
+                self.raw.as_ptr(),
+                &raw_params,
+                keys.as_mut_ptr().cast(),
+                keyed.as_mut_ptr(),
+                count,
+            )
+        };
+        Error::check("SmApiTessellate", status)?;
+        Ok(keys
+            .into_iter()
+            .zip(keyed)
+            .map(|(key, keyed)| (keyed != 0).then_some(FaceKey(key)))
+            .collect())
+    }
+
+    /// Triangulates the faces `wanted` marks, one flag per face, into a mesh
+    /// laid out as [`Tessellation::mesh`] lays it out, running SMLib's edge
+    /// splitting only for those faces and the faces sharing their edges.
+    ///
+    /// Each face's triangles are [`tessellate`](Brep::tessellate)'s for it
+    /// provided every face not wanted has the
+    /// [`tessellation_keys`](Brep::tessellation_keys) key of a face an
+    /// earlier `tessellate_some` triangulated: then no face's boundary needs
+    /// refining, which this checks only for the faces wanted, and a face's
+    /// key fixes its triangles. `None` when this can't vouch for its faces:
+    /// a wanted face's boundary needs refining, or something SMLib's whole
+    /// tessellation would recover from went wrong. Then
+    /// [`begin_tessellation`](Brep::begin_tessellation) tessellates the
+    /// whole solid.
+    pub fn tessellate_some(
+        &self,
+        params: &TessellationParams,
+        wanted: &[bool],
+    ) -> Result<Option<Mesh>, Error> {
+        let raw_params = params.to_raw()?;
+        let flags: Vec<u8> = wanted.iter().map(|&w| u8::from(w)).collect();
+        let mut out = ptr::null_mut();
+        // SAFETY: self is a live brep on the kernel thread; params and the
+        // flags outlive the call.
+        let status = unsafe {
+            sys::sm_brep_tessellate_some(
+                self.raw.as_ptr(),
+                &raw_params,
+                flags.as_ptr(),
+                flags.len(),
+                &mut out,
+            )
+        };
+        Error::check("SmApiTessellate", status)?;
+        let Some(raw) = NonNull::new(out) else {
+            return Ok(None);
+        };
+        // SAFETY: raw is a mesh the shim just allocated; we free it once,
+        // after copying its arrays out.
+        unsafe {
+            let mesh = Mesh::from_raw(raw.as_ptr());
+            sys::sm_mesh_free(raw.as_ptr());
+            Ok(Some(mesh))
+        }
     }
 }
 

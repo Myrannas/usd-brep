@@ -12,10 +12,13 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `a81ed1b` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: in a local operation, `ExtendTrimEdges` lifts a tangent edge from whichever side pointer order picks, which for a face that kept its surface is the old edge; the solid comes out open. | For `SM_OO_LOCAL_OPERATION`, lift from the side whose lifted midpoint lies on the other side's new surface, measured to the whole surface (exact for analytic surfaces and planar B-splines), not the G1-extended one. |
 | `fdc9c9b` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: when the curve replacing an open edge is closed (a plane meeting a sphere), `MateEdges` keeps the trim interval inside the curve's parameter range, which can be the far arc: an inside-out solid with no gaps. | Keep the arc nearer the original edge, re-anchoring the 3D and UV curves when it runs past the curve's seam, and only if they still agree. |
 | `c282328` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: `TrimExtendedEdge` trims against a not-yet-mated tangent neighbour's old UV curve, which in a local operation can describe the old corner. | For `SM_OO_LOCAL_OPERATION`, also offer the base vertex as a trim point when it lies on the new curve; the shim moves vertices it can place there for the operation. |
+| `4d13c5e` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: `Phase1SetupBrep` builds every face's surface cache and splits every edge, so a small edit still pays for the whole solid's edge preparation. | Add `SmTess::Phase1SetupFaces`, which sets up only the faces given (with caches for the faces sharing their edges, which split only those edges) exactly as `Phase1SetupBrep` would, and reports refinement or anything `Phase1SetupBrep` would recover from; and a `SplitFaceEdgesToUVSize` overload that splits only edges shared with given faces. Existing calls are unchanged. |
 
-`source/SM_API` is unmodified. Each patch changes only `SM_OO_LOCAL_OPERATION`
-(`SmBrep::LocalOperation` and the shim's face offset); solid offsets and
-shells take the code paths they always did.
+`source/SM_API` is unmodified. Each offset patch changes only
+`SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
+offset); solid offsets and shells take the code paths they always did. The
+tessellation patch only adds methods: `SmApiTessellate` and
+`Phase1SetupBrep` take the code paths they always did.
 
 ## Notes from the bring-up (no patch needed)
 

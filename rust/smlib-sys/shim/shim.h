@@ -443,6 +443,34 @@ sm_status sm_tessellation_mesh(sm_tessellation *tessellation, const uint8_t *wan
 /* Deletes a tessellation. NULL is ignored. */
 void sm_tessellation_free(sm_tessellation *tessellation);
 
+/* Tessellation of some faces only, with SMLib's edge splitting run for just
+ * those faces and their neighbours (SmTess::Phase1SetupFaces, a fork patch).
+ *
+ * sm_brep_tessellation_keys writes each face's key before tessellating: a
+ * 128-bit digest of everything the tessellation reads for the face when no
+ * face's boundary needs refining. That is the parameters, the brep's
+ * tolerance, the face's surface, domain, tolerance and loops (each edgeuse's
+ * UV trim curve, edge curve, interval and tolerance, and start vertex), and
+ * for each of its edges, every edgeuse's trim curve and the surface, domain,
+ * tolerance and order of the other faces using it. keys holds two words per
+ * face and keyed one flag per face, 0 for a face that can't be keyed (SMLib
+ * can't write its geometry). SM_SHIM_ERR_BAD_FACE when face_count isn't the
+ * brep's. These keys are distinct from sm_tessellation_face_key's.
+ *
+ * sm_brep_tessellate_some triangulates the faces `wanted` marks (one byte per
+ * face, non-zero to triangulate), laid out as sm_tessellation_mesh lays them
+ * out, each face's triangles and vertices being sm_brep_tessellate's for it,
+ * provided every face not wanted has the key of a face an earlier
+ * sm_brep_tessellate_some triangulated. *out is NULL when it can't vouch for
+ * that: when a wanted face's boundary needs refining, or set-up of one of
+ * them fails or can't be matched; sm_brep_tessellation_begin then
+ * tessellates the brep. SM_SHIM_ERR_BAD_FACE when wanted_count isn't the face
+ * count. The brep isn't changed. */
+sm_status sm_brep_tessellation_keys(sm_brep *brep, const sm_tessellation_params *params, uint64_t *keys,
+                                    int32_t *keyed, size_t face_count);
+sm_status sm_brep_tessellate_some(sm_brep *brep, const sm_tessellation_params *params, const uint8_t *wanted,
+                                  size_t wanted_count, sm_mesh **out);
+
 #ifdef __cplusplus
 }
 #endif

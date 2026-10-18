@@ -111,4 +111,4 @@ impl Drop for Tessellation<'_> {
 
 /// What a face's triangles depend on, from [`Tessellation::face_keys`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FaceKey([u64; 2]);
+pub struct FaceKey(pub(crate) [u64; 2]);
