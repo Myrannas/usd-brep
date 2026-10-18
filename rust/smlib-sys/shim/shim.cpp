@@ -1169,7 +1169,7 @@ bool lands_like(const SmFace* face, const Motion& motion, const SmVector3d& shif
 // known. That loses precision, fails outright where two equal fillets meet
 // at a corner (their cylinders touch tangentially at its tip), and on tangent
 // edges between a moved face and a kept one lifts whichever side's old trim
-// curve comes first in pointer order, which is the old edge half the time.
+// curve the executive meets first, which is the old edge half the time.
 class RigidMoveGeometry : public SmLocalOperationGeometryCreation {
 public:
     RigidMoveGeometry(double distance, double tolerance, SmTArray<SmFace*>& faces, SmTArray<SmSurface*>& surfaces,
@@ -1319,8 +1319,8 @@ private:
     // beside a pushed wall. Both its faces land as no move would put them
     // (kept, or moved within their own surfaces), it isn't a seam, and both
     // ends are placed (aim_vertices) on the line, in the same order. Mating
-    // such an edge lifts one face's old trim curve, which picks a side in
-    // pointer order and so varies in the last digits from run to run.
+    // such an edge lifts the old trim curve of whichever face the executive
+    // meets first, which is off in the last digits.
     bool stretched_line(const SmContext& context, const SmEdge* edge, SmPoint3d& from, SmPoint3d& to) const {
         SmVector3d direction;
         if (!straight(edge, direction)) return false;
@@ -1381,8 +1381,8 @@ private:
     }
 
     // Before the executive mates any edge, moves every rigid one and marks its
-    // edgeuses as mated. Its neighbours then find its moved ends whichever
-    // order the executive's pointer-keyed maps give: a tangent neighbour that
+    // edgeuses as mated. Its neighbours then find its moved ends whatever
+    // order the executive mates them in: a tangent neighbour that
     // isn't marked yet is trimmed against its old trim curve instead, which
     // puts it back at the old corner.
     void move_rigid_edges(const SmContext& context, SmOffsetExecutive* executive, SmBrep* brep, SmMarkType mark) {
@@ -1741,12 +1741,16 @@ sm_status offset_faces(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     sm_status result = plan_offset(picked, distance, brep.GetTolerance(), motions);
     if (result != SM_SUCCESS) return result;
 
+    // In the brep's face order, not the map's (by address): the analytic
+    // surfaces restored afterwards are tried in this order.
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
     SmTArray<SmFace*> changed;
     SmTArray<SmSurface*> surfaces;
     double reach = std::fabs(distance);
-    for (const auto& entry : motions) {
-        SmFace* face = const_cast<SmFace*>(entry.first);
-        const Motion& motion = entry.second;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmFace* face = faces[i];
+        const Motion motion = motion_of(motions, face);
         SmSurface* surface = nullptr;
         if (motion.kind == Motion::kShift) {
             result = translated_surface(face, motion.shift, surface);
