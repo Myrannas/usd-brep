@@ -2826,6 +2826,296 @@ sm_status cut_over(const SmBrep& swept, const Obstacle& obstacle, std::unique_pt
     return SM_SUCCESS;
 }
 
+// Where an offset of one face can sweep, as boxes in a frame (origin; u, v,
+// and w = u x v): for a plane, in its frame, the slab between its old and
+// new places across the whole part; for a curved face, in the world's axes,
+// its box grown by the distance; and each blend moving with it, from where it
+// is to where it goes. What the part has alike before and after away from
+// the move, such as a vent beside a pushed side, is outside them.
+struct Region {
+    struct Box {
+        double low[3] = {HUGE_VAL, HUGE_VAL, HUGE_VAL};
+        double high[3] = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+    };
+    SmPoint3d origin;
+    SmVector3d axes[3];
+    // The picked face's first: a plane's slab when `slab`, which spans the
+    // part along u and v.
+    std::vector<Box> boxes;
+    bool slab = false;
+    double distance = 0.0;
+
+    void at(const SmPoint3d& p, double c[3]) const {
+        for (int k = 0; k < 3; ++k) c[k] = (p - origin).Dot(axes[k]);
+    }
+    // Grows `box` to take in `p` and everything within `grow` of it, along
+    // the first `count` axes.
+    void add(Box& box, const SmPoint3d& p, double grow, int count = 3) const {
+        double c[3];
+        at(p, c);
+        for (int k = 0; k < count; ++k) {
+            box.low[k] = std::min(box.low[k], c[k] - grow);
+            box.high[k] = std::max(box.high[k], c[k] + grow);
+        }
+    }
+    // Whether `c` lies inside a box but the one at `except`, `by` clear of its
+    // walls.
+    bool holds(const double c[3], size_t except, double by) const {
+        for (size_t b = 0; b < boxes.size(); ++b) {
+            bool inside = b != except;
+            for (int k = 0; k < 3; ++k) inside = inside && c[k] > boxes[b].low[k] + by && c[k] < boxes[b].high[k] - by;
+            if (inside) return true;
+        }
+        return false;
+    }
+};
+
+// The region an offset of `moved` by `distance` sweeps, short of a slab's
+// span; false when that isn't one picked face.
+bool region_of(const SmBrep& brep, const SmTArray<SmFace*>& moved, double distance, Region& out) {
+    Motions motions;
+    if (moved.GetSize() != 1 || plan_offset(moved, distance, brep.GetTolerance(), motions) != SM_SUCCESS) return false;
+    out.slab = frame_of(moved[0], out.origin, out.axes[0], out.axes[1], out.axes[2]);
+    if (!out.slab) {
+        out.origin = SmPoint3d(0.0, 0.0, 0.0);
+        out.axes[0] = SmVector3d(1.0, 0.0, 0.0);
+        out.axes[1] = SmVector3d(0.0, 1.0, 0.0);
+        out.axes[2] = SmVector3d(0.0, 0.0, 1.0);
+    }
+    out.distance = distance;
+    out.boxes.emplace_back();
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const Motion motion = motion_of(motions, faces[i]);
+        if (motion.kind == Motion::kKept) continue;
+        if (faces[i] != moved[0]) out.boxes.emplace_back();
+        Region::Box& box = faces[i] == moved[0] ? out.boxes.front() : out.boxes.back();
+        std::vector<SmPoint3d> points;
+        face_points(faces[i], points);
+        box_corners(faces[i], points);
+        for (const SmPoint3d& p : points) {
+            if (motion.kind == Motion::kShift) {
+                out.add(box, p, 0.0);
+                out.add(box, p + motion.shift, 0.0);
+            } else {
+                out.add(box, p, std::fabs(distance));
+            }
+        }
+    }
+    return out.boxes.front().low[0] <= out.boxes.front().high[0];
+}
+
+// A face's extents in a region's frame; along which axes a wall across
+// would cut it cleanly, the face running straight through it (a plane square
+// to the wall, a cylinder along its normal); and whether it's a surface a
+// boolean is slow to match where it coincides (canonical).
+struct Extent {
+    double low[3] = {HUGE_VAL, HUGE_VAL, HUGE_VAL};
+    double high[3] = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+    bool clean[3] = {false, false, false};
+    bool slow = false;
+};
+
+void add_extents(const Region& region, const SmBrep& brep, std::vector<Extent>& out) {
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const SmSurface* surface = faces[i]->GetSurface();
+        Extent extent;
+        std::vector<SmPoint3d> points;
+        face_points(faces[i], points);
+        box_corners(faces[i], points);
+        for (const SmPoint3d& p : points) {
+            double c[3];
+            region.at(p, c);
+            for (int k = 0; k < 3; ++k) {
+                extent.low[k] = std::min(extent.low[k], c[k]);
+                extent.high[k] = std::max(extent.high[k], c[k]);
+            }
+        }
+        for (int k = 0; k < 3; ++k) extent.clean[k] = surface && invariant_under(surface, region.axes[k]);
+        extent.slow = !surface || !canonical(surface);
+        out.push_back(extent);
+    }
+}
+
+// Whether a face with `extent` would meet the wall across `axis` at `wall`
+// of the box at `index` only inside another box, where the wall isn't the
+// region's.
+bool met_inside(const Region& region, size_t index, int axis, double wall, const Extent& extent, double tolerance) {
+    const Region::Box& box = region.boxes[index];
+    for (size_t b = 0; b < region.boxes.size(); ++b) {
+        const Region::Box& other = region.boxes[b];
+        bool holds = b != index && wall > other.low[axis] + tolerance && wall < other.high[axis] - tolerance;
+        for (int j = 0; j < 3; ++j) {
+            holds = holds && (j == axis || (std::max(extent.low[j], box.low[j]) > other.low[j] + tolerance &&
+                                            std::min(extent.high[j], box.high[j]) < other.high[j] - tolerance));
+        }
+        if (holds) return true;
+    }
+    return false;
+}
+
+// Sets the region's walls `margin` out from its boxes, then moves each wall
+// off each face that it would cut but not cleanly (see Extent), or only
+// touch: in between the face and what the box must hold, if there's room,
+// or else out past the face. Cut any other way (a vent's wall from the side,
+// its B-spline chamfer), what's left inside meets the whole face in the other
+// operand, partly coincident, and the kernel can crash on that. False if the
+// walls don't settle.
+bool clear_walls(Region& region, const std::vector<Extent>& extents, double margin, double tolerance) {
+    const std::vector<Region::Box> held = region.boxes;
+    for (Region::Box& box : region.boxes) {
+        for (int k = 0; k < 3; ++k) {
+            box.low[k] -= margin;
+            box.high[k] += margin;
+        }
+    }
+    // The least room between a face and what a box holds to put a wall in.
+    const double room = std::max(0.1, 100.0 * tolerance);
+    for (int round = 0; round < 64; ++round) {
+        bool moved = false;
+        for (size_t b = 0; b < region.boxes.size(); ++b) {
+            Region::Box& box = region.boxes[b];
+            for (int k = 0; k < 3; ++k) {
+                for (int side = 0; side < 2; ++side) {
+                    double& wall = side ? box.high[k] : box.low[k];
+                    for (const Extent& extent : extents) {
+                        bool across = extent.low[k] <= wall + tolerance && extent.high[k] >= wall - tolerance;
+                        for (int j = 0; j < 3; ++j) {
+                            across = across && (j == k || (extent.low[j] <= box.high[j] + tolerance &&
+                                                           extent.high[j] >= box.low[j] - tolerance));
+                        }
+                        const bool through = extent.low[k] < wall - tolerance && extent.high[k] > wall + tolerance;
+                        if (!across || (through && extent.clean[k]) ||
+                            met_inside(region, b, k, wall, extent, tolerance)) {
+                            continue;
+                        }
+                        const double out = side ? 1.0 : -1.0;
+                        const double hold = side ? held[b].high[k] : held[b].low[k];
+                        const double near = side ? extent.low[k] : extent.high[k];
+                        const double far = side ? extent.high[k] : extent.low[k];
+                        wall = (near - hold) * out > room ? 0.5 * (hold + near) : far + out * margin;
+                        moved = true;
+                    }
+                }
+            }
+        }
+        if (!moved) return true;
+    }
+    return false;
+}
+
+// Whether the region leaves out a face that's slow to match (see Extent):
+// otherwise taking the swept region inside it saves nothing.
+bool leaves_out_slow(const Region& region, const std::vector<Extent>& extents) {
+    for (const Extent& extent : extents) {
+        bool apart = extent.slow;
+        for (const Region::Box& box : region.boxes) {
+            bool meets = true;
+            for (int k = 0; k < 3; ++k) meets = meets && extent.low[k] <= box.high[k] && extent.high[k] >= box.low[k];
+            apart = apart && !meets;
+        }
+        if (apart) return true;
+    }
+    return false;
+}
+
+// Whether a face of `brep` lies on the region's boundary: then the region
+// cut through it.
+bool reaches_walls(const SmBrep& brep, const Region& region) {
+    const double tolerance = 10.0 * brep.GetTolerance();
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        double normal[3];
+        if (!outward_plane(faces[i], normal)) continue;
+        SmPoint3d inside;
+        if (SmApiFaceInternalPoint(faces[i], inside) != SM_SUCCESS) return true;
+        const SmVector3d n(normal[0], normal[1], normal[2]);
+        double c[3];
+        region.at(inside, c);
+        for (size_t b = 0; b < region.boxes.size(); ++b) {
+            const Region::Box& box = region.boxes[b];
+            for (int k = 0; k < 3; ++k) {
+                if (std::fabs(std::fabs(n.Dot(region.axes[k])) - 1.0) > 1e-9 ||
+                    (std::fabs(c[k] - box.low[k]) > tolerance && std::fabs(c[k] - box.high[k]) > tolerance)) {
+                    continue;
+                }
+                bool on_wall = true;
+                for (int j = 0; j < 3; ++j) {
+                    on_wall =
+                        on_wall && (j == k || (c[j] >= box.low[j] - tolerance && c[j] <= box.high[j] + tolerance));
+                }
+                if (on_wall && !region.holds(c, b, tolerance)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// What an offset swept through, from the part `before` and `after` it: what
+// it took, pushed in, or added, pulled out; into `before`. The two share
+// most faces, and where they share one a boolean is slow to match (a vent's
+// B-spline chamfer beside a pushed side), so when the region leaves such a
+// face out, only what lies in the region is taken. That's the same unless
+// the region cut through what was swept, and then the whole is taken after
+// all.
+sm_status swept_between(std::unique_ptr<SmBrep>& before, const SmBrep& after, bool pushed, const Region* given) {
+    if (given) {
+        Region region = *given;
+        if (region.slab) {
+            for (const SmBrep* brep : {static_cast<const SmBrep*>(before.get()), &after}) {
+                SmExtent3d bounds;
+                if (brep->CalculateBoundingBox(bounds) != SM_SUCCESS) return SM_ERR;
+                const SmPoint3d low = bounds.GetMin();
+                const SmPoint3d high = bounds.GetMax();
+                for (int k = 0; k < 8; ++k) {
+                    const SmPoint3d corner(k & 1 ? high.x : low.x, k & 2 ? high.y : low.y, k & 4 ? high.z : low.z);
+                    region.add(region.boxes.front(), corner, 0.0, 2);
+                }
+            }
+        }
+        // A margin keeps the walls off what was swept.
+        const double margin = 1.0 + 0.01 * std::fabs(region.distance);
+        std::vector<Extent> extents;
+        add_extents(region, *before, extents);
+        add_extents(region, after, extents);
+        const double tolerance = 10.0 * std::max(before->GetTolerance(), after.GetTolerance());
+        bool good = clear_walls(region, extents, margin, tolerance) && leaves_out_slow(region, extents);
+        std::unique_ptr<SmBrep> shape;
+        for (size_t b = 0; b < region.boxes.size() && good; ++b) {
+            std::unique_ptr<SmBrep> box;
+            const Region::Box& at = region.boxes[b];
+            good = frame_box(region.origin, region.axes[0], region.axes[1], at.low, at.high, box) == SM_SUCCESS;
+            if (good && !shape) {
+                shape = std::move(box);
+            } else if (good) {
+                good = boolean_into(SmApiBooleanUnion, shape, std::move(box)) == SM_SUCCESS;
+            }
+        }
+        std::unique_ptr<SmBrep> inside;
+        std::unique_ptr<SmBrep> other;
+        if (good && copy_of(pushed ? *before : after, inside) == SM_SUCCESS &&
+            boolean_into(SmApiBooleanIntersection, inside, std::move(shape)) == SM_SUCCESS &&
+            copy_of(pushed ? after : *before, other) == SM_SUCCESS &&
+            boolean_into(SmApiBooleanDifference, inside, std::move(other)) == SM_SUCCESS &&
+            !reaches_walls(*inside, region)) {
+            before = std::move(inside);
+            return SM_SUCCESS;
+        }
+    }
+    std::unique_ptr<SmBrep> other;
+    sm_status status = copy_of(after, other);
+    if (status != SM_SUCCESS) return status;
+    if (pushed) return boolean_into(SmApiBooleanDifference, before, std::move(other));
+    status = boolean_into(SmApiBooleanDifference, other, std::move(before));
+    if (status != SM_SUCCESS) return status;
+    before = std::move(other);
+    return SM_SUCCESS;
+}
+
 // Offsets the picked faces through `obstacles` (see find_obstacles), in place.
 sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance,
                        const std::vector<Obstacle>& obstacles) {
@@ -2885,18 +3175,12 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     const bool cut_bosses = curved && pushed && !bosses.empty();
     std::unique_ptr<SmBrep> swept;
     if ((holed || cut_bosses) && (status = copy_of(*work, swept)) != SM_SUCCESS) return status;
+    Region region;
+    const bool bounded = swept && region_of(*work, moved, distance, region);
     status = keeping_topology(*work, [&] { return offset_faces(*work, moved, distance); });
     if (status != SM_SUCCESS) return status;
     if (swept) {
-        std::unique_ptr<SmBrep> after;
-        if ((status = copy_of(*work, after)) != SM_SUCCESS) return status;
-        if (pushed) {
-            status = boolean_into(SmApiBooleanDifference, swept, std::move(after));
-        } else {
-            status = boolean_into(SmApiBooleanDifference, after, std::move(swept));
-            swept = std::move(after);
-        }
-        if (status != SM_SUCCESS) return status;
+        if ((status = swept_between(swept, *work, pushed, bounded ? &region : nullptr)) != SM_SUCCESS) return status;
     }
 
     // The holes back: the part with its holes, less what the offset took (or
