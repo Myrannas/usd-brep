@@ -176,6 +176,13 @@ public:
   // and used only to split edges, to another face whose surface is identical
   // and a tessellation with the same parameters.
   void SetFace(SmFace * pFace, SmSurfaceTessDriver * pSurfaceTessDriver);
+
+  // game-cad patch: a deep copy of a cache BuildTree has built but not yet given
+  // a boundary, for pFace, whose surface is identical, in a tessellation with
+  // the same parameters. NULL when this cache holds anything else or memory
+  // runs out. Phase 2 subdivides and labels the tree, so a store keeps the
+  // original and hands out copies.
+  SmTessSrfCache * Copy(SmFace * pFace, SmSurfaceTessDriver * pSurfaceTessDriver) const;
   SmPolyBrep * GetTS_PolyBrep() const { return mTS_pPolyBrep ; }
 
   SmStatus ImplantUVSegment(SmPolyEdge* pSegment);
@@ -523,7 +530,10 @@ PURPOSE: game-cad patch: keeps surface caches from one SmTess::Phase1SetupFaces
 
 NOTES: Phase1SetupFaces asks the store for each face's cache before building
     one, and gives it back the caches of faces it used only to split edges
-    those faces share, which are still as BuildTree left them.
+    those faces share, which are still as BuildTree left them. A face it
+    tessellates gets a copy (SmTessSrfCache::Copy) of a cache it takes, and
+    the store keeps the cache copied; a face that builds its cache gives the
+    store a copy when WantsCopy says to.
 ***********************************************************************/
 class SM_EXPORT SmTessSrfCacheStore
 {
@@ -534,8 +544,14 @@ public:
   // a surface identical to pFace's, or NULL. The caller owns it.
   virtual SmTessSrfCache * Take(SmFace * pFace) = 0;
 
-  // pFace's cache, used only to split edges: the store owns it.
+  // pFace's cache, as BuildTree left it or used only to split edges: the
+  // store owns it.
   virtual void Keep(SmFace * pFace, SmTessSrfCache * pSC) = 0;
+
+  // TRUE to keep a copy of the cache just built for pFace, a face being
+  // tessellated, before Phase 2 changes it: worth it when a later call will
+  // want a cache for the same surface.
+  virtual SmBoolean WantsCopy(SmFace * pFace) { return TRUE; }
 } ;
 
 class SM_EXPORT SmTess

@@ -122,8 +122,14 @@ pub struct FaceKey(pub(crate) [u64; 2]);
 /// whose surfaces are identical to an earlier face's can share it. Caches
 /// SMLib used only to split edges a wanted face shares are kept here, and
 /// faces with identical surfaces take them rather than building their own.
-/// The store keeps the caches kept by its last two calls that triangulated
-/// any face.
+///
+/// Triangulating a face changes its cache, so a wanted face takes a copy
+/// and the cache stays here for the next call. A wanted face that builds its
+/// cache leaves a copy here when one of the last two calls built a cache for
+/// the same surface: in a drag, the faces whose boundaries move while their
+/// surfaces stay, and not the faces whose surfaces change every step. The
+/// store keeps the caches kept by its last two calls that triangulated any
+/// face.
 pub struct SurfaceCaches {
     raw: NonNull<sys::sm_surface_caches>,
     _not_send: PhantomData<*mut ()>,

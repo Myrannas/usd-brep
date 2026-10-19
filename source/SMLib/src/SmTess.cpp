@@ -19,6 +19,7 @@
 #include <SmHermiteCurve.h>
 #include <SmTrimmingTools.h>
 #include <SmNurbsSrf.h>
+#include <nurbs.h>    // game-cad patch: gw_SURFACE, for SmTessSrfCache::Copy
 #include <SmGeomUtility.h>
 #include <SmVertex.h>
 #include <SmEdge.h>
@@ -31,6 +32,10 @@
 #include <atomic>
 #include <unordered_set>
 #include <iterator>
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <vector>
 
 #ifdef SM_USE_TBB
 #include "tbb/parallel_for.h"
@@ -11935,7 +11940,10 @@ NOTES:
   or given to pOptStore, so only the faces given can go on to
   Phase2CreateFacePolygons. With pOptStore, a face takes the store's cache for
   an identical surface, if it has one, rather than building one: a cache
-  depends only on its surface and the parameters.
+  depends only on its surface and the parameters. Phase 2 changes a cache, so
+  a face given gets a copy (SmTessSrfCache::Copy) of a cache it takes, and the
+  store keeps the cache copied; a face given that builds its cache gives the
+  store a copy when the store wants one.
 
   increments an unlocked mark value
 ***********************************************************************/
@@ -12019,14 +12027,35 @@ SmStatus SmTess::Phase1SetupFaces
       pFace->SetIsRectangularTrim(bRectangularTrim);
       sRectangularTrim.Add(bRectangularTrim);
 
-      SmTessSrfCache * pSC = pOptStore ? pOptStore->Take(pFace) : NULL;
+      // Phase 2 changes a cache, so a face to tessellate gets a copy and the
+      // store keeps the cache as BuildTree left it.
+      SmBoolean        bWanted = sWanted.count(pFace) > 0;
+      SmTessSrfCache * pSC     = pOptStore ? pOptStore->Take(pFace) : NULL;
       if (pSC)
         {
-          pSC->SetFace(pFace, &m_rSurfaceTess);
+          SmTessSrfCache * pCopy = bWanted ? pSC->Copy(pFace, &m_rSurfaceTess) : NULL;
+          if (pCopy)
+            {
+              pOptStore->Keep(pFace, pSC);
+              pSC = pCopy;
+            }
+          else
+            { pSC->SetFace(pFace, &m_rSurfaceTess); }
           m_vCache.RelatePair(pFace, pSC);
         }
       else if (CreateFaceTessCache(pFace) != SM_SUCCESS)
         { return SM_SUCCESS; } // Phase1SetupBrep fails the face
+      else if (pOptStore && bWanted && pOptStore->WantsCopy(pFace))
+        {
+          pSC = m_vCache.GetSecond(pFace);
+          SmTessSrfCache * pCopy = pSC->Copy(pFace, &m_rSurfaceTess);
+          if (pCopy)
+            {
+              m_vCache.RemovePair(pFace, pSC);
+              m_vCache.RelatePair(pFace, pCopy);
+              pOptStore->Keep(pFace, pSC);
+            }
+        }
     }
 
   // This creates SmEdges.
@@ -14900,17 +14929,310 @@ PURPOSE: game-cad patch: moves a cache SmTess::Phase1SetupFaces built for one
 
 NOTES: The tree depends only on the surface and the parameters. The bounding
     planes are computed again from the new surface when they're next needed.
+    Nodes that point to the old face's surface (all of an analytic surface's)
+    point to the new face's, as a tree built for it would, so the cache can
+    still be copied (Copy).
 ***********************************************************************/
 void SmTessSrfCache::SetFace
  (SmFace              * pFace,               // in : face with a surface identical to the cache's
   SmSurfaceTessDriver * pSurfaceTessDriver)  // in : the new tessellation's driver
 {
+  const SmSurface * cpOldSurface = m_cpSurface;
+
   m_pFace              = pFace;
   m_pSurfaceTessDriver = pSurfaceTessDriver;
   m_cpSurface          = pFace->GetSurface();
   m_sBoundingPlanes    = SmPatchBoundaryBoundingPlanes(m_cpSurface, m_sUVDomain);
 
+  ULONG ii;
+  ULONG lAuxs = m_sAuxMgr.GetNumActiveElements();
+  for (ii=0; ii<lAuxs; ii++)
+    {
+      SmBezierAux2d * pAux = (SmBezierAux2d*)m_sAuxMgr.GetAt(ii);
+      if (pAux->mBA_pSurface == cpOldSurface)
+        { pAux->mBA_pSurface = m_cpSurface; }
+    }
+  ULONG lBezs = m_sBezMgr.GetNumActiveElements();
+  for (ii=0; ii<lBezs; ii++)
+    {
+      SmBezierPatch * pBez = (SmBezierPatch*)m_sBezMgr.GetAt(ii);
+      if (pBez->mBA_pSurface == cpOldSurface)
+        { pBez->mBA_pSurface = m_cpSurface; }
+    }
+
 } // end SmTessSrfCache::SetFace
+
+namespace {
+
+/*******************************************************************//**
+PURPOSE: game-cad patch: maps the active elements of a SmMemBlockMgr to their
+    copies in another, made with SmMemBlockMgr::CopyFrom.
+
+NOTES: Elements are found by block, trying the last block found first: a
+    node's neighbours and data are mostly in the same block.
+***********************************************************************/
+class SmElementCopies
+{
+  struct Block { uintptr_t m_lFrom; char * m_pTo; size_t m_lBytes; };
+  std::vector<Block> m_sBlocks;
+  ULONG              m_lElementSize;
+  mutable size_t     m_lLast = 0;
+
+public:
+  SmElementCopies(const SmMemBlockMgr & crFrom, SmMemBlockMgr & rTo)
+   : m_lElementSize(rTo.GetElementSize())
+  {
+    ULONG lPerBlock = crFrom.GetNumElementsPerBlock();
+    ULONG lActive   = crFrom.GetNumActiveElements();
+    for (ULONG ii=0; lPerBlock > 0 && ii*lPerBlock < lActive; ii++)
+      {
+        ULONG lInBlock = smos_Min(lPerBlock, lActive - ii*lPerBlock);
+        m_sBlocks.push_back({(uintptr_t)crFrom.GetBlock(ii), rTo.GetBlock(ii), (size_t)lInBlock * m_lElementSize});
+      }
+  }
+
+  // rpElement's copy in place of rpElement, which may be NULL
+  // rtn: FALSE when rpElement isn't one of the active elements copied
+  template<class TYPE>
+  SmBoolean Map(TYPE *& rpElement) const
+  {
+    if (rpElement == NULL)
+      { return TRUE; }
+    uintptr_t lElement = (uintptr_t)rpElement;
+    for (size_t ii=0; ii<m_sBlocks.size(); ii++)
+      {
+        size_t        lBlock = (m_lLast + ii) % m_sBlocks.size();
+        const Block & rBlock = m_sBlocks[lBlock];
+        if (lElement < rBlock.m_lFrom || lElement - rBlock.m_lFrom >= rBlock.m_lBytes)
+          { continue; }
+        size_t lOffset = (size_t)(lElement - rBlock.m_lFrom);
+        if (lOffset % m_lElementSize != 0)
+          { return FALSE; }
+        m_lLast   = lBlock;
+        rpElement = (TYPE*)(rBlock.m_pTo + lOffset);
+        return TRUE;
+      }
+    return FALSE;
+  }
+};
+
+} // namespace
+
+/*******************************************************************//**
+PURPOSE: game-cad patch: a deep copy of a cache BuildTree has built but not yet
+    given a boundary, for pFace, whose surface is identical, in a tessellation
+    with the same parameters.
+
+NOTES: Phase 2 subdivides the tree and labels its nodes, so a cache can't be
+    used twice: SmTess::Phase1SetupFaces keeps the original in its store and
+    gives the face this copy.
+
+    BuildTree's tree lives in fixed-size elements of block managers (nodes,
+    their SmBezierAux2d or SmBezierPatch data), which hold no virtual
+    functions, so the copy copies those blocks byte for byte and maps their
+    pointers to the copied elements. A B-spline surface's tree also points to
+    the subdivision surfaces that built it (until Phase 2's BuildTree frees
+    them): those are copied with their exact knots, since the copy
+    constructor tidies knots. Pointers to the cache's surface go to pFace's.
+    The bounding planes are computed again from the new surface when needed,
+    as for SetFace.
+
+    Anything a boundary, point solves or intersections add (UVTrimCurve
+    lists, PolyBrep, iso boundary curves, alternate caches) makes the cache
+    one this doesn't copy: it returns NULL.
+***********************************************************************/
+SmTessSrfCache * SmTessSrfCache::Copy
+ (SmFace              * pFace,               // in : face with a surface identical to the cache's
+  SmSurfaceTessDriver * pSurfaceTessDriver)  // in : the new tessellation's driver
+ const
+{
+  ULONG ii, jj;
+
+  if (   m_pTree == NULL
+      || mTS_pPolyBrep != NULL
+      || m_bHaveTSurfaceCache
+      || m_bFaceContainmentDone != FALSE
+      || m_lNumAltCaches != 0
+      || m_apIsoBoundaryCurves[0] != NULL
+      || m_lUseCount != 0
+      || m_bDeleted
+      || m_sVLMgr.GetNumActiveElements() != 0
+      || m_sEdgeuseListMgr.GetNumActiveElements() != 0
+      || m_sPolyEdgeListMgr.GetNumActiveElements() != 0
+      || m_pTree->m_pOwner != this
+      || m_pTree->m_sListMgr.GetNumActiveElements() != 0
+      || m_pTree->m_sTreeVertices.GetSize() != 0)
+    { return NULL; }
+
+  const SmSurface * cpSurface = pFace->GetSurface();
+  SmTessSrfCache  * pCopy     = new (*GetContext()) SmTessSrfCache
+      (pFace, NULL, pSurfaceTessDriver,
+       m_dChordHeightTolerance, m_dAngTolRad, m_dMaximumSideLength3D,
+       m_dMinimumSideLength3D, m_dMinimumSideLengthRatioUV, m_dAspectRatio3D);
+  if (pCopy == NULL)
+    { return NULL; }
+  SmObjDelete sCleanup(pCopy);
+
+  // SmSurfaceCache values
+  pCopy->m_sUVDomain                     = m_sUVDomain;
+  *pCopy->m_pUContinuities               = *m_pUContinuities;
+  *pCopy->m_pVContinuities               = *m_pVContinuities;
+  pCopy->m_lBezierSize                   = m_lBezierSize;
+  pCopy->m_lTotalBezSize                 = m_lTotalBezSize;
+  pCopy->m_dChordHeightTolerance         = m_dChordHeightTolerance;
+  pCopy->m_dAngTolRad                    = m_dAngTolRad;
+  pCopy->m_dAspectRatio3D                = m_dAspectRatio3D;
+  pCopy->m_dMaximumSideLength3D          = m_dMaximumSideLength3D;
+  pCopy->m_dMinimumSideLength3D          = m_dMinimumSideLength3D;
+  pCopy->m_dMinimumSideLengthRatioUV     = m_dMinimumSideLengthRatioUV;
+  pCopy->m_dIsoCurveTolerance            = m_dIsoCurveTolerance;
+  pCopy->m_eTessellationAlgorithm        = m_eTessellationAlgorithm;
+  pCopy->m_dStartFastSubdivisionAngleDeg = m_dStartFastSubdivisionAngleDeg;
+  pCopy->m_bSwitchToFastSubdivision      = m_bSwitchToFastSubdivision;
+  pCopy->m_dTrimSubdivisionFactor        = m_dTrimSubdivisionFactor;
+  pCopy->m_sBoundingPlanes               = SmPatchBoundaryBoundingPlanes(cpSurface, m_sUVDomain);
+  pCopy->m_bHaveTSurfaceCache            = m_bHaveTSurfaceCache;
+  pCopy->m_bFaceWasModified              = m_bFaceWasModified;
+  pCopy->m_bProcessBoundaryCurves        = m_bProcessBoundaryCurves;
+  pCopy->m_bPointTestEnabled             = m_bPointTestEnabled;
+  pCopy->m_bFaceContainmentDone          = m_bFaceContainmentDone;
+
+  // the subdivision surfaces, by original
+  std::vector<std::pair<const SmSurface*, SmSurface*>> sSurfaces;
+  sSurfaces.reserve(m_sSubdivisionSurfaces.GetSize());
+  for (ii=0; ii<m_sSubdivisionSurfaces.GetSize(); ii++)
+    {
+      const SmSurface * cpFrom = m_sSubdivisionSurfaces[ii];
+      if (cpFrom == NULL || cpFrom->GetType() != SmBSplineSurface_TYPE)
+        { return NULL; }
+      const SmBSplineSurface * cpFromBSS = (const SmBSplineSurface*)cpFrom;
+      const gw_SURFACE       * cpFromNurb = cpFromBSS->GetGwNurbPointer();
+      if (cpFromNurb == NULL)
+        { return NULL; }
+
+      SmBSplineSurface * pTo = new (*cpFrom->GetContext()) SmBSplineSurface(*cpFromBSS);
+      if (pTo == NULL)
+        { return NULL; }
+      pCopy->m_sSubdivisionSurfaces.Add(pTo); // the copy deletes it
+      gw_SURFACE * pToNurb = pTo->GetGwNurbPointer();
+      if (   pToNurb == NULL
+          || pToNurb->knu->m != cpFromNurb->knu->m
+          || pToNurb->knv->m != cpFromNurb->knv->m)
+        { return NULL; }
+      memcpy(pToNurb->knu->U, cpFromNurb->knu->U, sizeof(gw_REAL) * ((size_t)cpFromNurb->knu->m + 1));
+      memcpy(pToNurb->knv->U, cpFromNurb->knv->U, sizeof(gw_REAL) * ((size_t)cpFromNurb->knv->m + 1));
+      sSurfaces.push_back({cpFrom, pTo});
+    }
+  std::sort(sSurfaces.begin(), sSurfaces.end(),
+            [](const std::pair<const SmSurface*, SmSurface*> & a,
+               const std::pair<const SmSurface*, SmSurface*> & b)
+            { return std::less<const SmSurface*>()(a.first, b.first); });
+
+  // the tree, its nodes and their data, byte for byte
+  SmTree * pTree = new (*GetContext()) SmTree(pCopy);
+  if (pTree == NULL)
+    { return NULL; }
+  pCopy->m_pTree = pTree;
+  pTree->m_lMaxElementsPerNode = m_pTree->m_lMaxElementsPerNode;
+  pTree->m_dMinSizeRatio       = m_pTree->m_dMinSizeRatio;
+  pTree->m_dNodeReduction      = m_pTree->m_dNodeReduction;
+  if (   !pTree->m_sNodeMgr.CopyFrom(m_pTree->m_sNodeMgr)
+      || !pTree->m_sListMgr.CopyFrom(m_pTree->m_sListMgr)
+      || !pCopy->m_sBezMgr.CopyFrom(m_sBezMgr)
+      || !pCopy->m_sAuxMgr.CopyFrom(m_sAuxMgr)
+      || !pCopy->m_sVLMgr.CopyFrom(m_sVLMgr)
+      || !pCopy->m_sEdgeuseListMgr.CopyFrom(m_sEdgeuseListMgr)
+      || !pCopy->m_sPolyEdgeListMgr.CopyFrom(m_sPolyEdgeListMgr))
+    { return NULL; }
+
+  // pointers to the copies
+  const SmElementCopies sNodes(m_pTree->m_sNodeMgr, pTree->m_sNodeMgr);
+  const SmElementCopies sAuxs (m_sAuxMgr, pCopy->m_sAuxMgr);
+  const SmElementCopies sBezs (m_sBezMgr, pCopy->m_sBezMgr);
+
+  pTree->m_pTopNode = m_pTree->m_pTopNode;
+  if (!sNodes.Map(pTree->m_pTopNode))
+    { return NULL; }
+
+  ULONG lNodes = pTree->m_sNodeMgr.GetNumActiveElements();
+  for (ii=0; ii<lNodes; ii++)
+    {
+      SmTreeNode * pNode = (SmTreeNode*)pTree->m_sNodeMgr.GetAt(ii);
+      if (pNode->m_pTree == m_pTree)
+        { pNode->m_pTree = pTree; }
+      else if (pNode->m_pTree != NULL)
+        { return NULL; }
+      if (   !sNodes.Map(pNode->m_pParent)
+          || !sNodes.Map(pNode->m_pChild1)
+          || !sNodes.Map(pNode->m_pChild2))
+        { return NULL; }
+      switch (pNode->m_eAuxDataType)
+        {
+          case SM_AD_NONE:
+            if (pNode->m_pData != NULL)
+              { return NULL; }
+            break;
+          case SM_AD_BEZIER_SURFACE:
+            if (!sBezs.Map(pNode->m_pData))
+              { return NULL; }
+            break;
+          case SM_AD_BEZIER_SURFACE_HEAD:
+          case SM_AD_AUX_DATA:
+            if (!sAuxs.Map(pNode->m_pData))
+              { return NULL; }
+            break;
+          default:
+            return NULL;
+        }
+    }
+
+  auto mapData = [&](SmBezierAux2d * pAux) -> SmBoolean
+  {
+    if (   pAux->m_pFace != NULL
+        || pAux->m_vVertexList.GetFirstNode() != NULL
+        || pAux->m_sEdgeuseList.GetFirstNode() != NULL
+        || pAux->m_sPolyEdgeList.GetFirstNode() != NULL
+        || !sNodes.Map(pAux->m_pOwningTreeNode))
+      { return FALSE; }
+    for (jj=0; jj<4; jj++)
+      {
+        if (!sNodes.Map(pAux->m_CornerNode[jj]))
+          { return FALSE; }
+      }
+    if (pAux->mBA_pSurface == NULL)
+      { return TRUE; }
+    if (pAux->mBA_pSurface == m_cpSurface)
+      {
+        pAux->mBA_pSurface = cpSurface;
+        return TRUE;
+      }
+    auto found = std::lower_bound(sSurfaces.begin(), sSurfaces.end(), pAux->mBA_pSurface,
+                                  [](const std::pair<const SmSurface*, SmSurface*> & a, const SmSurface * b)
+                                  { return std::less<const SmSurface*>()(a.first, b); });
+    if (found == sSurfaces.end() || found->first != pAux->mBA_pSurface)
+      { return FALSE; }
+    pAux->mBA_pSurface = found->second;
+    return TRUE;
+  };
+
+  ULONG lAuxs = pCopy->m_sAuxMgr.GetNumActiveElements();
+  for (ii=0; ii<lAuxs; ii++)
+    {
+      if (!mapData((SmBezierAux2d*)pCopy->m_sAuxMgr.GetAt(ii)))
+        { return NULL; }
+    }
+  ULONG lBezs = pCopy->m_sBezMgr.GetNumActiveElements();
+  for (ii=0; ii<lBezs; ii++)
+    {
+      SmBezierPatch * pBez = (SmBezierPatch*)pCopy->m_sBezMgr.GetAt(ii);
+      if (pBez->m_pBezier != NULL || !mapData(pBez))
+        { return NULL; }
+    }
+
+  sCleanup.Clear();
+  return pCopy;
+
+} // end SmTessSrfCache::Copy
 
 /*******************************************************************//**
 PURPOSE: Destructor for the tessellating surface cache.

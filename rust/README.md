@@ -180,10 +180,20 @@ edges, and faces whose surfaces are identical take them later rather than
 building their own (`SmTessSrfCacheStore`, the second kernel patch). In a drag
 the faces around the moving ones keep theirs from step to step.
 
+Triangulating a face subdivides and labels its cache, so a wanted face takes a
+deep copy (`SmTessSrfCache::Copy`, the third kernel patch): the tree's nodes
+and their data are fixed-size blocks without virtual functions, copied byte for
+byte with their pointers mapped, and a B-spline surface's subdivision surfaces
+are copied with their exact knots. The original stays in the store. A wanted
+face that builds its cache leaves a copy there when one of the store's last two
+calls built a cache for the same surface, so in a drag the faces whose
+boundaries move while their surfaces stay take copies from the third step on,
+and faces whose surfaces change every step cost no copies.
+
 `tests/tessellation.rs` checks every face against `Brep::tessellate`, partial
 meshes against whole ones, and kept faces standing in across edits, both ways
-and with surface caches kept, and that `tessellate_some` declines faces whose
-boundaries need refining.
+and with surface caches kept (copied for NURBS faces too), and that
+`tessellate_some` declines faces whose boundaries need refining.
 
 ## Build cache
 

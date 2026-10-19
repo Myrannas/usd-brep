@@ -109,7 +109,55 @@ class SM_EXPORT SmMemBlockMgr
   // free all memory blocks - reset all size parameters to zero
   void   ReSet();
 
+  // game-cad patch: replace this with a byte-for-byte copy of crOther: the same
+  // element size and blocking, with crOther's blocks of active elements copied.
+  // rtn: FALSE when out of memory, leaving this empty.
+  SmBoolean CopyFrom(const SmMemBlockMgr & crOther);
+
+  // game-cad patch: memory blocks, for mapping elements to their copies after CopyFrom
+  ULONG        GetNumElementsPerBlock() const { return m_lNumElementsPerBlock ; }
+  ULONG        GetNumBlocks()           const { return m_sBlocks.GetSize() ; }
+  const char * GetBlock(ULONG lIndex)   const { return (const char*)m_sBlocks[lIndex] ; }
+  char       * GetBlock(ULONG lIndex)         { return (char*)m_sBlocks[lIndex] ; }
+
 } ; // end class SmMemBlockMgr
+
+/*******************************************************************//**
+PURPOSE: game-cad patch: replace this with a byte-for-byte copy of crOther.
+
+NOTES: Element i of the copy is at the same block and offset as element i of
+  crOther, so elements map to their copies by block. Only blocks holding active
+  elements are copied, whole, so later GetNewElement calls find what crOther's
+  would: zeroed memory.
+***********************************************************************/
+inline SmBoolean SmMemBlockMgr::CopyFrom
+  (const SmMemBlockMgr & crOther)  // in : manager to copy
+{
+  ReSet();
+  m_lSizeOfElements      = crOther.m_lSizeOfElements;
+  m_lNumElementsPerBlock = crOther.m_lNumElementsPerBlock;
+
+  if (crOther.m_lNumActiveElements == 0 || m_lNumElementsPerBlock == 0)
+    { return TRUE; }
+
+  ULONG  lBlocks     = (crOther.m_lNumActiveElements + m_lNumElementsPerBlock - 1) / m_lNumElementsPerBlock;
+  size_t lBlockBytes = (size_t)m_lSizeOfElements * m_lNumElementsPerBlock;
+  for (ULONG i=0; i<lBlocks; i++)
+    {
+      char *pNew = (char*)smos_Malloc(lBlockBytes);
+      if (pNew == NULL)
+        {
+          ReSet();
+          return FALSE;
+        }
+      memcpy(pNew, crOther.m_sBlocks[i], lBlockBytes);
+      m_sBlocks.Add(pNew);
+    }
+  m_lNumActiveElements = crOther.m_lNumActiveElements;
+
+  return TRUE;
+
+} // end SmMemBlockMgr::CopyFrom
 
 /*******************************************************************//**
 PURPOSE: Free all allocated memory

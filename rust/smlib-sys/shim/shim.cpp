@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -3828,6 +3829,7 @@ struct sm_surface_caches final : SmTessSrfCacheStore {
         params = p;
         edge_length = length;
         digests = Digests();
+        missed[call % 3].clear();
     }
 
     // Ends a call, dropping the caches neither it nor the call before kept.
@@ -3856,7 +3858,10 @@ struct sm_surface_caches final : SmTessSrfCacheStore {
         std::array<uint64_t, 2> digest;
         if (!key(*face, digest)) return nullptr;
         const auto found = kept.find(digest);
-        if (found == kept.end()) return nullptr;
+        if (found == kept.end()) {
+            missed[call % 3].insert(digest);
+            return nullptr;
+        }
         SmTessSrfCache* cache = found->second.back().cache;
         found->second.pop_back();
         if (found->second.empty()) kept.erase(found);
@@ -3870,6 +3875,16 @@ struct sm_surface_caches final : SmTessSrfCacheStore {
             return;
         }
         kept[digest].push_back({cache, call});
+    }
+
+    // A face being tessellated built its cache: keeping a copy pays when one
+    // of the last two calls built a cache for the same surface too, as for a
+    // face whose boundary moves in a drag while its surface stays. Surfaces
+    // that change every call (the faces of the feature dragged) aren't kept.
+    SmBoolean WantsCopy(SmFace* face) override {
+        std::array<uint64_t, 2> digest;
+        if (!key(*face, digest)) return FALSE;
+        return missed[(call + 1) % 3].count(digest) > 0 || missed[(call + 2) % 3].count(digest) > 0;
     }
 
 private:
@@ -3893,6 +3908,8 @@ private:
     }
 
     std::map<std::array<uint64_t, 2>, std::vector<Kept>> kept;
+    // The surfaces each of the last three calls found no cache for, by call % 3.
+    std::array<std::set<std::array<uint64_t, 2>>, 3> missed;
     uint64_t call = 0;
     sm_tessellation_params params{};
     double edge_length = 0.0;
