@@ -2651,6 +2651,227 @@ void find_obstacles(const SmBrep& brep, const SmTArray<SmFace*>& picked, double 
     }
 }
 
+// A face beside a picked one that the picked face, pushed in, swallows whole:
+// a chamfer along a lid's edge pushed past its width, a vent's chamfer when
+// the vent widens past it, a post's when it thins. The picked face then meets
+// the plane beyond it directly, as if the edge had never been chamfered,
+// which is new topology. So the swallowed face is plugged, for the offset: a
+// box in the plane's frame, from deeper than the swallowed face reaches to
+// just outside the plane, covering it where it is and where the move takes
+// it, and the picked face is extended through the box along its own surface,
+// for which it must run along the plane's normal (a lid beside a chamfered
+// wall, a vent's wall under its chamfered lid). A picked plane extends as
+// the box, which ends on it, merges into it; a picked curved face as the
+// box's inner face, where it bounds the space the face looks into, is
+// pushed out past the plane. The picked face is then offset as usual, and
+// the part cut by the result: what the offset takes from the plugged part.
+struct Plug {
+    // A frame on the plane beyond, w its outward normal, and the box in it.
+    // For a picked plane, u is its outward normal and the box ends on it.
+    SmPoint3d origin;
+    SmVector3d u, v, w;
+    double low[3] = {0.0, 0.0, 0.0};
+    double high[3] = {0.0, 0.0, 0.0};
+    // Whether its inner face is pushed out: for a picked curved face.
+    bool opens = true;
+};
+
+// The faces across the face's edges, each once.
+std::vector<SmFace*> neighbours_of(const SmFace* face) {
+    std::vector<SmFace*> out;
+    SmTArray<SmEdge*> edges;
+    face->GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        for (SmFace* other : faces_of(edges[i]).faces) {
+            if (other && other != face && std::find(out.begin(), out.end(), other) == out.end()) out.push_back(other);
+        }
+    }
+    return out;
+}
+
+// Points that bound a face: along its edges, and one inside it.
+void bounding_points(const SmFace* face, std::vector<SmPoint3d>& out) {
+    face_points(face, out);
+    SmPoint3d interior;
+    if (face->CalculateAnInternalPoint(interior) == SM_SUCCESS) out.push_back(interior);
+}
+
+// How far `p` stands off the face's surface along its outward normal at the
+// nearest point, and that normal.
+bool height_off(const SmFace* face, const SmPoint3d& p, double& height, SmVector3d& normal) {
+    SmPoint3d closest;
+    SmTArray<SmPoint2d> uvs;
+    double gap = 0.0;
+    double n[3];
+    if (SmApiSurfaceClosestPoint(face->GetSurface(), p, closest, uvs, gap) != SM_SUCCESS ||
+        !outward_normal(face, closest, n)) {
+        return false;
+    }
+    normal = SmVector3d(n[0], n[1], n[2]);
+    height = (p - closest).Dot(normal);
+    return true;
+}
+
+// The plugs a push needs (see Plug), in the brep's face order; none unless
+// every swallowed face can be plugged, so that the offset then fails as it
+// would have. Faces of `obstacles` are set aside instead.
+void find_plugs(const SmBrep& brep, const SmTArray<SmFace*>& picked, double distance, const Motions& motions,
+                const std::vector<Obstacle>& obstacles, std::vector<Plug>& out) {
+    if (!(distance < 0.0)) return;
+    const double tolerance = 10.0 * brep.GetTolerance();
+    auto moving = [&](const SmFace* face) {
+        ULONG index = 0;
+        return picked.FindElement(const_cast<SmFace*>(face), index) || motion_of(motions, face).kind != Motion::kKept;
+    };
+    std::unordered_set<const SmFace*> set_aside;
+    for (const Obstacle& obstacle : obstacles) set_aside.insert(obstacle.faces.begin(), obstacle.faces.end());
+    // The kept faces beside a picked face that lie wholly between its
+    // surface and its offset.
+    std::unordered_map<const SmFace*, SmFace*> swallowed;  // and the picked face
+    std::vector<SmFace*> order;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        for (SmFace* face : neighbours_of(picked[i])) {
+            if (moving(face) || swallowed.count(face) || set_aside.count(face)) continue;
+            std::vector<SmPoint3d> points;
+            bounding_points(face, points);
+            bool inside = !points.empty();
+            for (const SmPoint3d& p : points) {
+                double height = 0.0;
+                SmVector3d normal;
+                inside = inside && height_off(picked[i], p, height, normal) && height >= distance - tolerance &&
+                         height <= tolerance;
+                if (!inside) break;
+            }
+            if (!inside) continue;
+            swallowed[face] = picked[i];
+            order.push_back(face);
+        }
+    }
+    if (swallowed.empty()) return;
+    std::unordered_set<const SmVertex*> on_moving;
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (!moving(faces[i])) continue;
+        SmTArray<SmVertex*> vertices;
+        faces[i]->GetVertices(vertices);
+        for (ULONG k = 0; k < vertices.GetSize(); ++k) on_moving.insert(vertices[k]);
+    }
+    std::vector<Plug> plugs;
+    for (SmFace* face : order) {
+        SmFace* by = swallowed[face];
+        // Beyond it: the one kept, unswallowed face it meets that touches no
+        // moving face, not even at a corner, a plane the picked face runs
+        // along. (The faces it meets at its ends, such as the next chamfer
+        // along a lid's edges, touch the picked face at a corner.)
+        SmFace* beyond = nullptr;
+        int count = 0;
+        bool alone = true;
+        for (SmFace* other : neighbours_of(face)) {
+            if (moving(other)) {
+                alone = alone && other == by;
+                continue;
+            }
+            if (swallowed.count(other)) continue;
+            SmTArray<SmVertex*> vertices;
+            other->GetVertices(vertices);
+            bool touches = false;
+            for (ULONG k = 0; k < vertices.GetSize(); ++k) touches = touches || on_moving.count(vertices[k]) > 0;
+            if (touches) continue;
+            beyond = other;
+            ++count;
+        }
+        Plug plug;
+        if (!alone || count != 1 || !frame_of(beyond, plug.origin, plug.u, plug.v, plug.w) ||
+            !invariant_under(by->GetSurface(), plug.w)) {
+            return;
+        }
+        SmPoint3d on_picked;
+        SmVector3d picked_normal;
+        if (plane_of(by->GetSurface(), on_picked, picked_normal)) {
+            if (outward_normal_inside(by, on_picked, picked_normal) != SM_SUCCESS) return;
+            plug.u = picked_normal;
+            plug.v = plug.w * plug.u;  // cross product
+            plug.opens = false;
+        }
+        // Where the face is and where the move takes it: each point carried
+        // along the picked face's normal, as the move carries the face.
+        std::vector<SmPoint3d> points;
+        bounding_points(face, points);
+        const size_t here = points.size();
+        for (size_t k = 0; k < here; ++k) {
+            double height = 0.0;
+            SmVector3d normal;
+            if (!height_off(by, points[k], height, normal)) return;
+            points.push_back(points[k] + normal * distance);
+        }
+        double low[3] = {HUGE_VAL, HUGE_VAL, HUGE_VAL};
+        double high[3] = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+        for (const SmPoint3d& p : points) {
+            const SmVector3d d = p - plug.origin;
+            const double c[3] = {d.Dot(plug.u), d.Dot(plug.v), d.Dot(plug.w)};
+            for (int k = 0; k < 3; ++k) {
+                low[k] = std::min(low[k], c[k]);
+                high[k] = std::max(high[k], c[k]);
+            }
+        }
+        for (int k = 0; k < 3; ++k) {
+            plug.low[k] = low[k];
+            plug.high[k] = high[k];
+        }
+        if (!plug.opens) plug.high[0] = (on_picked - plug.origin).Dot(plug.u);
+        plugs.push_back(plug);
+    }
+    // One margin for every plug, and every plug as deep as the deepest, so
+    // that where plugs meet (along a chamfered lid's corners) they cover
+    // each other's ends, and one push takes all their inner faces out.
+    double margin = 0.0;
+    double deepest = 0.0;
+    for (const Plug& plug : plugs) {
+        const double size = std::max({plug.high[0] - plug.low[0], plug.high[1] - plug.low[1], -plug.low[2]});
+        margin = std::max(margin, 0.5 + 0.02 * size);
+        deepest = std::min(deepest, plug.low[2]);
+    }
+    for (Plug& plug : plugs) {
+        for (int k = 0; k < 2; ++k) {
+            plug.low[k] -= margin;
+            plug.high[k] += k == 0 && !plug.opens ? 0.0 : margin;
+        }
+        plug.low[2] = deepest - margin;
+        plug.high[2] = margin;
+    }
+    // A plug may only cover the swallowed faces and what meets them: else it
+    // fills more than the swallowed faces leave.
+    std::unordered_set<const SmFace*> allowed;
+    for (const auto& entry : swallowed) {
+        allowed.insert(entry.first);
+        SmTArray<SmVertex*> vertices;
+        entry.first->GetVertices(vertices);
+        for (ULONG i = 0; i < vertices.GetSize(); ++i) {
+            SmTArray<SmFace*> faces;
+            vertices[i]->GetFaces(faces);
+            for (ULONG f = 0; f < faces.GetSize(); ++f) allowed.insert(faces[f]);
+        }
+    }
+    for (const Plug& plug : plugs) {
+        for (ULONG i = 0; i < faces.GetSize(); ++i) {
+            if (allowed.count(faces[i])) continue;
+            std::vector<SmPoint3d> points;
+            bounding_points(faces[i], points);
+            for (const SmPoint3d& p : points) {
+                const SmVector3d d = p - plug.origin;
+                const double c[3] = {d.Dot(plug.u), d.Dot(plug.v), d.Dot(plug.w)};
+                bool inside = true;
+                for (int k = 0; k < 3; ++k) {
+                    inside = inside && c[k] > plug.low[k] + tolerance && c[k] < plug.high[k] - tolerance;
+                }
+                if (inside) return;
+            }
+        }
+    }
+    out = std::move(plugs);
+}
+
 // Whether any face but the obstacle's own and its base reaches into its box:
 // then setting the box's contents aside would take more than the feature.
 bool box_holds_only(const SmBrep& brep, const Obstacle& obstacle) {
@@ -2825,9 +3046,118 @@ sm_status cut_over(const SmBrep& swept, const Obstacle& obstacle, std::unique_pt
     return SM_SUCCESS;
 }
 
-// Offsets the picked faces through `obstacles` (see find_obstacles), in place.
+// The plugs' inner faces in `work`: on a plug's inner plane, meeting a
+// picked face.
+sm_status inner_faces(const SmBrep& work, ULONG picked_count, const std::vector<Plug>& plugs,
+                      SmTArray<SmFace*>& inner) {
+    SmTArray<SmFace*> picked;
+    if (!find_picked(work, picked_count, picked)) return SM_SHIM_ERR_OBSTRUCTED;
+    const double tolerance = 10.0 * work.GetTolerance();
+    SmTArray<SmFace*> faces;
+    work.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        double normal[3];
+        SmPoint3d inside;
+        if (!outward_plane(faces[i], normal) || SmApiFaceInternalPoint(faces[i], inside) != SM_SUCCESS) continue;
+        const SmVector3d n(normal[0], normal[1], normal[2]);
+        for (const Plug& plug : plugs) {
+            if (!plug.opens) continue;
+            const SmVector3d d = inside - plug.origin;
+            const double c[3] = {d.Dot(plug.u), d.Dot(plug.v), d.Dot(plug.w)};
+            if (std::fabs(n.Dot(plug.w)) < 1.0 - 1e-9 || std::fabs(c[2] - plug.low[2]) > tolerance ||
+                c[0] < plug.low[0] || c[0] > plug.high[0] || c[1] < plug.low[1] || c[1] > plug.high[1]) {
+                continue;
+            }
+            bool meets = false;
+            for (SmFace* other : neighbours_of(faces[i])) {
+                ULONG index = 0;
+                meets = meets || picked.FindElement(other, index);
+            }
+            if (meets) inner.Add(faces[i]);
+            break;
+        }
+    }
+    return inner.GetSize() > 0 ? SM_SUCCESS : SM_SHIM_ERR_OBSTRUCTED;
+}
+
+// The plug an inner face lies on.
+const Plug* plug_under(const SmFace* face, const std::vector<Plug>& plugs, double tolerance) {
+    SmPoint3d inside;
+    if (SmApiFaceInternalPoint(face, inside) != SM_SUCCESS) return nullptr;
+    for (const Plug& plug : plugs) {
+        if (plug.opens && std::fabs((inside - plug.origin).Dot(plug.w) - plug.low[2]) <= tolerance) return &plug;
+    }
+    return nullptr;
+}
+
+// Fills `work` with the plugs (see Plug). A plug over a blind hole's mouth
+// seals the hole in, a void, whose faces nothing here orients right; so each
+// inner face over a void is then bored through, along the plug's normal,
+// clear of its edges, which opens the void again and leaves the inner face a
+// ring whose bore stretches as it is pushed out.
+sm_status fill_plugs(std::unique_ptr<SmBrep>& work, ULONG picked_count, const std::vector<Plug>& plugs) {
+    const ULONG shells = shell_count(*work);
+    sm_status status = SM_SUCCESS;
+    for (const Plug& plug : plugs) {
+        std::unique_ptr<SmBrep> box;
+        if ((status = frame_box(plug.origin, plug.u, plug.v, plug.low, plug.high, box)) != SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanUnion, work, std::move(box))) != SM_SUCCESS) {
+            return status;
+        }
+    }
+    if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
+    if (shell_count(*work) == shells) return SM_SUCCESS;
+    SmTArray<SmFace*> inner;
+    if ((status = inner_faces(*work, picked_count, plugs, inner)) != SM_SUCCESS) return status;
+    const double tolerance = 10.0 * work->GetTolerance();
+    std::vector<std::unique_ptr<SmBrep>> bores;
+    for (ULONG i = 0; i < inner.GetSize(); ++i) {
+        const Plug* plug = plug_under(inner[i], plugs, tolerance);
+        SmPoint3d centre;
+        if (!plug || SmApiFaceInternalPoint(inner[i], centre) != SM_SUCCESS) return SM_SHIM_ERR_OBSTRUCTED;
+        std::vector<SmPoint3d> points;
+        face_points(inner[i], points);
+        double clear = HUGE_VAL;
+        for (const SmPoint3d& p : points) {
+            const SmVector3d d = p - centre;
+            clear = std::min(clear, (d - plug->w * d.Dot(plug->w)).Length());
+        }
+        const double radius = 0.5 * clear;
+        // Into the void a little, and out of the plug's outer face.
+        const double past = 0.05;
+        if (!(radius > tolerance) || points.empty()) return SM_SHIM_ERR_OBSTRUCTED;
+        const SmVector3d d = centre - plug->origin;
+        SmBrep* raw = nullptr;
+        SmApiStatus made = SmApiCreateCylinder(SmVector3d(d.Dot(plug->u), d.Dot(plug->v), plug->low[2] - past),
+                                               radius, plug->high[2] - plug->low[2] + 2.0 * past, raw);
+        if (made != SM_SUCCESS || !raw) return made != SM_SUCCESS ? static_cast<sm_status>(made) : SM_ERR;
+        std::unique_ptr<SmBrep> bore(raw);
+        made = SmApiTransform(raw, SmAxis2Placement(plug->origin, plug->u, plug->v));
+        if (made != SM_SUCCESS) return static_cast<sm_status>(made);
+        bores.push_back(std::move(bore));
+    }
+    for (auto& bore : bores) {
+        if ((status = boolean_into(SmApiBooleanDifference, work, std::move(bore))) != SM_SUCCESS) return status;
+    }
+    if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
+    return shell_count(*work) == shells ? SM_SUCCESS : SM_SHIM_ERR_OBSTRUCTED;
+}
+
+// Pushes the plugs' inner faces in `work` out past the planes beyond, so
+// the picked faces reach through them.
+sm_status open_plugs(SmBrep& work, ULONG picked_count, const std::vector<Plug>& plugs) {
+    if (std::none_of(plugs.begin(), plugs.end(), [](const Plug& plug) { return plug.opens; })) return SM_SUCCESS;
+    SmTArray<SmFace*> inner;
+    sm_status status = inner_faces(work, picked_count, plugs, inner);
+    if (status != SM_SUCCESS) return status;
+    const double push = plugs[0].low[2] - plugs[0].high[2] / 2.0;
+    return keeping_topology(work, [&] { return offset_faces(work, inner, push); });
+}
+
+// Offsets the picked faces through `obstacles` (see find_obstacles) and the
+// faces they swallow (see Plug), in place.
 sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance,
-                       const std::vector<Obstacle>& obstacles) {
+                       const std::vector<Obstacle>& obstacles, const std::vector<Plug>& plugs) {
     for (const Obstacle& obstacle : obstacles) {
         if (obstacle.side == 0 || !box_holds_only(brep, obstacle)) return SM_SHIM_ERR_OBSTRUCTED;
     }
@@ -2858,9 +3188,11 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
         bosses.emplace_back(&obstacle, std::move(part));
     }
     // A hole on a picked face that the push swallows whole has nothing to
-    // come back as; any other needs the part as it is to come back from.
+    // come back as; any other, and the part around a plug, needs the part as
+    // it is to come back from.
     std::unique_ptr<SmBrep> holed;
     const double tolerance = 10.0 * brep.GetTolerance();
+    if (!plugs.empty() && (status = copy_of(*work, holed)) != SM_SUCCESS) return status;
     for (const Obstacle& obstacle : obstacles) {
         if (obstacle.side > 0) continue;
         const bool gone = obstacle.on_picked && swallows(obstacle, distance, tolerance, true);
@@ -2876,14 +3208,18 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
         }
     }
     if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
-    SmTArray<SmFace*> moved;
-    if (!find_picked(*work, picked.GetSize(), moved)) return SM_SHIM_ERR_OBSTRUCTED;
+    if (!plugs.empty() && (status = fill_plugs(work, picked.GetSize(), plugs)) != SM_SUCCESS) return status;
     // What the offset sweeps through, from the filled part before and after:
     // what it takes, pushed in, or adds, pulled out. Holes come back by it,
-    // and bosses beside a curved face pushed in are cut by it.
+    // and bosses beside a curved face pushed in are cut by it; around a plug,
+    // it takes the swallowed faces, and what the plug opened only takes
+    // what's empty in the part.
     const bool cut_bosses = curved && pushed && !bosses.empty();
     std::unique_ptr<SmBrep> swept;
     if ((holed || cut_bosses) && (status = copy_of(*work, swept)) != SM_SUCCESS) return status;
+    if (!plugs.empty() && (status = open_plugs(*work, picked.GetSize(), plugs)) != SM_SUCCESS) return status;
+    SmTArray<SmFace*> moved;
+    if (!find_picked(*work, picked.GetSize(), moved)) return SM_SHIM_ERR_OBSTRUCTED;
     status = keeping_topology(*work, [&] { return offset_faces(*work, moved, distance); });
     if (status != SM_SUCCESS) return status;
     if (swept) {
@@ -2981,11 +3317,15 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
 sm_status offset_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance) {
     Motions motions;
     std::vector<Obstacle> obstacles;
+    std::vector<Plug> plugs;
     if (plan_offset(picked, distance, brep.GetTolerance(), motions) == SM_SUCCESS) {
         find_obstacles(brep, picked, distance, motions, obstacles);
+        find_plugs(brep, picked, distance, motions, obstacles, plugs);
     }
-    if (obstacles.empty()) return keeping_topology(brep, [&] { return offset_faces(brep, picked, distance); });
-    return push_through(brep, picked, distance, obstacles);
+    if (obstacles.empty() && plugs.empty()) {
+        return keeping_topology(brep, [&] { return offset_faces(brep, picked, distance); });
+    }
+    return push_through(brep, picked, distance, obstacles, plugs);
 }
 
 }  // namespace

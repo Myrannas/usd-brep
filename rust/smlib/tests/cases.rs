@@ -1085,14 +1085,14 @@ fn offset_face_around_a_hole() {
 
 #[test]
 fn offset_face_fails_cleanly_when_a_face_would_vanish() {
-    // Each move would shrink a face to nothing: the chamfers (legs 2) from
-    // d = -2, the walls under the fillets from d = -32, the box's walls at
-    // d = -40, the drafted block's top past its apex (about d = +303). The
-    // kernel hands back an open or inside-out solid; the shim refuses it.
+    // Each move would shrink a face to nothing that the moved face can't
+    // simply pass: the walls under the fillets from d = -32, the box's walls
+    // at d = -40, the drafted block's top past its apex (about d = +303).
+    // The kernel hands back an open or inside-out solid; the shim refuses
+    // it. (A chamfer along the moved face's edge it can pass: see
+    // a_pushed_face_meets_the_face_beyond_one_it_swallows.)
     let outcomes = on_kernel(move |k| {
         let attempts: Vec<(&str, f64, Result<Brep, Error>)> = vec![
-            ("chamfered box", -2.5, chamfered_box(k, H, 2.0)),
-            ("chamfered box", -10.0, chamfered_box(k, H, 2.0)),
             ("filleted box", -32.0, top_rounded_box(k, H, 8.0)),
             ("filleted box", -35.0, top_rounded_box(k, H, 8.0)),
             ("plain box", -40.0, box_of_height(k, H)),
@@ -2157,4 +2157,150 @@ fn an_unchecked_offset_returns_what_the_kernel_made() {
     .unwrap();
     assert!(unchecked.is_err(), "the kernel's own result tessellates");
     checked.unwrap();
+}
+
+#[test]
+fn a_pushed_face_meets_the_face_beyond_one_it_swallows() {
+    // A face pushed in past a chamfer along its edge swallows it, and meets
+    // the face beyond directly, as if the edge had never been chamfered: the
+    // chamfered box's top pushed past its chamfers (legs 2), to exactly
+    // their width and beyond, is a plain box, and so is its +X wall pushed
+    // past the chamfer above it, less that chamfer, the others running into
+    // the wall's new plane.
+    type Make = Box<dyn Fn(&Kernel) -> Result<Brep, Error> + Send>;
+    let c: f64 = 2.0;
+    let mut cases: Vec<(String, Make, f64, usize)> = Vec::new();
+    for d in [-2.0, -2.5, -10.0] {
+        cases.push((
+            format!("chamfered box, top d={d:+}"),
+            Box::new(move |k| {
+                let mut part = chamfered_box(k, H, c)?;
+                let top = part.find_faces(&top_at(H), &Tolerance::default())?;
+                part.set_face_label(top[0], &Label::new(1, "top"))?;
+                part.offset_faces(&top, d)
+            }),
+            L * W * (H + d),
+            6,
+        ));
+    }
+    let short = L - 5.0;
+    cases.push((
+        "chamfered box, +X wall d=-5".into(),
+        Box::new(move |k| chamfered_box(k, H, c)?.offset_where(&side(X), -5.0)),
+        short * W * H - c * c / 2.0 * (2.0 * short + W) + 2.0 * c.powi(3) / 3.0,
+        9,
+    ));
+    for (name, make, expected, faces) in cases {
+        let (volume, count, manifold, labels) = on_kernel(move |k| {
+            let moved = make(k)?;
+            moved.tessellate(&TessellationParams::default())?;
+            let labels: Vec<String> = moved
+                .faces()?
+                .iter()
+                .filter_map(|f| f.label.as_ref().map(ToString::to_string))
+                .collect();
+            Ok::<_, Error>((
+                moved.volume(PRECISE)?,
+                moved.face_count(),
+                moved.is_manifold()?,
+                labels,
+            ))
+        })
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        println!("{name}: {volume:.6} against {expected:.6}, {count} faces");
+        assert!(manifold, "{name}");
+        assert!(
+            ((volume - expected) / expected).abs() < 1e-9,
+            "{name}: {volume} against {expected}"
+        );
+        assert_eq!(count, faces, "{name}");
+        if name.contains("top") {
+            assert_eq!(
+                labels,
+                ["1/top.0"],
+                "{name}: the moved face keeps its label"
+            );
+        }
+    }
+
+    // Curved faces the same: game-cad's sample crate's vent, 25 in radius
+    // and 80 deep with its rim chamfered 3, widened to the chamfer's width
+    // and past it, is a plain hole up to the lid; and a post 20 in radius and
+    // 30 tall, its top rim chamfered 3, thinned so is a plain post.
+    let rim = |z: f64, r: f64| EdgeQuery::OnCircle {
+        center: [0.0, 0.0, z],
+        axis: UP,
+        radius: r,
+    };
+    type Expected = Box<dyn Fn(&Kernel) -> Result<f64, Error> + Send>;
+    let mut cases: Vec<(String, Make, f64, Expected)> = Vec::new();
+    for d in [-3.0, -3.5, -10.0] {
+        cases.push((
+            format!("vent widened d={d:+}"),
+            Box::new(move |k| {
+                crate_with(k, &[], &[])?
+                    .difference(Brep::cylinder(k, [0.0, 0.0, 60.0], 25.0, 90.0)?)?
+                    .chamfer(
+                        &rim(140.0, 25.0),
+                        3.0 * 2.0_f64.sqrt(),
+                        &Tolerance::default(),
+                    )
+            }),
+            d,
+            Box::new(move |k| {
+                crate_with(k, &[], &[])?
+                    .difference(Brep::cylinder(k, [0.0, 0.0, 60.0], 25.0 - d, 90.0)?)?
+                    .volume(PRECISE)
+            }),
+        ));
+    }
+    for d in [-3.0, -5.0] {
+        cases.push((
+            format!("post thinned d={d:+}"),
+            Box::new(move |k| {
+                crate_with(k, &[], &[])?
+                    .union(Brep::cylinder(k, [0.0, 0.0, 140.0], 20.0, 30.0)?)?
+                    .chamfer(
+                        &rim(170.0, 20.0),
+                        3.0 * 2.0_f64.sqrt(),
+                        &Tolerance::default(),
+                    )
+            }),
+            d,
+            Box::new(move |k| {
+                crate_with(k, &[], &[])?
+                    .union(Brep::cylinder(k, [0.0, 0.0, 140.0], 20.0 + d, 30.0)?)?
+                    .volume(PRECISE)
+            }),
+        ));
+    }
+    for (name, make, d, expected) in cases {
+        let r = if name.starts_with("vent") { 25.0 } else { 20.0 };
+        let (volume, expected, faces, plain, manifold) = on_kernel(move |k| {
+            let part = make(k)?;
+            let picked = [cylinder_at(&part, 0.0, 0.0, r)?];
+            let moved = part.offset_faces(&picked, d)?;
+            moved.tessellate(&TessellationParams::default())?;
+            let plain = crate_with(k, &[], &[])?.face_count();
+            Ok::<_, Error>((
+                moved.volume(PRECISE)?,
+                expected(k)?,
+                moved.face_count(),
+                plain,
+                moved.is_manifold()?,
+            ))
+        })
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(manifold, "{name}");
+        println!("{name}: {volume:.6} against {expected:.6}, {faces} faces");
+        assert!(
+            ((volume - expected) / expected).abs() < 1e-8,
+            "{name}: {volume} against {expected}"
+        );
+        assert_eq!(
+            faces,
+            plain + 2,
+            "{name}: the crate's faces, a wall and a floor or top"
+        );
+    }
 }

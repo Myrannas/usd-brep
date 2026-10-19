@@ -641,9 +641,17 @@ impl Brep {
     /// entirely on one side of a planar face, or something else stands in
     /// its way; or when it would come back on its own or sealed inside.
     ///
+    /// A face pushed in past a chamfer beside it swallows the chamfer and
+    /// meets the plane beyond directly, as if the edge had never been
+    /// chamfered: a lid past the chamfer along its edge, a hole widened or a
+    /// post thinned past the chamfer on its rim. That needs the face to run
+    /// along the plane's normal, and nothing but the chamfer and what meets it
+    /// near where the face passes.
+    ///
     /// With nothing in the way the topology doesn't change, so every face and
     /// edge keeps its [`Label`]: the moved faces and the neighbours that
-    /// stretch alike. A move that would shrink a face to nothing fails with
+    /// stretch alike. A move that would otherwise shrink a face to nothing
+    /// (the walls under a lid's rounds, a whole box) fails with
     /// `SHIM_ERR_BROKE_SOLID` or `SHIM_ERR_CHANGED_TOPOLOGY`, never a broken
     /// solid: the kernel's result is checked for manifoldness, the same faces
     /// and edges, every planar face's loops apart (none crossing, every inner
