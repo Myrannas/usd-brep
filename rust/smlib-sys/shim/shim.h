@@ -441,9 +441,14 @@ sm_status sm_brep_merge_faces(sm_brep *brep);
  * new plane: a boss joined back as far as the plane leaves it, a hole cut
  * back. SM_SHIM_ERR_OBSTRUCTED when one can't be set aside: it doesn't stand
  * on a planar face entirely on one side of it, or something else stands in
- * its way (see sm_brep_offset_obstacles). With nothing in the way the brep
- * keeps its faces and edges, so a move that would make a face vanish fails,
- * with SM_SHIM_ERR_CHANGED_TOPOLOGY or SM_SHIM_ERR_BROKE_SOLID (the kernel
+ * its way (see sm_brep_offset_obstacles). A face pushed in past a chamfer
+ * beside it (a lid past the chamfer along its edge, a hole widened or a post
+ * thinned past the chamfer on its rim) swallows the chamfer and meets the
+ * plane beyond directly, as if the edge had never been chamfered, where it
+ * runs along that plane's normal and nothing else stands near the chamfer.
+ * Otherwise the brep keeps its faces and edges, so a move that would make a
+ * face vanish fails, with SM_SHIM_ERR_CHANGED_TOPOLOGY or
+ * SM_SHIM_ERR_BROKE_SOLID (the kernel
  * returned an open solid, a face whose loops cross or whose inner loop left
  * its outer one, one whose vertices or edges are off their faces by more
  * than the brep's tolerance, or one whose volume its own tessellation
