@@ -1898,6 +1898,61 @@ fn a_moved_face_swallows_or_cuts_what_it_passes() {
     );
 }
 
+#[test]
+fn rounds_pushed_over_pockets_cut_them_beside_a_chamfered_vent() {
+    // The front pushed in takes its corner rounds over the ends of pockets 30
+    // deep, 120 long and 40 high in the sides, which then open into the
+    // rounds, while the chamfered vent through the lid stays as it was: at
+    // -115 the front's new plane comes within 7 of the chamfer. The part is
+    // the crate with only the vent, pushed the same, less what's left of the
+    // pockets.
+    const DEPTH: f64 = 30.0;
+    for d in [-80.0, -115.0] {
+        let (volume, plain) = on_kernel(move |k| {
+            let rim = EdgeQuery::OnCircle {
+                center: [0.0, 0.0, 140.0],
+                axis: UP,
+                radius: 25.0,
+            };
+            let vented = crate_with(k, &[], &[])?
+                .difference(Brep::cylinder(k, [0.0, 0.0, 60.0], 25.0, 90.0)?)?
+                .chamfer(&rim, 3.0 * 2.0_f64.sqrt(), &Tolerance::default())?;
+            let part = vented
+                .try_clone()?
+                .difference(Brep::cuboid(
+                    k,
+                    [200.0 - DEPTH, -60.0, 0.0],
+                    [DEPTH + 10.0, 120.0, 40.0],
+                )?)?
+                .difference(Brep::cuboid(
+                    k,
+                    [-210.0, -60.0, 0.0],
+                    [DEPTH + 10.0, 120.0, 40.0],
+                )?)?;
+            let moved = part.offset_where(&crate_front(), d)?;
+            assert!(moved.is_manifold()?);
+            moved.tessellate(&TessellationParams::default())?;
+            let plain = vented.offset_where(&crate_front(), d)?;
+            Ok::<_, Error>((moved.volume(PRECISE)?, plain.volume(PRECISE)?))
+        })
+        .unwrap();
+        // The rounds, radius 20, end at the moved front and centre 20 behind
+        // it: a pocket is as deep as a round leaves it over the first stretch
+        // past the front, and DEPTH from the rounds' centres on.
+        let front = -150.0 - d;
+        let centre = front + 20.0;
+        let under = centre - front.max(-60.0);
+        let round = under / 2.0 * (400.0 - under * under).sqrt() + 200.0 * (under / 20.0).asin();
+        let pocket = 40.0 * (DEPTH * (60.0 - centre) + (DEPTH - 20.0) * under + round);
+        let expected = plain - 2.0 * pocket;
+        println!("d={d}: {volume:.4} against {expected:.4}");
+        assert!(
+            ((volume - expected) / expected).abs() < 1e-6,
+            "d={d}: {volume} against {expected}"
+        );
+    }
+}
+
 /// The area two discs of radii `a` and `b`, `d` apart, share.
 fn lens(a: f64, b: f64, d: f64) -> f64 {
     if d >= a + b {
