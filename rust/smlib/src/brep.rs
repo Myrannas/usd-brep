@@ -625,18 +625,21 @@ impl Brep {
     /// wall, or under a corner round that moves with the wall, whose loops
     /// would cross the lid's new boundary. A picked plane can also swallow a
     /// face of a feature on it whole: a pocket pushed past its floor, a
-    /// chamfer past its width, a boss pulled out past its top. Each such
-    /// feature is set aside, the faces are offset without it, and it comes
-    /// back cut by the plane's new position, as Parasolid pushes a face
-    /// through: a boss joined back as far as the plane leaves it, or not at
-    /// all; a hole as the part with its holes less what the offset swept
-    /// away. [`offset_obstacles`](Brep::offset_obstacles) lists them. Where a
-    /// cut boss's new face doesn't merge into the moved face it is
+    /// chamfer past its width, a boss pulled out past its top. A picked
+    /// curved face moved either way crosses features beside it the same
+    /// way: a boss near a hole that widens, a hole or boss beside a boss
+    /// that grows, a pin on a post that thins. Each such feature is set
+    /// aside, the faces are offset without it, and it comes back cut by the
+    /// face's new position, as Parasolid pushes a face through: a boss
+    /// joined back as far as the face leaves it, or not at all; a hole as
+    /// the part with its holes less what the offset swept away, or with what
+    /// it grew. [`offset_obstacles`](Brep::offset_obstacles) lists them.
+    /// Where a cut boss's new face doesn't merge into the moved face it is
     /// unlabelled; everything else keeps its [`Label`], though a cut face
     /// can come back in two pieces along its surface's seam.
     /// `SHIM_ERR_OBSTRUCTED` when one can't be set aside: it doesn't stand
     /// entirely on one side of a planar face, or something else stands in
-    /// its way.
+    /// its way; or when it would come back on its own or sealed inside.
     ///
     /// With nothing in the way the topology doesn't change, so every face and
     /// edge keeps its [`Label`]: the moved faces and the neighbours that
@@ -693,8 +696,9 @@ impl Brep {
 
     /// What offsetting `faces` by `distance` runs into: the features standing
     /// on faces beside the moving ones, along inner loops, that reach into
-    /// the space a picked plane pushed in or the blends moving with it
-    /// sweep, and those on a picked plane it swallows a face of (see
+    /// the space a picked plane pushed in, the blends moving with it, or a
+    /// picked curved face moved either way sweep, and those on a picked
+    /// plane it swallows a face of (see
     /// [`offset_faces`](Brep::offset_faces)). Each is its faces' indices, in
     /// face order, and the features come in the order of their first faces;
     /// none when nothing is in the way.

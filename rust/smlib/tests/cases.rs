@@ -1898,6 +1898,181 @@ fn a_moved_face_swallows_or_cuts_what_it_passes() {
     );
 }
 
+/// The area two discs of radii `a` and `b`, `d` apart, share.
+fn lens(a: f64, b: f64, d: f64) -> f64 {
+    if d >= a + b {
+        return 0.0;
+    }
+    if d <= (a - b).abs() {
+        return PI * a.min(b).powi(2);
+    }
+    let alpha = ((d * d + a * a - b * b) / (2.0 * d * a)).acos();
+    let beta = ((d * d + b * b - a * a) / (2.0 * d * b)).acos();
+    let kite = ((-d + a + b) * (d + a - b) * (d - a + b) * (d + a + b)).sqrt() / 2.0;
+    a * a * alpha + b * b * beta - kite
+}
+
+/// The cylindrical face of radius `r` whose axis runs through (x, y).
+fn cylinder_at(part: &Brep, x: f64, y: f64, r: f64) -> Result<usize, Error> {
+    Ok(part
+        .faces()?
+        .into_iter()
+        .find(|f| {
+            matches!(f.surface, Surface::Cylinder { origin, radius, .. }
+                if (radius - r).abs() < 1e-6 && (origin[0] - x).hypot(origin[1] - y) < 1e-6)
+        })
+        .unwrap_or_else(|| panic!("no cylinder of radius {r} at ({x}, {y})"))
+        .index)
+}
+
+#[test]
+fn a_moved_curved_face_cuts_what_it_passes_along_its_new_surface() {
+    // Parts on the crate's lid, at z = 140, each with the curved face moved,
+    // how many features are in its way, and its volume as it should come out.
+    type Make = Box<dyn Fn(&Kernel) -> Result<Brep, Error> + Send>;
+    type Expected = Box<dyn Fn(&Kernel) -> Result<f64, Error> + Send>;
+    // The crate with bosses (x, y, radius, height) on its lid and holes (x,
+    // y, radius) 20 deep in it.
+    fn lid(k: &Kernel, bosses: &[[f64; 4]], holes: &[[f64; 3]]) -> Result<Brep, Error> {
+        let mut part = crate_with(k, &[], &[])?;
+        for &[x, y, r, h] in bosses {
+            part = part.union(Brep::cylinder(k, [x, y, 140.0], r, h)?)?;
+        }
+        for &[x, y, r] in holes {
+            part = part.difference(Brep::cylinder(k, [x, y, 120.0], r, 30.0)?)?;
+        }
+        Ok(part)
+    }
+    fn volume(k: &Kernel, bosses: &[[f64; 4]], holes: &[[f64; 3]]) -> Result<f64, Error> {
+        lid(k, bosses, holes)?.volume(PRECISE)
+    }
+    struct Case {
+        name: &'static str,
+        part: Make,
+        // The cylinder moved: its axis's (x, y) and radius.
+        face: [f64; 3],
+        d: f64,
+        in_the_way: usize,
+        expected: Expected,
+    }
+    let cases = vec![
+        // A hole of radius 20 widened to 38 and to 50 past a boss of radius 8
+        // beside it, 40 out: the boss is cut along the new wall, then gone.
+        // Short of the boss, nothing's in the way.
+        Case {
+            name: "hole widened short of the boss",
+            part: Box::new(move |k| lid(k, &[[40.0, 0.0, 8.0, 6.0]], &[[0.0, 0.0, 20.0]])),
+            face: [0.0, 0.0, 20.0],
+            d: -5.0,
+            in_the_way: 0,
+            expected: Box::new(move |k| volume(k, &[[40.0, 0.0, 8.0, 6.0]], &[[0.0, 0.0, 25.0]])),
+        },
+        Case {
+            name: "hole widened through the boss",
+            part: Box::new(move |k| lid(k, &[[40.0, 0.0, 8.0, 6.0]], &[[0.0, 0.0, 20.0]])),
+            face: [0.0, 0.0, 20.0],
+            d: -18.0,
+            in_the_way: 1,
+            expected: Box::new(move |k| {
+                Ok(
+                    volume(k, &[], &[[0.0, 0.0, 38.0]])?
+                        + 6.0 * (PI * 64.0 - lens(38.0, 8.0, 40.0)),
+                )
+            }),
+        },
+        Case {
+            name: "hole widened past the boss",
+            part: Box::new(move |k| lid(k, &[[40.0, 0.0, 8.0, 6.0]], &[[0.0, 0.0, 20.0]])),
+            face: [0.0, 0.0, 20.0],
+            d: -30.0,
+            in_the_way: 1,
+            expected: Box::new(move |k| volume(k, &[], &[[0.0, 0.0, 50.0]])),
+        },
+        // A post 20 in radius and 30 tall thinned to 12 past a pin on its
+        // top, 15 out: the pin is cut along the post's new side.
+        Case {
+            name: "post thinned through the pin on it",
+            part: Box::new(move |k| {
+                lid(k, &[[0.0, 0.0, 20.0, 30.0]], &[])?.union(Brep::cylinder(
+                    k,
+                    [15.0, 0.0, 170.0],
+                    3.0,
+                    5.0,
+                )?)
+            }),
+            face: [0.0, 0.0, 20.0],
+            d: -8.0,
+            in_the_way: 1,
+            expected: Box::new(move |k| {
+                Ok(volume(k, &[[0.0, 0.0, 12.0, 30.0]], &[])? + 5.0 * lens(12.0, 3.0, 15.0))
+            }),
+        },
+        // A boss 10 in radius widened to 22 over a hole 5 in radius 25 out,
+        // whose mouth it then half covers, and over a taller boss there,
+        // which it joins.
+        Case {
+            name: "boss widened over a hole",
+            part: Box::new(move |k| lid(k, &[[0.0, 0.0, 10.0, 6.0]], &[[25.0, 0.0, 5.0]])),
+            face: [0.0, 0.0, 10.0],
+            d: 12.0,
+            in_the_way: 1,
+            expected: Box::new(move |k| {
+                Ok(volume(k, &[[0.0, 0.0, 10.0, 6.0]], &[[25.0, 0.0, 5.0]])?
+                    + 6.0 * PI * (22.0 * 22.0 - 100.0))
+            }),
+        },
+        Case {
+            name: "boss widened over a boss",
+            part: Box::new(move |k| lid(k, &[[0.0, 0.0, 10.0, 6.0], [25.0, 0.0, 5.0, 10.0]], &[])),
+            face: [0.0, 0.0, 10.0],
+            d: 12.0,
+            in_the_way: 1,
+            expected: Box::new(move |k| {
+                let both = volume(k, &[[0.0, 0.0, 10.0, 6.0], [25.0, 0.0, 5.0, 10.0]], &[])?;
+                Ok(both + 6.0 * (PI * (22.0 * 22.0 - 100.0) - lens(22.0, 5.0, 25.0)))
+            }),
+        },
+    ];
+    for case in cases {
+        let Case {
+            name,
+            part,
+            face,
+            d,
+            in_the_way,
+            expected,
+        } = case;
+        let (volume, expected, obstacles) = on_kernel(move |k| {
+            let part = part(k)?;
+            let [x, y, r] = face;
+            let picked = [cylinder_at(&part, x, y, r)?];
+            let obstacles = part.offset_obstacles(&picked, d)?.len();
+            let moved = part.offset_faces(&picked, d)?;
+            assert!(moved.is_manifold()?, "{name}");
+            moved.tessellate(&TessellationParams::default())?;
+            Ok::<_, Error>((moved.volume(PRECISE)?, expected(k)?, obstacles))
+        })
+        .unwrap();
+        println!("{name}: {volume:.4} against {expected:.4}, {obstacles} in the way");
+        assert!(
+            ((volume - expected) / expected).abs() < 1e-7,
+            "{name}: {volume} against {expected}"
+        );
+        assert_eq!(obstacles, in_the_way, "{name}");
+    }
+
+    // Widened to 32, the boss covers the hole's mouth whole, which would
+    // leave it a void inside the part: refused.
+    let outcome = on_kernel(move |k| {
+        let part = lid(k, &[[0.0, 0.0, 10.0, 6.0]], &[[25.0, 0.0, 5.0]])?;
+        let picked = [cylinder_at(&part, 0.0, 0.0, 10.0)?];
+        Ok::<_, Error>(part.offset_faces(&picked, 22.0).map(|b| b.face_count()))
+    })
+    .unwrap();
+    let error = outcome.expect_err("the hole would be sealed in");
+    assert_eq!(status_name(&error), Some("SHIM_ERR_OBSTRUCTED"), "{error}");
+}
+
 #[test]
 fn a_pushed_face_refuses_what_it_cannot_set_aside() {
     // A small boss stands 0.5 mm behind a front one, inside the room the
