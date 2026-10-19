@@ -1769,6 +1769,135 @@ fn a_pushed_face_cuts_through_what_stands_in_its_way() {
     }
 }
 
+fn crate_lid() -> FaceQuery {
+    FaceQuery::OnPlane {
+        point: [0.0, 0.0, 140.0],
+        normal: UP,
+    }
+}
+
+/// The part of a disc of radius `r` beyond a chord `d` from its centre, the
+/// part a cut there leaves on the far side.
+fn disc_beyond(r: f64, d: f64) -> f64 {
+    if d >= r {
+        return 0.0;
+    }
+    PI * r * r - (r * r * (d / r).acos() - d * (r * r - d * d).sqrt())
+}
+
+#[test]
+fn a_moved_face_swallows_or_cuts_what_it_passes() {
+    // What stands on the moved face itself: the front pushed past the floor
+    // of a pocket 30 deep in it, which then goes, and the lid pulled up past
+    // the 6 mm bosses on it, which it swallows. Short of that, the faces just
+    // move: the pocket is shallower and the bosses shorter. Either way the
+    // part is the plain crate moved the same, less what's left of the pocket
+    // or plus what's left of the bosses.
+    const BOSSES: [[f64; 3]; 4] = [
+        [-165.0, -115.0, 8.0],
+        [165.0, -115.0, 8.0],
+        [-165.0, 115.0, 8.0],
+        [165.0, 115.0, 8.0],
+    ];
+    let pocket = |k: &Kernel| {
+        crate_with(k, &[], &[])?.difference(Brep::cuboid(
+            k,
+            [-60.0, -160.0, 40.0],
+            [120.0, 40.0, 40.0],
+        )?)
+    };
+    type Make = Box<dyn Fn(&Kernel) -> Result<Brep, Error> + Send>;
+    let cases: Vec<(&str, Make, FaceQuery, f64, usize, f64)> = vec![
+        (
+            "front short of the pocket's floor",
+            Box::new(pocket),
+            crate_front(),
+            -20.0,
+            0,
+            -120.0 * 40.0 * 10.0,
+        ),
+        (
+            "front past the pocket's floor",
+            Box::new(pocket),
+            crate_front(),
+            -36.0,
+            1,
+            0.0,
+        ),
+        (
+            "lid short of the bosses' tops",
+            Box::new(|k| crate_with(k, &BOSSES, &[])),
+            crate_lid(),
+            3.0,
+            0,
+            4.0 * PI * 64.0 * 3.0,
+        ),
+        (
+            "lid past the bosses' tops",
+            Box::new(|k| crate_with(k, &BOSSES, &[])),
+            crate_lid(),
+            10.0,
+            4,
+            0.0,
+        ),
+    ];
+    for (name, make, face, d, in_the_way, left) in cases {
+        let (volume, plain, obstacles) = on_kernel(move |k| {
+            let part = make(k)?;
+            let picked = part.find_faces(&face, &Tolerance::default())?;
+            let obstacles = part.offset_obstacles(&picked, d)?.len();
+            let moved = part.offset_faces(&picked, d)?;
+            assert!(moved.is_manifold()?);
+            let plain = crate_with(k, &[], &[])?.offset_where(&face, d)?;
+            Ok::<_, Error>((moved.volume(PRECISE)?, plain.volume(PRECISE)?, obstacles))
+        })
+        .unwrap();
+        let expected = plain + left;
+        println!("{name}: {volume:.4} against {expected:.4}, {obstacles} in the way");
+        assert!(
+            ((volume - expected) / expected).abs() < PRECISE,
+            "{name}: {volume} against {expected}"
+        );
+        assert_eq!(obstacles, in_the_way, "{name}");
+    }
+
+    // A vent 25 in radius through the lid, its rim chamfered 3, as in
+    // game-cad's sample crate: the front pushed in to 22.2 short of its axis
+    // cuts both its wall and its chamfer, leaving what's behind the plane.
+    // Cutting the vent's space back out of the moved part instead used to
+    // leave a solid 45 mm out of true; copying the result back with
+    // CopyFaces, one inside out.
+    let (volume, plain) = on_kernel(|k| {
+        let rim = EdgeQuery::OnCircle {
+            center: [0.0, 0.0, 140.0],
+            axis: UP,
+            radius: 25.0,
+        };
+        let part = crate_with(k, &[], &[])?
+            .difference(Brep::cylinder(k, [0.0, 0.0, 60.0], 25.0, 90.0)?)?
+            .chamfer(&rim, 3.0 * 2.0_f64.sqrt(), &Tolerance::default())?;
+        let moved = part.offset_where(&crate_front(), -127.8)?;
+        assert!(moved.is_manifold()?);
+        moved.tessellate(&TessellationParams::default())?;
+        let plain = crate_with(k, &[], &[])?.offset_where(&crate_front(), -127.8)?;
+        Ok::<_, Error>((moved.volume(PRECISE)?, plain.volume(PRECISE)?))
+    })
+    .unwrap();
+    let steps = 300;
+    let chamfer: f64 = (0..steps)
+        .map(|i| {
+            disc_beyond(25.0 + (f64::from(i) + 0.5) * 3.0 / f64::from(steps), 22.2) * 3.0
+                / f64::from(steps)
+        })
+        .sum();
+    let expected = plain - 77.0 * disc_beyond(25.0, 22.2) - chamfer;
+    println!("chamfered vent: {volume:.4} against {expected:.4}");
+    assert!(
+        ((volume - expected) / expected).abs() < 1e-6,
+        "chamfered vent: {volume} against {expected}"
+    );
+}
+
 #[test]
 fn a_pushed_face_refuses_what_it_cannot_set_aside() {
     // A small boss stands 0.5 mm behind a front one, inside the room the

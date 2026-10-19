@@ -2272,21 +2272,28 @@ sm_status offset_faces(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     return rigid_local_operation(brep, changed, surfaces, motions, reach);
 }
 
-// Pushing a face in through what stands in its way.
+// Moving a face through what stands in its way.
 //
 // A face pushed in sweeps the space between its old plane and its new one.
 // Its neighbours trim back with it, and a feature standing on one of them
 // near the moving edge (a boss near a lid's edge when the wall below is
 // pushed in) is then crossed by the neighbour's new boundary: new topology,
-// which a local operation can't make. Such features are set aside, the face
-// is offset without them, and they come back cut by the face's new plane: a
-// boss as its material behind the plane, joined back; a hole as its space,
-// cut back out.
+// which a local operation can't make. So is a feature under a blend that
+// moves with the face (a pocket in a wall that a corner round slides over),
+// and one on the face itself that the move swallows a face of (a pocket
+// pushed past its floor, a chamfer pushed past its width, a boss a pulled
+// face rises past). Such features are set aside and the face is offset
+// without them. A boss comes back as its material behind the face's new
+// plane, joined back, or not at all when it's under it. Holes, filled for
+// the offset, come back by taking what the offset swept away from the part
+// with its holes, which cuts a hole the plane runs through along the plane.
 
 // A feature the offset runs into: faces standing on `base`, attached to it
-// along inner loops, that reach into the space a pushed face sweeps.
+// along inner loops, that the move crosses or swallows a face of.
 struct Obstacle {
     SmFace* base = nullptr;
+    // Whether `base` is one of the faces moved.
+    bool on_picked = false;
     std::vector<SmFace*> faces;
     // +1: on the base's outer side (a boss); -1: inside it (a hole); 0:
     // neither, or the base isn't planar.
@@ -2298,17 +2305,47 @@ struct Obstacle {
     double high[3] = {0.0, 0.0, 0.0};
 };
 
-// A picked plane pushed in: a point on it, its outward normal, and how far.
+// Two unit axes along a plane with unit normal `w`, making (u, v, w)
+// right-handed.
+void plane_axes(const SmVector3d& w, SmVector3d& u, SmVector3d& v) {
+    u = std::fabs(w.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
+    u = u - w * u.Dot(w);
+    u = u / u.Length();
+    v = w * u;  // cross product
+}
+
+// A picked plane pushed in: a point on it, its outward normal, and how far;
+// and the box each blend moving with it sweeps through (see add_blends).
 struct Push {
     SmPoint3d point;
     SmVector3d normal;
     double distance;
+    // A box in the frame (u, v, normal) at `point`.
+    struct Box {
+        double low[3];
+        double high[3];
+    };
+    SmVector3d u, v;
+    std::vector<Box> blends;
     // Whether `p` lies in the space the face sweeps: behind its old plane and
     // beyond its new one.
     bool sweeps(const SmPoint3d& p, double tolerance) const {
         const double behind_old = (p - point).Dot(normal);
         const double beyond_new = behind_old + distance;
         return behind_old <= tolerance && beyond_new > tolerance;
+    }
+    // Whether `p` lies in a box a blend moving with the face sweeps.
+    bool blend_sweeps(const SmPoint3d& p, double tolerance) const {
+        const SmVector3d d = p - point;
+        const double c[3] = {d.Dot(u), d.Dot(v), d.Dot(normal)};
+        for (const Box& box : blends) {
+            bool inside = true;
+            for (int k = 0; k < 3; ++k) {
+                inside = inside && c[k] >= box.low[k] - tolerance && c[k] <= box.high[k] + tolerance;
+            }
+            if (inside) return true;
+        }
+        return false;
     }
 };
 
@@ -2324,7 +2361,9 @@ std::vector<Push> pushes_of(const SmTArray<SmFace*>& picked, double distance) {
             outward_normal_inside(picked[i], inside, normal) != SM_SUCCESS) {
             continue;
         }
-        pushes.push_back({inside, normal, -distance});
+        Push push{inside, normal, -distance, {}, {}, {}};
+        plane_axes(normal, push.u, push.v);
+        pushes.push_back(push);
     }
     return pushes;
 }
@@ -2337,10 +2376,7 @@ bool frame_of(const SmFace* face, SmPoint3d& origin, SmVector3d& u, SmVector3d& 
         outward_normal_inside(face, origin, w) != SM_SUCCESS) {
         return false;
     }
-    u = std::fabs(w.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
-    u = u - w * u.Dot(w);
-    u = u / u.Length();
-    v = w * u;  // cross product
+    plane_axes(w, u, v);
     return true;
 }
 
@@ -2362,14 +2398,67 @@ void box_corners(const SmFace* face, std::vector<SmPoint3d>& out) {
     }
 }
 
+// Each push's blends: the faces moving with the picked ones (plan_offset),
+// each boxed in the push's frame from where it is to where it goes.
+void add_blends(const SmBrep& brep, const SmTArray<SmFace*>& picked, const Motions& motions,
+                std::vector<Push>& pushes) {
+    if (pushes.empty()) return;
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        ULONG index = 0;
+        const Motion motion = motion_of(motions, faces[i]);
+        if (picked.FindElement(faces[i], index) || motion.kind != Motion::kShift) continue;
+        std::vector<SmPoint3d> points;
+        face_points(faces[i], points);
+        box_corners(faces[i], points);
+        for (Push& push : pushes) {
+            Push::Box box = {{HUGE_VAL, HUGE_VAL, HUGE_VAL}, {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL}};
+            const double shift[3] = {motion.shift.Dot(push.u), motion.shift.Dot(push.v), motion.shift.Dot(push.normal)};
+            for (const SmPoint3d& p : points) {
+                const SmVector3d d = p - push.point;
+                const double c[3] = {d.Dot(push.u), d.Dot(push.v), d.Dot(push.normal)};
+                for (int k = 0; k < 3; ++k) {
+                    box.low[k] = std::min(box.low[k], c[k] + std::min(shift[k], 0.0));
+                    box.high[k] = std::max(box.high[k], c[k] + std::max(shift[k], 0.0));
+                }
+            }
+            push.blends.push_back(box);
+        }
+    }
+}
+
+// Whether moving an obstacle's base `distance` along its normal swallows one
+// of the obstacle's faces whole (or, with `all`, every one): the face lies in
+// the space the base sweeps, so a local operation would have to remove it.
+bool swallows(const Obstacle& obstacle, double distance, double tolerance, bool all = false) {
+    const double low = std::min(distance, 0.0) - tolerance;
+    const double high = std::max(distance, 0.0) + tolerance;
+    for (SmFace* face : obstacle.faces) {
+        std::vector<SmPoint3d> points;
+        face_points(face, points);
+        SmPoint3d interior;
+        if (face->CalculateAnInternalPoint(interior) == SM_SUCCESS) points.push_back(interior);
+        bool inside = !points.empty();
+        for (const SmPoint3d& p : points) {
+            const double height = (p - obstacle.origin).Dot(obstacle.w);
+            inside = inside && height >= low && height <= high;
+        }
+        if (inside != all) return inside;
+    }
+    return all;
+}
+
 // The features the faces' move runs into (see Obstacle), in the brep's face
-// order. Only a planar face pushed in sweeps space; `motions` (plan_offset)
-// says which faces move with it, and the faces beside them are the ones whose
-// boundaries move.
+// order. A planar face pushed in sweeps space, as do the blends moving with
+// it; `motions` (plan_offset) says which faces those are, and the faces beside
+// them are the ones whose boundaries move. On a picked plane itself, pushed in
+// or pulled out, only a feature the move swallows a face of is in the way: a
+// hole pushed in, a boss pulled out.
 void find_obstacles(const SmBrep& brep, const SmTArray<SmFace*>& picked, double distance, const Motions& motions,
                     std::vector<Obstacle>& out) {
-    const std::vector<Push> pushes = pushes_of(picked, distance);
-    if (pushes.empty()) return;
+    std::vector<Push> pushes = pushes_of(picked, distance);
+    add_blends(brep, picked, motions, pushes);
     const double tolerance = brep.GetTolerance();
     SmTArray<SmFace*> faces;
     brep.GetFaces(faces);
@@ -2378,7 +2467,7 @@ void find_obstacles(const SmBrep& brep, const SmTArray<SmFace*>& picked, double 
         return picked.FindElement(const_cast<SmFace*>(face), index) || motion_of(motions, face).kind != Motion::kKept;
     };
     std::unordered_set<const SmFace*> beside;
-    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+    for (ULONG i = 0; i < faces.GetSize() && !pushes.empty(); ++i) {
         if (!moving(faces[i])) continue;
         SmTArray<SmEdge*> edges;
         faces[i]->GetEdges(edges);
@@ -2388,23 +2477,35 @@ void find_obstacles(const SmBrep& brep, const SmTArray<SmFace*>& picked, double 
             }
         }
     }
+    std::unordered_set<const SmFace*> planes;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        SmPoint3d on_plane;
+        SmVector3d plane_normal;
+        if (picked[i]->GetSurface() && plane_of(picked[i]->GetSurface(), on_plane, plane_normal)) {
+            planes.insert(picked[i]);
+        }
+    }
+    const int swallowed_side = distance < 0.0 ? -1 : 1;
     std::unordered_set<const SmFace*> taken;
     for (ULONG i = 0; i < faces.GetSize(); ++i) {
         SmFace* base = faces[i];
-        if (!beside.count(base)) continue;
+        const bool on_picked = planes.count(base) > 0;
+        if (!beside.count(base) && !on_picked) continue;
         SmTArray<SmLoop*> loops;
         base->GetLoops(loops);
         for (ULONG l = 0; l < loops.GetSize(); ++l) {
             if (loops[l]->IsOuterLoop()) continue;
             SmTArray<SmEdgeuse*> uses;
             loops[l]->GetEdgeuses(uses);
-            bool reached = false;
+            bool reached = on_picked;
             for (ULONG e = 0; e < uses.GetSize() && !reached; ++e) {
                 std::vector<SmPoint3d> points;
                 if (!uses[e]->GetEdge()) continue;
                 edge_points(uses[e]->GetEdge(), 24, points);
                 for (const SmPoint3d& p : points) {
-                    for (const Push& push : pushes) reached = reached || push.sweeps(p, tolerance);
+                    for (const Push& push : pushes) {
+                        reached = reached || push.sweeps(p, tolerance) || push.blend_sweeps(p, tolerance);
+                    }
                 }
             }
             if (!reached) continue;
@@ -2413,6 +2514,7 @@ void find_obstacles(const SmBrep& brep, const SmTArray<SmFace*>& picked, double 
             // feature is part of what moves, which can't be set aside.
             Obstacle obstacle;
             obstacle.base = base;
+            obstacle.on_picked = on_picked;
             std::vector<SmFace*> queue;
             std::unordered_set<const SmFace*> seen;
             bool escapes = false;
@@ -2440,7 +2542,6 @@ void find_obstacles(const SmBrep& brep, const SmTArray<SmFace*>& picked, double 
                 if (seen.count(faces[f])) obstacle.faces.push_back(faces[f]);
             }
             if (obstacle.faces.empty() || taken.count(obstacle.faces[0])) continue;
-            for (SmFace* face : obstacle.faces) taken.insert(face);
             if (!escapes && frame_of(base, obstacle.origin, obstacle.u, obstacle.v, obstacle.w)) {
                 std::vector<SmPoint3d> points;
                 for (SmFace* face : obstacle.faces) {
@@ -2477,6 +2578,15 @@ void find_obstacles(const SmBrep& brep, const SmTArray<SmFace*>& picked, double 
                 obstacle.low[2] = obstacle.side > 0 ? 0.0 : low[2] - margin;
                 obstacle.high[2] = obstacle.side > 0 ? high[2] + margin : 0.0;
             }
+            // A feature on a picked face that the move leaves whole (a boss
+            // on a face pushed in grows; a hole on one pulled out deepens)
+            // isn't in the way, and neither is one that reaches round to
+            // other faces, such as a hole right through.
+            if (on_picked &&
+                (escapes || obstacle.side != swallowed_side || !swallows(obstacle, distance, 10.0 * tolerance))) {
+                continue;
+            }
+            for (SmFace* face : obstacle.faces) taken.insert(face);
             out.push_back(obstacle);
         }
     }
@@ -2602,11 +2712,28 @@ ULONG shell_count(const SmBrep& brep) {
     return shells.GetSize();
 }
 
+// The largest height of a brep's bounding box corners in an obstacle's
+// frame: how far out of its base it reaches, at most.
+double reach_out(const SmBrep& brep, const Obstacle& obstacle) {
+    SmExtent3d bounds;
+    if (brep.CalculateBoundingBox(bounds) != SM_SUCCESS) return HUGE_VAL;
+    const SmPoint3d low = bounds.GetMin();
+    const SmPoint3d high = bounds.GetMax();
+    double furthest = -HUGE_VAL;
+    for (int k = 0; k < 8; ++k) {
+        const SmPoint3d corner(k & 1 ? high.x : low.x, k & 2 ? high.y : low.y, k & 4 ? high.z : low.z);
+        furthest = std::max(furthest, (corner - obstacle.origin).Dot(obstacle.w));
+    }
+    return furthest;
+}
+
 // Offsets the picked faces through `obstacles` (see find_obstacles), in place.
 sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance,
                        const std::vector<Obstacle>& obstacles) {
     for (const Obstacle& obstacle : obstacles) {
         if (obstacle.side == 0 || !box_holds_only(brep, obstacle)) return SM_SHIM_ERR_OBSTRUCTED;
+        // Only a face pushed in leaves holes in the way (find_obstacles).
+        if (obstacle.side < 0 && !(distance < 0.0)) return SM_SHIM_ERR_OBSTRUCTED;
     }
     const std::vector<Push> pushes = pushes_of(picked, distance);
     for (ULONG i = 0; i < picked.GetSize(); ++i) mark_picked(picked[i], static_cast<long>(i));
@@ -2615,43 +2742,70 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     unmark_all(brep);
     if (status != SM_SUCCESS) return status;
 
-    // Set each obstacle aside: a boss's material, taken out; a hole's space,
-    // filled in.
-    std::vector<std::unique_ptr<SmBrep>> bosses;
-    std::vector<std::unique_ptr<SmBrep>> holes;
+    // Set each obstacle aside: a boss's material, taken out; then a hole's
+    // space, filled in, keeping the part as it was with its holes.
+    std::vector<std::pair<const Obstacle*, std::unique_ptr<SmBrep>>> bosses;
     for (const Obstacle& obstacle : obstacles) {
+        if (obstacle.side < 0) continue;
         std::unique_ptr<SmBrep> box;
         std::unique_ptr<SmBrep> second;
         std::unique_ptr<SmBrep> part;
         if ((status = frame_box(obstacle.origin, obstacle.u, obstacle.v, obstacle.low, obstacle.high, box)) !=
                 SM_SUCCESS ||
-            (status = copy_of(*box, second)) != SM_SUCCESS || (status = copy_of(brep, part)) != SM_SUCCESS) {
+            (status = copy_of(*box, second)) != SM_SUCCESS || (status = copy_of(brep, part)) != SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanIntersection, part, std::move(box))) != SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanDifference, work, std::move(second))) != SM_SUCCESS) {
             return status;
         }
-        if (obstacle.side > 0) {
-            if ((status = boolean_into(SmApiBooleanIntersection, part, std::move(box))) != SM_SUCCESS ||
-                (status = boolean_into(SmApiBooleanDifference, work, std::move(second))) != SM_SUCCESS) {
-                return status;
-            }
-            bosses.push_back(std::move(part));
-        } else {
-            if ((status = boolean_into(SmApiBooleanDifference, box, std::move(part))) != SM_SUCCESS ||
-                (status = boolean_into(SmApiBooleanUnion, work, std::move(second))) != SM_SUCCESS) {
-                return status;
-            }
-            holes.push_back(std::move(box));
+        bosses.emplace_back(&obstacle, std::move(part));
+    }
+    // A hole on a picked face that the push swallows whole has nothing to
+    // come back as; any other needs the part as it is to come back from.
+    std::unique_ptr<SmBrep> holed;
+    const double tolerance = 10.0 * brep.GetTolerance();
+    for (const Obstacle& obstacle : obstacles) {
+        if (obstacle.side > 0) continue;
+        const bool gone = obstacle.on_picked && swallows(obstacle, distance, tolerance, true);
+        if (!gone && !holed && (status = copy_of(*work, holed)) != SM_SUCCESS) return status;
+    }
+    for (const Obstacle& obstacle : obstacles) {
+        if (obstacle.side > 0) continue;
+        std::unique_ptr<SmBrep> box;
+        if ((status = frame_box(obstacle.origin, obstacle.u, obstacle.v, obstacle.low, obstacle.high, box)) !=
+                SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanUnion, work, std::move(box))) != SM_SUCCESS) {
+            return status;
         }
     }
     if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
     SmTArray<SmFace*> moved;
     if (!find_picked(*work, picked.GetSize(), moved)) return SM_SHIM_ERR_OBSTRUCTED;
+    std::unique_ptr<SmBrep> filled;
+    if (holed && (status = copy_of(*work, filled)) != SM_SUCCESS) return status;
     status = keeping_topology(*work, [&] { return offset_faces(*work, moved, distance); });
     if (status != SM_SUCCESS) return status;
 
-    // Each boss back as far as the pushed planes leave it; each hole cut back.
-    for (std::unique_ptr<SmBrep>& boss : bosses) {
-        bool gone = false;
+    // The holes back: the part with its holes, less what the offset swept
+    // from the filled part. That cuts what the pushed plane runs through
+    // along the plane, as a cut of the part with a slab would; cutting each
+    // hole's space back out of the offset part instead can leave a broken
+    // solid, as where a vent's chamfer meets the lid.
+    if (holed) {
+        std::unique_ptr<SmBrep> after;
+        if ((status = copy_of(*work, after)) != SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanDifference, filled, std::move(after))) != SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanDifference, holed, std::move(filled))) != SM_SUCCESS) {
+            return status;
+        }
+        work = std::move(holed);
+    }
+
+    // Each boss back as far as the moved planes leave it: behind a plane
+    // pushed in, and not at all under one pulled out past it.
+    for (auto& [obstacle, boss] : bosses) {
+        bool gone = obstacle->on_picked && distance > 0.0 && reach_out(*boss, *obstacle) <= distance + tolerance;
         for (const Push& push : pushes) {
+            if (gone) break;
             SmExtent3d bounds;
             if (boss->CalculateBoundingBox(bounds) != SM_SUCCESS) return SM_ERR;
             const SmPoint3d plane = push.point - push.normal * push.distance;
@@ -2672,26 +2826,19 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
             if (furthest <= brep.GetTolerance()) continue;
             // Keep what's behind the plane: a box on it reaching back past
             // the boss, wide enough to cover it.
-            SmVector3d u = std::fabs(push.normal.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
-            u = u - push.normal * u.Dot(push.normal);
-            u = u / u.Length();
-            const SmVector3d v = push.normal * u;  // cross product
             const double reach = (high - low).Length() + 1.0;
             const SmVector3d centre = (SmVector3d(low.x, low.y, low.z) + SmVector3d(high.x, high.y, high.z)) * 0.5;
             const SmVector3d offset = SmPoint3d(centre.x, centre.y, centre.z) - plane;
-            const double box_low[3] = {offset.Dot(u) - reach, offset.Dot(v) - reach, -2.0 * reach};
-            const double box_high[3] = {offset.Dot(u) + reach, offset.Dot(v) + reach, 0.0};
+            const double box_low[3] = {offset.Dot(push.u) - reach, offset.Dot(push.v) - reach, -2.0 * reach};
+            const double box_high[3] = {offset.Dot(push.u) + reach, offset.Dot(push.v) + reach, 0.0};
             std::unique_ptr<SmBrep> behind;
-            if ((status = frame_box(plane, u, v, box_low, box_high, behind)) != SM_SUCCESS ||
+            if ((status = frame_box(plane, push.u, push.v, box_low, box_high, behind)) != SM_SUCCESS ||
                 (status = boolean_into(SmApiBooleanIntersection, boss, std::move(behind))) != SM_SUCCESS) {
                 return status;
             }
         }
         if (gone) continue;
         if ((status = boolean_into(SmApiBooleanUnion, work, std::move(boss))) != SM_SUCCESS) return status;
-    }
-    for (std::unique_ptr<SmBrep>& hole : holes) {
-        if ((status = boolean_into(SmApiBooleanDifference, work, std::move(hole))) != SM_SUCCESS) return status;
     }
     if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
     unmark_all(*work);
@@ -2700,13 +2847,13 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     // with the pushed face) would come back on its own.
     if (shell_count(*work) != shell_count(brep)) return SM_SHIM_ERR_OBSTRUCTED;
 
+    // MergeBrep rather than CopyFaces, which classifies regions again and
+    // can turn the solid inside out (a vent cut along a moved face).
     SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
     SmTArray<SmFace*> old_faces;
     brep.GetFaces(old_faces);
     if ((status = static_cast<sm_status>(brep.RemoveFaces(old_faces))) != SM_SUCCESS) return status;
-    SmTArray<SmFace*> new_faces;
-    work->GetFaces(new_faces);
-    return static_cast<sm_status>(work->CopyFaces(new_faces, &brep));
+    return static_cast<sm_status>(brep.MergeBrep(*work, NULL, NULL, FALSE));
 }
 
 // The offset with whatever it runs into cut through, or as before when
