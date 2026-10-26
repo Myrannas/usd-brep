@@ -48,6 +48,8 @@ static const sm_status SM_SHIM_ERR_BAD_AXIS = 2031;            /* an axis isn't 
 static const sm_status SM_SHIM_ERR_AXIS_CROSSES_FACE = 2032;   /* a revolve's axis runs through the inside of its face */
 static const sm_status SM_SHIM_ERR_BAD_DRAFT = 2033;           /* a draft angle isn't finite and under 90 degrees either way */
 static const sm_status SM_SHIM_ERR_DRAFT_CLOSES = 2034;        /* a draft's sides meet before the end of the sweep */
+static const sm_status SM_SHIM_ERR_BAD_PATH = 2035;            /* a pipe's path turns back on itself, or a bend overlaps itself */
+static const sm_status SM_SHIM_ERR_ARC_CORNER = 2036;          /* an arc of a pipe's path meets a curve beside it at an angle */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -457,6 +459,55 @@ sm_status sm_brep_revolve_face(const sm_brep *brep, size_t face, sm_vec3 axis_po
  * *faces with sm_swept_faces_free. */
 sm_status sm_brep_sweep_face_tapered(const sm_brep *brep, size_t face, double distance, double draft_deg,
                                      sm_brep **out, sm_swept_face **faces, size_t *face_count);
+
+/* What a face of a pipe is (sm_brep_create_pipe). */
+enum sm_pipe_role {
+    /* The outer wall, swept round one curve of the path. */
+    SM_PIPE_OUTER = 0,
+    /* The inner wall of a hollow pipe, swept round one curve of the path. */
+    SM_PIPE_INNER = 1,
+    /* The cap at the path's start. */
+    SM_PIPE_START = 2,
+    /* The cap at its end. */
+    SM_PIPE_END = 3
+};
+
+/* One face of a pipe, in the order of its face list: its sm_pipe_role, and
+ * for walls the index in the path of the curve it was swept along, or -1
+ * when the shim couldn't tell (and for caps). */
+typedef struct sm_pipe_face {
+    int32_t role;
+    int32_t segment;
+} sm_pipe_face;
+
+/* A pipe: a circle of `radius` swept along a path of lines and arcs in the
+ * plane through origin spanned by x_axis and y_axis (unit and perpendicular),
+ * as sm_brep_create_planar_faces takes its curves but in order, each
+ * starting where the last ended and running its own way (an arc's sweep_deg
+ * may be negative); a circle is a closed path on its own. With inner_radius
+ * above 0 (and below radius) an open path's pipe is hollow. Each curve gets a piece: a disc
+ * square to it at its start, swept along a line (as
+ * sm_brep_sweep_face) or turned about an arc's centre (as
+ * sm_brep_revolve_face), so walls along lines are cylinders and along arcs
+ * tori. Where two curves meet tangentially the pieces meet face to face;
+ * where they meet at an angle both are made longer and cut at the plane
+ * halfway between them, a mitre: only between lines, since a plane can't
+ * mitre a cylinder against a torus. The pieces are joined
+ * (SmApiBooleanUnion); a hollow pipe is the solid one less a solid pipe of
+ * inner_radius. An open path is capped at both ends, a closed one isn't.
+ * *faces says what each face is (sm_pipe_face); free it with
+ * sm_pipe_faces_free. SM_ERR_INVALID_INPUT for an empty path or bad radii;
+ * SM_SHIM_ERR_BAD_PATH when the path turns back on itself (by more than 179
+ * degrees), a bend would overlap itself, or a closed path's pipe is hollow
+ * (its bore would be sealed inside); SM_SHIM_ERR_ARC_CORNER when an arc
+ * meets a curve beside it at an angle; the kernel's status, or
+ * SM_SHIM_ERR_BAD_SWEEP, when it builds no solid. */
+sm_status sm_brep_create_pipe(const sm_plane_curve *path, size_t count, sm_vec3 origin, sm_vec3 x_axis,
+                              sm_vec3 y_axis, double radius, double inner_radius, sm_brep **out, sm_pipe_face **faces,
+                              size_t *face_count);
+
+/* Frees the array sm_brep_create_pipe returns. NULL is ignored. */
+void sm_pipe_faces_free(sm_pipe_face *faces);
 
 /* Merges faces that lie on one surface into one face, removing the edges
  * between them, and edges that lie on one curve into one edge

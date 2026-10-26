@@ -332,6 +332,70 @@ fn arcs_turn_into_spheres_and_tori() {
 }
 
 #[test]
+fn a_circle_turns_into_a_torus_about_any_axis() {
+    // The circle's edge starts on the sketch's x side, so about most of
+    // these axes the generator circle starts off the torus's equator, and
+    // below it as often as above.
+    let frame = tilted();
+    for axis in [
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [-1.0, 0.0],
+        [0.0, -1.0],
+        [-1.0, 2.0],
+    ] {
+        let length = f64::hypot(axis[0], axis[1]);
+        // The circle's centre, 20 off the axis.
+        let centre = [axis[1] / length * 20.0, -axis[0] / length * 20.0];
+        let direction = add(scale(frame.x_axis, axis[0]), scale(frame.y_axis, axis[1]));
+        for angle in [360.0, 90.0, -90.0] {
+            let (volume, torus, faces) = on_kernel(move |k| {
+                let ring = vec![vec![BoundaryCurve::labelled(
+                    PlaneCurve::Circle {
+                        centre,
+                        radius: 5.0,
+                    },
+                    edge(0),
+                )]];
+                let sheet = Brep::planar_faces(k, &frame, &ring).unwrap();
+                let swept = sheet
+                    .revolve_face(0, frame.origin, direction, angle)
+                    .unwrap();
+                let faces = swept.prism.faces().unwrap();
+                let side = swept
+                    .faces
+                    .iter()
+                    .position(|r| matches!(r, SweptFace::Side { .. }))
+                    .unwrap();
+                (
+                    swept.prism.volume(1e-9).unwrap(),
+                    faces[side].surface.clone(),
+                    faces.len(),
+                )
+            });
+            assert_eq!(faces, if angle == 360.0 { 1 } else { 3 });
+            let expected = 2.0 * PI * PI * 20.0 * 25.0 * f64::abs(angle) / 360.0;
+            assert!(close(volume, expected), "{axis:?} {angle}: {volume}");
+            let Surface::Torus {
+                center,
+                axis: along,
+                major_radius,
+                minor_radius,
+                ..
+            } = torus
+            else {
+                panic!("{axis:?} {angle}: {torus:?} isn't a torus");
+            };
+            let unit = scale(direction, 1.0 / length);
+            assert!(1.0 - dot(along, unit).abs() < 1e-12, "{along:?}");
+            assert_near("centre", center, frame.origin, 1e-9);
+            assert!((major_radius - 20.0).abs() < 1e-9 && (minor_radius - 5.0).abs() < 1e-9);
+        }
+    }
+}
+
+#[test]
 fn a_face_touching_the_axis_at_a_point_turns_into_one_solid() {
     // Two cones meeting at their apex on the axis, and a cylinder round
     // them.

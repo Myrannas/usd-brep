@@ -15,6 +15,7 @@ use crate::imprint::{Imprint, ImprintEdge};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams, slice};
+use crate::pipe::{Pipe, PipeFace};
 use crate::tessellation::{FaceKey, SurfaceCaches, Tessellation};
 
 /// Relative accuracy of [`Brep::face_centroid`]: placing a feature at a
@@ -25,8 +26,12 @@ const CENTROID_ACCURACY: f64 = 1e-7;
 const EDGE_LENGTH_ACCURACY: f64 = 1e-7;
 
 /// How far apart, in model units, one curve's end and the next one's start
-/// may be in a loop for [`Brep::planar_faces`].
+/// may be in a loop for [`Brep::planar_faces`] or a path for [`Brep::pipe`].
 const LOOP_GAP: f64 = 1e-6;
+
+/// The sharpest turn, in degrees, a [`Brep::pipe`]'s path may take where
+/// two curves meet: past it a mitre's corner would reach too far.
+const MAX_PIPE_TURN_DEG: f64 = 179.0;
 
 /// A B-rep solid owned by the kernel. It is freed on drop.
 ///
@@ -696,6 +701,149 @@ impl Brep {
         };
         Error::check(OP, status)?;
         Brep::from_raw(OP, out)
+    }
+
+    /// A pipe: a circle of `radius` swept along `path`, lines and arcs in
+    /// `frame`'s xy plane, hollow with `inner_radius` when that's given. Each
+    /// curve of the path starts where the last ended and runs its own way
+    /// (an arc's sweep may be negative); a circle is a closed path on its
+    /// own. An open path is capped at both ends, a closed one isn't.
+    ///
+    /// Each curve gets a piece: a disc square to it at its start, swept
+    /// along a line as [`sweep_face`](Brep::sweep_face) does or turned about
+    /// an arc's centre as
+    /// [`revolve_face`](Brep::revolve_face) does, so the walls along lines
+    /// are cylinders and along arcs tori. Where curves meet tangentially the
+    /// pieces meet face to face; where they meet at an angle the pipe is
+    /// mitred, both pieces cut at the plane halfway between them. The pieces
+    /// are joined (`SmApiBooleanUnion`), and a hollow pipe is the solid one
+    /// less a solid pipe of `inner_radius`. [`Pipe::faces`] says which face
+    /// is the outer wall, which the inner, which the start and end caps, and
+    /// which path curve each wall was swept along: one outer wall (and one
+    /// inner) per curve.
+    ///
+    /// Lines may meet at an angle, up to 179 degrees, but an arc must meet
+    /// the curves either side of it tangentially: a plane can't mitre a
+    /// cylinder against a torus. Refuses those paths, a bend tighter than the
+    /// pipe (an arc whose radius isn't more than `radius`), and a hollow pipe
+    /// along a closed path, whose bore would be sealed inside it (SMLib's
+    /// tessellation winds some of such a cavity's walls the wrong way).
+    pub fn pipe(
+        _kernel: &Kernel,
+        frame: &Frame,
+        path: &[PlaneCurve],
+        radius: f64,
+        inner_radius: Option<f64>,
+    ) -> Result<Pipe, Error> {
+        const OP: &str = "sm_brep_create_pipe";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
+        };
+        if path.is_empty() {
+            return invalid("the path needs at least one curve");
+        }
+        if let Some(reason) = path.iter().find_map(PlaneCurve::problem) {
+            return invalid(reason);
+        }
+        let circle = |c: &PlaneCurve| matches!(c, PlaneCurve::Circle { .. });
+        if path.len() > 1 && path.iter().any(circle) {
+            return invalid("a circle is a path on its own");
+        }
+        if path
+            .windows(2)
+            .any(|pair| gap(pair[0].end(), pair[1].start()) > LOOP_GAP)
+        {
+            return invalid("each curve of the path must start where the last ended");
+        }
+        // Where each curve meets the next, and the last the first when closed.
+        let closed = path.len() > 1 && gap(path[path.len() - 1].end(), path[0].start()) <= LOOP_GAP;
+        let ring = closed
+            || path.iter().any(|c| match *c {
+                PlaneCurve::Arc { sweep_deg, .. } => sweep_deg.abs() == 360.0,
+                _ => circle(c),
+            });
+        if ring && inner_radius.is_some() {
+            return invalid(
+                "a pipe along a closed path can't be hollow: its bore would be sealed inside",
+            );
+        }
+        let joints = path.windows(2).map(|pair| (pair[0], pair[1]));
+        let closing = closed.then(|| (path[path.len() - 1], path[0]));
+        for (before, after) in joints.chain(closing) {
+            let ([x1, y1], [x2, y2]) = (before.end_tangent(), after.start_tangent());
+            let turn = (x1 * y2 - y1 * x2).abs().atan2(x1 * x2 + y1 * y2);
+            if turn > MAX_PIPE_TURN_DEG.to_radians() {
+                return invalid("the path turns back on itself");
+            }
+            let arc = |c: PlaneCurve| !matches!(c, PlaneCurve::Line { .. });
+            if turn > 1e-9 && (arc(before) || arc(after)) {
+                return invalid(
+                    "an arc in the path must meet the curves either side of it tangentially",
+                );
+            }
+        }
+        check_positive(OP, radius, "the radius must be finite and positive")?;
+        let inner = inner_radius.unwrap_or(0.0);
+        if !(inner.is_finite() && inner >= 0.0 && inner < radius) {
+            return invalid(
+                "the inner radius must be finite, not negative, and less than the radius",
+            );
+        }
+        let tight = |c: &PlaneCurve| match *c {
+            PlaneCurve::Arc { radius: bend, .. } | PlaneCurve::Circle { radius: bend, .. } => {
+                bend <= radius
+            }
+            PlaneCurve::Line { .. } => false,
+        };
+        if path.iter().any(tight) {
+            return invalid("a bend's radius must be more than the pipe's");
+        }
+        let raw = path
+            .iter()
+            .map(|curve| curve.to_raw(&None, OP))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = ptr::null_mut();
+        let mut faces = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: raw holds raw.len() curves; the outputs are written only on
+        // success.
+        let status = unsafe {
+            sys::sm_brep_create_pipe(
+                raw.as_ptr(),
+                raw.len(),
+                vec3(frame.origin),
+                vec3(frame.x_axis),
+                vec3(frame.y_axis),
+                radius,
+                inner,
+                &mut out,
+                &mut faces,
+                &mut count,
+            )
+        };
+        match status {
+            sys::SM_SHIM_ERR_BAD_PATH => return invalid("the path turns back on itself"),
+            sys::SM_SHIM_ERR_ARC_CORNER => {
+                return invalid(
+                    "an arc in the path must meet the curves either side of it tangentially",
+                );
+            }
+            _ => Error::check(OP, status)?,
+        }
+        // SAFETY: on success faces holds count entries, which we copy and then
+        // free once.
+        let roles = unsafe {
+            let roles = slice(faces, count).iter().map(PipeFace::from_raw).collect();
+            sys::sm_pipe_faces_free(faces);
+            roles
+        };
+        Ok(Pipe {
+            solid: Brep::from_raw(OP, out)?,
+            faces: roles,
+        })
     }
 
     /// Merges faces that lie on one surface into one face, and edges that lie

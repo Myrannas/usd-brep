@@ -72,6 +72,11 @@ cargo test -p smlib
   (`SmPrimitiveCreation::CreateTaperExtrude` per loop, holes cut out). Sides
   from lines are planes and from arcs cones; it refuses a draft whose sides
   meet before the end. This is a sketch's extrude with draft.
+- `Brep::pipe` sweeps a circle, or a ring, along a path of lines and arcs
+  in a `Frame`'s plane: a piece per curve (a disc swept or revolved, so
+  walls are cylinders and tori), lines mitred where they meet at an angle,
+  all joined. `Pipe::faces` says which face is the outer wall, the inner
+  wall or a cap, and which path curve each wall was swept along.
 - `Brep::merge_faces` merges faces lying on one surface and edges lying on
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come

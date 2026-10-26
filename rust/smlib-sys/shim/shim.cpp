@@ -5363,9 +5363,12 @@ sm_status axis_crosses(const SmFace* face, const SmPoint3d& base, const SmVector
 // analytic (SmBSplineSurface::CopyAndAddAnalytics) but leaves tori as
 // surfaces of revolution, since CopyAndAddAnalytics doesn't look for them.
 // Gives each side that is one its torus (SmTorus::IsNurbSurfaceTorus), when
-// the torus has the surface's parameters: the same domain, and the same
-// point at every corner of a grid over it. Otherwise the side keeps its
-// surface of revolution.
+// the torus has the surface's parameters (the same domain, and the same
+// point at every corner of a grid over it) and those points lie on the torus
+// its centre, axis and radii describe, which is what callers read: the
+// recogniser can evaluate as the surface does while describing another
+// torus (before patch c7639c2). Otherwise the side keeps its surface of
+// revolution.
 void make_tori(SmBrep& brep) {
     const SmContext* context = brep.GetContext();
     SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
@@ -5387,6 +5390,8 @@ void make_tori(SmBrep& brep) {
         SmExtent3d box;
         if (faces[i]->CalculateBoundingBox(box) != SM_SUCCESS) continue;
         const double tolerance = 1e-9 * (1.0 + box.GetSize().Length());
+        const SmAxis2Placement& position = raw->GetPosition();
+        const SmVector3d axis = position.GetZAxis();
         bool agrees = true;
         for (int a = 0; a <= 4 && agrees; ++a) {
             for (int b = 0; b <= 4 && agrees; ++b) {
@@ -5395,6 +5400,10 @@ void make_tori(SmBrep& brep) {
                 agrees = surface->EvaluatePoint(uv, on_surface) == SM_SUCCESS &&
                          torus->EvaluatePoint(uv, on_torus) == SM_SUCCESS &&
                          (on_surface - on_torus).Length() <= tolerance;
+                const SmVector3d from_centre = on_surface - position.GetOrigin();
+                const double height = from_centre.Dot(axis);
+                const double out = (from_centre - axis * height).Length() - raw->GetMajorRadius();
+                agrees = agrees && std::fabs(std::hypot(out, height) - raw->GetMinorRadius()) <= tolerance;
             }
         }
         if (agrees) replace_surface(faces[i], std::move(torus));
@@ -5856,6 +5865,278 @@ sm_status taper_face(const SmBrep& brep, const SmFace* face, double distance, do
     return SM_SUCCESS;
 }
 
+// One curve of a pipe's path, in the frame's own (x, y): where it starts and
+// ends and its unit tangents there, along the way it runs.
+struct PipeSegment {
+    sm_plane_curve curve;
+    bool round = false;  // an arc or a circle
+    double start[2] = {0.0, 0.0};
+    double end[2] = {0.0, 0.0};
+    double start_tangent[2] = {0.0, 0.0};
+    double end_tangent[2] = {0.0, 0.0};
+    double sweep = 0.0;  // an arc's turn in degrees, signed; a circle's 360
+};
+
+PipeSegment pipe_segment(const sm_plane_curve& curve) {
+    PipeSegment segment;
+    segment.curve = curve;
+    if (curve.kind == SM_PLANE_LINE) {
+        const double dx = curve.b[0] - curve.a[0], dy = curve.b[1] - curve.a[1];
+        const double length = std::hypot(dx, dy);
+        segment.start[0] = curve.a[0];
+        segment.start[1] = curve.a[1];
+        segment.end[0] = curve.b[0];
+        segment.end[1] = curve.b[1];
+        segment.start_tangent[0] = segment.end_tangent[0] = dx / length;
+        segment.start_tangent[1] = segment.end_tangent[1] = dy / length;
+        return segment;
+    }
+    segment.round = true;
+    const double from = curve.kind == SM_PLANE_CIRCLE ? 0.0 : curve.start_deg;
+    segment.sweep = curve.kind == SM_PLANE_CIRCLE ? 360.0 : curve.sweep_deg;
+    const double to = from + segment.sweep;
+    const double turn = segment.sweep < 0.0 ? -1.0 : 1.0;
+    const double a = from * SM_PI / 180.0, b = to * SM_PI / 180.0;
+    segment.start[0] = curve.a[0] + curve.radius * std::cos(a);
+    segment.start[1] = curve.a[1] + curve.radius * std::sin(a);
+    segment.end[0] = curve.a[0] + curve.radius * std::cos(b);
+    segment.end[1] = curve.a[1] + curve.radius * std::sin(b);
+    segment.start_tangent[0] = -turn * std::sin(a);
+    segment.start_tangent[1] = turn * std::cos(a);
+    segment.end_tangent[0] = -turn * std::sin(b);
+    segment.end_tangent[1] = turn * std::cos(b);
+    return segment;
+}
+
+// The sharpest turn a pipe's path may take where two curves meet: 179
+// degrees, in radians.
+const double MAX_PIPE_TURN = 179.0 * SM_PI / 180.0;
+
+// Where two curves of a pipe's path meet: the angle the path turns through
+// there, in radians, and the plane halfway between them through the corner
+// (its unit normal, in the frame's (x, y)), where they're mitred unless they
+// meet tangentially.
+struct PipeJoint {
+    double turn = 0.0;
+    double corner[2] = {0.0, 0.0};
+    double mitre[2] = {0.0, 0.0};
+    bool mitred() const { return turn > 1e-9; }
+};
+
+PipeJoint pipe_joint(const PipeSegment& before, const PipeSegment& after) {
+    PipeJoint joint;
+    const double* t1 = before.end_tangent;
+    const double* t2 = after.start_tangent;
+    joint.turn = std::atan2(std::fabs(t1[0] * t2[1] - t1[1] * t2[0]), t1[0] * t2[0] + t1[1] * t2[1]);
+    joint.corner[0] = after.start[0];
+    joint.corner[1] = after.start[1];
+    const double mx = t1[0] + t2[0], my = t1[1] + t2[1];
+    const double length = std::hypot(mx, my);
+    joint.mitre[0] = length > 0.0 ? mx / length : t1[0];
+    joint.mitre[1] = length > 0.0 ? my / length : t1[1];
+    return joint;
+}
+
+// The labels a pipe's pieces carry while they're joined: SWEPT_ROLE's
+// feature id, the sm_pipe_role as the role and the path curve as the index.
+void mark_pipe(SmFace& face, int32_t role, int32_t segment) {
+    sm_label label{};
+    label.present = 1;
+    label.feature = SWEPT_ROLE;
+    label.index = static_cast<uint32_t>(segment);
+    std::snprintf(label.role, sizeof label.role, "pipe %d", static_cast<int>(role));
+    write_label(face, label);
+}
+
+// One curve's piece of a solid pipe of `radius`: a disc square to the curve
+// at its start, swept along a line (sweep_face) or turned about an arc's
+// centre (revolve_face), `before` and `after` longer at each end (in model
+// units along the curve), its wall marked with `wall` and the curve's index,
+// and its caps at the path's ends when `first` or `last`.
+sm_status pipe_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame, double radius,
+                     int32_t wall, double before, double after, bool first, bool last,
+                     std::unique_ptr<SmBrep>& piece) {
+    const SmVector3d x = frame.GetXAxis(), y = frame.GetYAxis(), normal = frame.GetZAxis();
+    const auto world = [&](double u, double v) { return frame.GetOrigin() + x * u + y * v; };
+    // Where the piece starts, extended back along the curve.
+    SmPoint3d origin;
+    SmVector3d tangent;
+    double angle = 0.0;
+    SmPoint3d centre;
+    if (!segment.round) {
+        tangent = x * segment.start_tangent[0] + y * segment.start_tangent[1];
+        origin = world(segment.start[0], segment.start[1]) - tangent * before;
+    } else {
+        const double r = segment.curve.radius;
+        const double turn = segment.sweep < 0.0 ? -1.0 : 1.0;
+        const double from = (segment.curve.kind == SM_PLANE_CIRCLE ? 0.0 : segment.curve.start_deg) -
+                            turn * before / r * 180.0 / SM_PI;
+        angle = segment.sweep + turn * (before + after) / r * 180.0 / SM_PI;
+        if (std::fabs(angle) > 360.0) return SM_SHIM_ERR_BAD_PATH;
+        const double a = from * SM_PI / 180.0;
+        centre = world(segment.curve.a[0], segment.curve.a[1]);
+        origin = world(segment.curve.a[0] + r * std::cos(a), segment.curve.a[1] + r * std::sin(a));
+        tangent = (x * -std::sin(a) + y * std::cos(a)) * turn;
+    }
+    // The disc, facing along the curve.
+    sm_plane_curve circle{};
+    circle.kind = SM_PLANE_CIRCLE;
+    circle.radius = radius;
+    SmBrep* raw = nullptr;
+    sm_status status = planar_faces(&circle, 1, raw);
+    if (status != SM_SUCCESS) return status;
+    std::unique_ptr<SmBrep> disc(raw);
+    status = static_cast<sm_status>(SmApiTransform(disc.get(), SmAxis2Placement(origin, normal, tangent * normal)));
+    if (status != SM_SUCCESS) return status;
+    SmTArray<SmFace*> disc_faces;
+    disc->GetFaces(disc_faces);
+    if (disc_faces.GetSize() != 1) return SM_ERR;
+
+    SmBrep* swept = nullptr;
+    std::vector<sm_swept_face> roles;
+    if (!segment.round) {
+        const double length = std::hypot(segment.end[0] - segment.start[0], segment.end[1] - segment.start[1]);
+        status = sweep_face(*disc, disc_faces[0], length + before + after, swept, roles);
+    } else {
+        status = revolve_face(*disc, disc_faces[0], centre, normal, angle, swept, roles);
+    }
+    if (status != SM_SUCCESS) return status;
+    piece.reset(swept);
+    SmTArray<SmFace*> faces;
+    piece->GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (roles[i].role == SM_SWEPT_SIDE) {
+            mark_pipe(*faces[i], wall, index);
+        } else if (roles[i].role == SM_SWEPT_START && first) {
+            mark_pipe(*faces[i], SM_PIPE_START, -1);
+        } else if (roles[i].role == SM_SWEPT_END && last) {
+            mark_pipe(*faces[i], SM_PIPE_END, -1);
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// Cuts away the part of the piece beyond the plane through `corner` with
+// unit normal `away` (SmApiBooleanDifference with a box that size covers).
+sm_status cut_beyond(std::unique_ptr<SmBrep>& piece, const SmPoint3d& corner, const SmVector3d& away, double size) {
+    SmVector3d across = away * SmVector3d(0.0, 0.0, 1.0);
+    if (across.Length() < 1e-6) across = away * SmVector3d(1.0, 0.0, 0.0);
+    across.Unitize(FALSE);
+    SmBrep* box = nullptr;
+    SmApiStatus status = SmApiCreateBox(SmVector3d(-size, -size, 0.0), 2.0 * size, 2.0 * size, size, box);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    std::unique_ptr<SmBrep> beyond(box);
+    status = SmApiTransform(beyond.get(), SmAxis2Placement(corner, across, away * across));
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    std::vector<std::unique_ptr<SmBrep>> cut;
+    cut.push_back(std::move(beyond));
+    return cut_holes(piece, cut);
+}
+
+// A solid pipe of `radius` along the path: a piece for each curve, mitred to
+// its neighbours where they meet at an angle (each made longer at that end,
+// by enough for its cap to clear the plane halfway between them, and cut
+// there) and met face to face where they meet tangentially, all joined
+// (SmApiBooleanUnion). An open path's ends are made `margin` longer, and
+// capped when `caps`. Walls are marked `wall`.
+sm_status solid_pipe(const std::vector<PipeSegment>& segments, const std::vector<PipeJoint>& joints, bool closed,
+                     const SmAxis2Placement& frame, double radius, int32_t wall, double margin, bool caps,
+                     double size, std::unique_ptr<SmBrep>& pipe) {
+    const size_t count = segments.size();
+    const auto extension = [&](const PipeJoint& joint) {
+        return joint.mitred() ? radius * std::tan(joint.turn / 2.0) + radius : 0.0;
+    };
+    const SmVector3d x = frame.GetXAxis(), y = frame.GetYAxis();
+    for (size_t i = 0; i < count; ++i) {
+        const PipeJoint* behind = i > 0 ? &joints[i - 1] : (closed && count > 1 ? &joints.back() : nullptr);
+        const PipeJoint* ahead = i < joints.size() && (i + 1 < count || (closed && count > 1)) ? &joints[i] : nullptr;
+        const double before = behind ? extension(*behind) : (closed ? 0.0 : margin);
+        const double after = ahead ? extension(*ahead) : (closed ? 0.0 : margin);
+        std::unique_ptr<SmBrep> piece;
+        sm_status status = pipe_piece(segments[i], static_cast<int32_t>(i), frame, radius, wall, before, after,
+                                      caps && i == 0 && !closed, caps && i + 1 == count && !closed, piece);
+        if (status != SM_SUCCESS) return status;
+        for (const auto& [joint, keep_before] : {std::make_pair(behind, false), std::make_pair(ahead, true)}) {
+            if (!joint || !joint->mitred()) continue;
+            const SmPoint3d corner = frame.GetOrigin() + x * joint->corner[0] + y * joint->corner[1];
+            const SmVector3d mitre = x * joint->mitre[0] + y * joint->mitre[1];
+            status = cut_beyond(piece, corner, keep_before ? mitre : mitre * -1.0, size);
+            if (status != SM_SUCCESS) return status;
+        }
+        if (!pipe) {
+            pipe = std::move(piece);
+            continue;
+        }
+        SmBrep* a = pipe.release();
+        SmBrep* joined = nullptr;
+        const SmApiStatus union_status = SmApiBooleanUnion(a, piece.get(), joined);
+        if (union_status != SM_SUCCESS || joined != a) {
+            delete a;
+            return union_status != SM_SUCCESS ? static_cast<sm_status>(union_status) : SM_ERR;
+        }
+        piece.release();  // the union deleted it
+        pipe.reset(joined);
+    }
+    return is_manifold_solid(*pipe) ? SM_SUCCESS : SM_SHIM_ERR_BAD_SWEEP;
+}
+
+// A pipe along the path: a solid pipe of `radius`, less a solid pipe of
+// `inner` (when above 0) running past the path's ends, so no ring meets
+// another face to face. Only an open path's pipe can be hollow
+// (SM_SHIM_ERR_BAD_PATH): a closed one's bore would be a sealed cavity, some
+// of whose walls SMLib's tessellation winds the wrong way. A bend meeting its neighbour at an angle can't
+// be mitred with a plane (a cylinder's and a torus's sections there differ),
+// so SM_SHIM_ERR_ARC_CORNER. The faces' marks say what each is.
+sm_status create_pipe(const sm_plane_curve* path, size_t count, const SmAxis2Placement& frame, double radius,
+                      double inner, SmBrep*& out, std::vector<sm_pipe_face>& roles) {
+    std::vector<PipeSegment> segments;
+    for (size_t i = 0; i < count; ++i) segments.push_back(pipe_segment(path[i]));
+    const PipeSegment& first = segments.front();
+    const PipeSegment& last = segments.back();
+    const bool closed = std::hypot(last.end[0] - first.start[0], last.end[1] - first.start[1]) <= 1e-6;
+    if (closed && inner > 0.0) return SM_SHIM_ERR_BAD_PATH;
+    // joints[i] is where curve i meets the next; the last only when closed.
+    std::vector<PipeJoint> joints;
+    for (size_t i = 0; i + 1 < count; ++i) joints.push_back(pipe_joint(segments[i], segments[i + 1]));
+    if (closed && count > 1) joints.push_back(pipe_joint(last, first));
+    for (size_t i = 0; i < joints.size(); ++i) {
+        const bool round = segments[i].round || segments[(i + 1) % count].round;
+        if (joints[i].turn > MAX_PIPE_TURN) return SM_SHIM_ERR_BAD_PATH;
+        if (round && joints[i].mitred()) return SM_SHIM_ERR_ARC_CORNER;
+    }
+    // Big enough for a box to cover any piece beyond a mitre.
+    double size = 8.0 * radius;
+    for (const PipeSegment& segment : segments) {
+        for (const double* p : {segment.start, segment.end}) size += std::hypot(p[0], p[1]);
+        if (segment.round) size += 2.0 * segment.curve.radius;
+    }
+    for (const PipeJoint& joint : joints) size += 2.0 * radius * (std::tan(joint.turn / 2.0) + 1.0);
+
+    std::unique_ptr<SmBrep> pipe;
+    sm_status status = solid_pipe(segments, joints, closed, frame, radius, SM_PIPE_OUTER, 0.0, true, size, pipe);
+    if (status != SM_SUCCESS) return status;
+    if (inner > 0.0) {
+        std::vector<std::unique_ptr<SmBrep>> bore(1);
+        status = solid_pipe(segments, joints, closed, frame, inner, SM_PIPE_INNER, radius, false, size, bore[0]);
+        if (status == SM_SUCCESS) status = cut_holes(pipe, bore);
+        if (status != SM_SUCCESS) return status;
+        if (!is_manifold_solid(*pipe)) return SM_SHIM_ERR_BAD_SWEEP;
+    }
+    SmTArray<SmFace*> faces;
+    pipe->GetFaces(faces);
+    roles.assign(faces.GetSize(), sm_pipe_face{SM_PIPE_OUTER, -1});
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const sm_label label = read_label(faces[i]);
+        int role = 0;
+        if (!label.present || label.feature != SWEPT_ROLE || std::sscanf(label.role, "pipe %d", &role) != 1) continue;
+        roles[i].role = role;
+        roles[i].segment = role == SM_PIPE_OUTER || role == SM_PIPE_INNER ? static_cast<int32_t>(label.index) : -1;
+    }
+    remove_labels(*pipe);
+    out = pipe.release();
+    return SM_SUCCESS;
+}
+
 }  // namespace
 
 extern "C" {
@@ -5913,5 +6194,37 @@ sm_status sm_brep_sweep_face_tapered(const sm_brep* brep, size_t face, double di
         return SM_SUCCESS;
     });
 }
+
+sm_status sm_brep_create_pipe(const sm_plane_curve* path, size_t count, sm_vec3 origin, sm_vec3 x_axis,
+                              sm_vec3 y_axis, double radius, double inner_radius, sm_brep** out, sm_pipe_face** faces,
+                              size_t* face_count) {
+    if (!path || !out || !faces || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    const double dot = x_axis.x * y_axis.x + x_axis.y * y_axis.y + x_axis.z * y_axis.z;
+    if (!std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) || !unit_vector(x_axis) ||
+        !unit_vector(y_axis) || std::fabs(dot) > 1e-9) {
+        return SM_SHIM_ERR_BAD_FRAME;
+    }
+    if (count == 0 || !std::isfinite(radius) || radius <= 0.0 || !std::isfinite(inner_radius) || inner_radius < 0.0 ||
+        inner_radius >= radius) {
+        return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    }
+    return guarded([&] {
+        const SmAxis2Placement frame(SmPoint3d(origin.x, origin.y, origin.z), SmVector3d(x_axis.x, x_axis.y, x_axis.z),
+                                     SmVector3d(y_axis.x, y_axis.y, y_axis.z));
+        SmBrep* pipe = nullptr;
+        std::vector<sm_pipe_face> roles;
+        const sm_status status = create_pipe(path, count, frame, radius, inner_radius, pipe, roles);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> owned(pipe);
+        std::unique_ptr<sm_pipe_face[]> array(new sm_pipe_face[roles.size()]);
+        std::copy(roles.begin(), roles.end(), array.get());
+        *out = handle_of(owned.release());
+        *faces = array.release();
+        *face_count = roles.size();
+        return SM_SUCCESS;
+    });
+}
+
+void sm_pipe_faces_free(sm_pipe_face* faces) { delete[] faces; }
 
 }  // extern "C"

@@ -248,6 +248,32 @@ impl PlaneCurve {
         }
     }
 
+    /// The unit direction the curve runs in where it starts; a circle runs
+    /// anticlockwise.
+    pub(crate) fn start_tangent(&self) -> [f64; 2] {
+        match *self {
+            PlaneCurve::Line { start, end } => unit([end[0] - start[0], end[1] - start[1]]),
+            PlaneCurve::Arc {
+                start_deg,
+                sweep_deg,
+                ..
+            } => along_circle(start_deg, sweep_deg),
+            PlaneCurve::Circle { .. } => along_circle(0.0, 1.0),
+        }
+    }
+
+    /// The unit direction the curve runs in where it ends.
+    pub(crate) fn end_tangent(&self) -> [f64; 2] {
+        match *self {
+            PlaneCurve::Arc {
+                start_deg,
+                sweep_deg,
+                ..
+            } => along_circle(start_deg + sweep_deg, sweep_deg),
+            _ => self.start_tangent(),
+        }
+    }
+
     /// Why the shim would refuse the curve, if it would.
     pub(crate) fn problem(&self) -> Option<&'static str> {
         let finite = |p: [f64; 2]| p.iter().all(|c| c.is_finite());
@@ -336,6 +362,19 @@ impl BoundaryCurve {
             label: Some(label),
         }
     }
+}
+
+fn unit([x, y]: [f64; 2]) -> [f64; 2] {
+    let length = x.hypot(y);
+    [x / length, y / length]
+}
+
+/// The direction a circle runs in at `angle_deg`, anticlockwise when `turn`
+/// is positive.
+fn along_circle(angle_deg: f64, turn: f64) -> [f64; 2] {
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    let sign = turn.signum();
+    [-sin * sign, cos * sign]
 }
 
 fn on_circle(centre: [f64; 2], radius: f64, angle_deg: f64) -> [f64; 2] {

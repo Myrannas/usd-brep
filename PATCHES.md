@@ -18,6 +18,7 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `76a3dbc` | `SmMemBlockMgr.h`, `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: Phase 2 subdivides and labels a face's surface cache, so a kept cache serves one face once, and faces whose surfaces stay while their boundaries move (beside a dragged fillet) build theirs in every tessellation. | Add `SmTessSrfCache::Copy`, a deep copy of a cache as `BuildTree` leaves it: the tree's node and node-data blocks byte for byte with their pointers mapped (`SmMemBlockMgr::CopyFrom`), B-spline subdivision surfaces with their exact knots; NULL for a cache holding anything else. `Phase1SetupFaces` gives the faces it tessellates copies and leaves originals in the store, which also gets copies of caches it builds when `SmTessSrfCacheStore::WantsCopy` says to. `SetFace` repoints nodes from the old face's surface to the new one's. |
 | `a9b66ee` | `SmBrep.cpp` | Found imprinting: `RemoveTopologicalEdgesAndVertices` tests each edge with `SmEdge::IsTopological`, which can expand one face's surface to cover the other's as a side effect, before it looks for the edge in the keep list. An edge kept between two pieces of a curved face (a panel imprinted on a crate's round, merged back off the round at the other end) leaves a piece on the stretched surface: its box grows by 12 mm, its area integral fails and a later union over it fails with `SM_ERR`. | Look for each edge in the keep list before testing it. Without a keep list the merge runs as before. |
 | `cd41f50` | `SmTorus.cpp` | Found revolving: `SmTorus::IsNurbSurfaceTorus` snaps the generator circle's start and end angles to 0 and 360 only within `SM_EFF_ZERO` (1e-12 degrees). A circle revolved a whole turn on a tilted plane came out with both 2.7e-12 degrees off zero, and the torus got an empty (u, v) domain. | Snap within `SM_EFF_ZERO_DEG` and turn an end no further than the start into a whole turn, as `RebuildSTEPFromNURBParameters` in the same file does. Nothing in the kernel calls it (its call in `CopyAndAddAnalytics` is commented out); the shim's revolve does. |
+| `c7639c2` | `SmTorus.cpp` | Found piping and revolving: `SmTorus::IsNurbSurfaceTorus` took the major radius as the distance between the first parallel circle's centre and the generator circle's, too long whenever that circle isn't the equator (a pipe bent round 10 came back a torus of 11.18), and the generator's start and end angles unsigned, so a point below the torus's plane read as one above and the torus ran half a turn round the tube from its surface. | Drop the height between the centres, and sign the angles towards the torus's z axis, the generator circle's y axis. Of 30 circles revolved about axes every way on two planes, 22 were recognised before and 30 after. |
 
 `source/SM_API` is unmodified. Each offset patch changes only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
@@ -27,7 +28,7 @@ block copy and block accessors): `SmApiTessellate` and `Phase1SetupBrep`
 take the code paths they always did. The merge patch changes only merges
 given a keep list: `RemoveTopologicalEdgesAndVertices()` without one, as
 every boolean's post-process and `Brep::merge_faces` call it, is as it was.
-The torus patch changes only `SmTorus::IsNurbSurfaceTorus`, which only the
+The torus patches change only `SmTorus::IsNurbSurfaceTorus`, which only the
 shim calls.
 
 ## Notes from the bring-up (no patch needed)
@@ -403,7 +404,7 @@ steps are shim and Rust only. What the shim relies on:
 ## Notes from the solids work
 
 Revolve, Draft, Pipe and Hollow, for game-cad's features of those names.
-Shim and Rust only, apart from the torus patch (`cd41f50`).
+Shim and Rust only, apart from the torus patches (`cd41f50`, `c7639c2`).
 
 ### Revolve
 
@@ -445,7 +446,11 @@ sweep does, and reads its maps: `GetToHigher` gives each edge's side and
   (`CopyAndAddAnalytics`), but a torus stays a surface of revolution:
   `CopyAndAddAnalytics` has its torus test commented out. The shim calls
   `SmTorus::IsNurbSurfaceTorus` and keeps the torus when it has the
-  surface's domain and points (patch `cd41f50`).
+  surface's domain, evaluates to the surface's points, and those points lie
+  on the torus its centre and radii describe, which is what callers read
+  (patches `cd41f50` and `c7639c2`: before them a third of the circles
+  turned about axes in other directions stayed surfaces of revolution, and
+  some came back tori with the wrong radius).
 - Results (`rust/smlib/tests/revolve.rs`, on a tilted plane, whole and part
   turns, both ways): tubes, discs, cones, frustums, balls, rings, a tube with
   a ring-shaped hole and a box's face turned about its own edge, all manifold,
@@ -510,4 +515,55 @@ so the end is the face shrunk all round, negative out. It answers with a
   drafted and joined back on. All manifold, volumes within 1e-6 of the
   frustums' (1e-9 in practice), sides traced to every edge, planes leaning
   at the angle and cones of the draft's half-angle, meshes winding outward.
+
+### Pipe
+
+`Brep::pipe` (`sm_brep_create_pipe`) sweeps a circle along a path of lines
+and arcs in a frame's plane, hollow when given an inner radius, and says
+what each face is (`Pipe`, `PipeFace`): the outer wall or the inner, swept
+along which path curve, or a cap.
+
+SMLib's own sweeps were measured first, a 5 mm pipe on the paths below.
+`SmApiCreatePipeSweep` takes one B-spline path and no inner radius.
+`SmApiCreateSweepAlongPlanarPath` sweeps each curve on its own
+(`CreateCurveSweep`), cuts neighbours that meet at an angle at the plane
+halfway between them (`ProjectAndTrim`) and joins the pieces by boolean
+tree. Straight pipes, L shapes, zig-zags and a square loop came out right,
+mitred, but:
+
+- turns of 145 degrees or more failed (135 worked), and so did a line
+  meeting an arc at an angle;
+- arcs came out as NURBS or surfaces of revolution, and a slot-shaped loop
+  1e-4 under its volume; a closed circle came out a NURBS ring, and hollow,
+  with the bore added rather than cut (20134 mm³ for 9475);
+- it took 30 to 700 ms.
+
+So the shim builds the pipe itself. Each path curve gets a piece: a disc
+square to it at its start, swept along a line (`sweep_face`) or turned
+about an arc's centre (`revolve_face`), so walls are exact cylinders and
+tori. Where curves meet tangentially the pieces meet face to face. Where
+two lines meet at an angle, each piece is made `r tan(turn / 2) + r`
+longer, so its cap clears the plane halfway between them, and cut there
+(the difference with a box covering the far side); the pieces are joined
+(`SmApiBooleanUnion`). Mitres hold to 165 degrees in the tests, up to the
+179 allowed. 2 to 65 ms.
+
+- An arc meeting a curve beside it at an angle is refused
+  (`SM_SHIM_ERR_ARC_CORNER`): a cylinder's section at the halfway plane
+  isn't a torus's, and the union left slivers of planes, some of no area.
+- A hollow pipe is the solid one less a solid pipe of the inner radius
+  running past the ends: built from ring-shaped pieces, the union of a
+  tilted slot loop's ring caps came out wrong.
+- A closed path's pipe can't be hollow (`SM_SHIM_ERR_BAD_PATH`): its bore
+  is a sealed cavity, and SMLib's tessellation wound some of a slot loop
+  cavity's torus walls inward (the mesh enclosed 15479 mm³ for the brep's
+  8759).
+- Walls are traced through the unions by temporary labels: one outer wall
+  (and one inner) per path curve; mitres end walls, they don't split them.
+- Results (`rust/smlib/tests/pipe.rs`): straight pipes and bends either way,
+  solid and hollow, flat and on a tilted plane; lines mitred at 30 to 165
+  degrees; a ring, a slot loop and a square loop; a bent handle joined into
+  a block. All manifold, volumes within 1e-6 of the section times the
+  path's length (mitres keep it), walls the right cylinders and tori, caps
+  where the path ends, meshes winding outward.
 
