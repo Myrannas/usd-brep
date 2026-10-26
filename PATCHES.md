@@ -750,3 +750,74 @@ that keeps what it can analytic, without touching the kernel either:
   `read_file`) bring back every surface, ellipse extrusions included, but no
   labels, scaled or not. Reading recognises analytic surfaces again: a crate
   stretched by `scale_axes_about` comes back with planes.
+
+## Notes from the mirrors (no patch needed)
+
+`Brep::mirror` (`sm_brep_mirror`) reflects a brep across a plane and keeps
+every surface and curve what it was. Nothing in the kernel changed.
+
+- SMLib has its own reflection, `SmBrep::Mirror`, which `SmBrep::Transform`
+  uses for a matrix with a negative determinant (`Brep::mirror_stock` wraps
+  it). It reflects each curve with `CreateMirrorCurve`, which every curve
+  class takes from `SmBSplineCurve`: a plain NURBS copy, so lines and circles
+  become NURBS. It reflects each surface the same way and finds analytic
+  surfaces again with `CopyAndAddAnalytics`, which leaves out tori, so a
+  torus comes back as a NURBS surface of revolution. It then drops every UV
+  trim curve and builds them again its own way, and 7 of the test part's 16
+  faces come back reparameterised. It takes about 15 ms on that part.
+- The shim keeps `SmBrep::Mirror`'s topology flip. A reflection turns each
+  surface's (u, v) round, so its normal Su × Sv points into the solid: each
+  face's two faceuses trade shells, and each edge's edgeuses reverse their
+  radial order pair by pair. When the brep has more than one region,
+  `FindAndSetInfiniteRegion` runs again afterwards. The shim puts each
+  faceuse in the other's place in its shell's list rather than at the end.
+- Geometry follows `scale_axes_keeping` with factors (1, 1, -1) after a
+  turn, and keeps parameters wherever it can:
+  - Planes, circles and ellipses move by a rigid motion: the reflection
+    after a reflection across their own plane, which leaves that plane in
+    place. Their own `Transform` then keeps their NURBS, as it does under
+    `SmApiTransform`.
+  - Lines take `SmLine::Transform` with the -1 factor.
+  - NURBS are reflected exactly.
+  - Cylinders, cones and spheres are found again in their reflected NURBS
+    (`IsNurbSurfaceCone`, which flags the reversed angle as inside-out, and
+    `IsNurbSurfaceSphere`).
+  - Tori are built from their own description. For a reflected torus,
+    `SmTorus::IsNurbSurfaceTorus` returns TRUE with a torus whose domain is
+    empty, and evaluating that torus crashed. The `SmTorus` constructor
+    never sets its own `m_bInsideOut`, which its header calls "not fully
+    supported", and keeps the reversed minor circle as its generating
+    circle's inside-out flag instead.
+  - Surfaces of revolution, which SMLib makes for fillets on circular edges,
+    are built from their reflected generating curve with
+    `SmSurfOfRevolution::CreateCanonical`, `AdjustSTEPUVDomain` and
+    `Reparameterize`.
+  - Every rebuilt surface must lie on the reflected NURBS at the same
+    parameters, or the NURBS stays.
+- `scale_keeping`, which both `scale_axes_keeping` and `mirror` use,
+  now refuses (`SM_SHIM_ERR_BAD_SCALE`) a brep in which two faces share one
+  surface or two edges share one curve, since it would transform that
+  surface or curve twice. No such brep turned up: booleans give each piece
+  of a split face its own surface.
+- Results (`tests/mirror.rs`) on the transform tests' part (planes,
+  cylinders, a cone, a sphere and a NURBS chamfer), a torus and a bracket
+  with rounded hole rims:
+  - Every kind, label, (u, v) domain and tolerance is kept.
+  - It is manifold, its volume is kept to 1e-10 to 1e-7 (the integrator,
+    as for a turn), and it costs 0.4 to 1.1 ms.
+  - Later fillets, chamfers, booleans and face offsets take it.
+  - It tessellates to the original's vertices reflected, within `f32`
+    rounding, with every triangle wound the other way round. On one planar
+    face of the part, the top with a chamfered hole and a ball cut out of
+    its corner, some quads split along the other diagonal: 29 to 62 of
+    3138 triangles, and as many after a second reflection back. A
+    `scale_axes_keeping` there and back does the same (39), and rigid turns
+    don't. Keeping the faceuses' list order, and moving planes and circles
+    rigidly rather than finding them again, changed nothing there. The
+    torus matches exactly (0 of 15760).
+- A half of a part, mirrored and joined to the other half, has the whole
+  part's volume to 1e-10. Its planes, its cylinders and its fillets'
+  surfaces of revolution that cross the mirror plane merge back into one
+  face each with `merge_faces`. A sphere that crosses it doesn't merge across
+  its seam. Joining the two halves cut from the part, with no mirror at all,
+  leaves that sphere in three pieces; with the mirrored half it is in four.

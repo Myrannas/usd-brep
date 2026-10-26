@@ -460,10 +460,37 @@ typedef struct sm_scale_report {
  * faces keep their domains and edges their intervals and UV trim curves.
  * Tolerances scale as in sm_brep_scale. SM_SHIM_ERR_BAD_SCALE as there, and
  * for a brep with a surface or curve that isn't a B-spline of some kind (an
- * offset surface, a curve on a surface), before anything changes. report may
- * be NULL. */
+ * offset surface, a curve on a surface) or that two faces or edges share,
+ * before anything changes. report may be NULL. */
 sm_status sm_brep_scale_keeping(sm_brep *brep, sm_vec3 point, sm_vec3 factors, int32_t extrusions,
                                 sm_scale_report *report);
+
+/* Reflects the brep across the plane through point with the given normal
+ * (any finite length but zero): the point p goes to p - 2 ((p - point) . n) n
+ * for the unit normal n. Every surface and curve keeps its kind and its
+ * parameters. Planes, circles and ellipses move by the rigid motion that
+ * moves their own plane as the reflection does (the reflection after one
+ * across that plane), through their own Transform, as a rigid move would.
+ * Everything else takes sm_brep_scale_keeping's path with a factor of -1
+ * along n: its NURBS is reflected exactly, and cylinders, cones and spheres
+ * are found in it again, while tori and surfaces of revolution (SMLib's
+ * fillets on circular edges), which SMLib can't find in a NURBS, are made
+ * from their own description; each is taken only where it lies on the
+ * reflected NURBS at the same parameters, or the NURBS stays. Each face's
+ * normal Su x Sv then points into the solid, so the faces' two sides swap
+ * shells and the order of faces round each edge reverses, as SmBrep::Mirror
+ * does: the result is a valid solid facing out. Faces keep their (u, v)
+ * domains, edges their intervals and UV trim curves, and every face and edge
+ * its label; tolerances are unchanged. SM_SHIM_ERR_BAD_FRAME for a point or
+ * normal that isn't finite, or a zero normal; SM_SHIM_ERR_BAD_SCALE as
+ * sm_brep_scale_keeping, before anything changes. report may be NULL. */
+sm_status sm_brep_mirror(sm_brep *brep, sm_vec3 point, sm_vec3 normal, sm_scale_report *report);
+
+/* SMLib's own reflection, SmBrep::Mirror, across the same plane: it turns
+ * every curve into a NURBS (SmBSplineCurve::CreateMirrorCurve), recognises
+ * surfaces again with SmBSplineSurface::CopyAndAddAnalytics (no tori), and
+ * rebuilds every UV trim curve its own way. For comparison. */
+sm_status sm_brep_mirror_stock(sm_brep *brep, sm_vec3 point, sm_vec3 normal);
 
 /* Writes the brep to an SMLib binary file (SmApiWriteBrepToFile), and reads
  * one back (SmApiReadBrepFromFile, keeping the UV trim curves it holds). */

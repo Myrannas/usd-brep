@@ -115,8 +115,8 @@ impl Frame {
     }
 }
 
-/// What [`Brep::scale_axes_keeping`](crate::Brep::scale_axes_keeping) made
-/// of a brep's faces and edges.
+/// What [`Brep::scale_axes_keeping`](crate::Brep::scale_axes_keeping) or
+/// [`Brep::mirror`](crate::Brep::mirror) made of a brep's faces and edges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScaleReport {
     /// Analytic faces still of the same kind.

@@ -3,10 +3,10 @@
 - `smlib-sys`: builds SMLib (`source/SMLib`) and SM_API (`source/SM_API`) with
   the `cc` crate, plus a C shim (`smlib-sys/shim`), and exposes the shim through
   committed bindgen bindings.
-- `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, transforms
-  and scales, booleans, face sweeps, face offsets, rigid face moves, face
-  merging, fillets, chamfers, volume, manifold check, face and edge queries,
-  labels) and `Mesh`, a tessellation that keeps its links to
+- `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, transforms,
+  scales and mirrors, booleans, face sweeps, face offsets, rigid face moves,
+  face merging, fillets, chamfers, volume, manifold check, face and edge
+  queries, labels) and `Mesh`, a tessellation that keeps its links to
   the B-rep: per-triangle face ids, per-vertex surface (u, v), per-face
   surface parameters, per-edge polylines, and every face's and edge's label.
 
@@ -88,7 +88,7 @@ cargo test -p smlib
   do this along their intersection curves, so an offset face's walls come
   back as single faces either way.
 
-## Moving and scaling
+## Moving, scaling and mirroring
 
 - `Brep::transform(rotation, translation)` moves a brep rigidly
   (`SmApiTransform`): p goes to R p + t. `Brep::translate` and
@@ -115,12 +115,26 @@ cargo test -p smlib
   what became what. Faces keep their (u, v) domains, edges their intervals
   and UV trim curves, so it tessellates the same whatever ran first, which
   `scale_axes_about` doesn't.
+- `Brep::mirror(point, normal)` reflects a brep across a plane. Every surface
+  and curve keeps its kind and (u, v): planes, cylinders, cones, spheres,
+  tori and surfaces of revolution (fillets on circular edges), lines,
+  circles and ellipses. Faces' sides and the order of faces round each edge
+  flip, so the result is a valid solid facing out, and every face and edge
+  keeps its index and label. It costs about 0.5 ms on a 16-face part. A
+  mirrored brep tessellates to the original's vertices reflected, every
+  triangle wound the other way round; a planar face with many boundary
+  points can split some quads along the other diagonal (a scale there and
+  back does the same). `Brep::mirror_stock` is SMLib's own `SmBrep::Mirror`,
+  for comparison: it turns every curve into a NURBS, reparameterises faces,
+  rebuilds every UV trim curve and makes a torus a NURBS surface of
+  revolution, in about 15 ms.
 - `Brep::tolerance` reads the brep's tolerance; `Brep::write_file` and
   `Brep::read_file` write and read SMLib's binary format (labels don't come
   back).
 
-`tests/transform.rs` checks labels, surfaces, (u, v), volumes, triangles and
-later fillets and booleans through each of them.
+`tests/transform.rs` and `tests/mirror.rs` check labels, surfaces, (u, v),
+volumes, triangles and later fillets and booleans through each of them;
+`tests/mirror.rs` also mirrors half a symmetric part and joins it back.
 
 ## Labels
 

@@ -8,13 +8,14 @@
 //!
 //! Fillets and chamfers ([`Brep::fillet`], [`Brep::chamfer`]) pick their
 //! edges with an [`EdgeQuery`]. Solids built at the origin can be placed on a
-//! face's [`Frame`] ([`Brep::place`]), any solid moved, turned and scaled
-//! ([`Brep::transform`], [`Brep::scale_about`]), and planar faces swept into
-//! prisms ([`Brep::sweep_face`], with draft [`Brep::sweep_face_tapered`]) or
-//! revolved ([`Brep::revolve_face`]), whether a solid's or ones built from
-//! lines, arcs and circles in a plane ([`Brep::planar_faces`]), and circles
-//! swept along paths into pipes ([`Brep::pipe`]). [`Brep::shell`] hollows a
-//! solid, leaving chosen faces open. [`Brep::offset_faces`]
+//! face's [`Frame`] ([`Brep::place`]), any solid moved, turned, scaled and
+//! mirrored ([`Brep::transform`], [`Brep::scale_about`], [`Brep::mirror`]),
+//! and planar faces swept into prisms ([`Brep::sweep_face`], with draft
+//! [`Brep::sweep_face_tapered`]) or revolved ([`Brep::revolve_face`]),
+//! whether a solid's or ones built from lines, arcs and circles in a plane
+//! ([`Brep::planar_faces`]), and circles swept along paths into pipes
+//! ([`Brep::pipe`]). [`Brep::shell`] hollows a solid, leaving chosen faces
+//! open. [`Brep::offset_faces`]
 //! moves faces along their normals, extending or trimming their neighbours,
 //! as Parasolid's face offset does, and [`Brep::move_faces`] moves or turns
 //! them rigidly the same way. Faces and edges can carry a [`Label`] that the kernel keeps

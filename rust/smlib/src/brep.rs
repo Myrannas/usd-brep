@@ -555,7 +555,7 @@ impl Brep {
     /// in [`scale_axes_about`](Brep::scale_axes_about). Fails with
     /// `SHIM_ERR_BAD_SCALE`, leaving the brep alone, for a brep with a surface
     /// or curve that isn't a B-spline of some kind (an offset surface, or a
-    /// curve on a surface).
+    /// curve on a surface), or that two faces or edges share.
     pub fn scale_axes_keeping(
         &mut self,
         point: [f64; 3],
@@ -567,16 +567,7 @@ impl Brep {
         for factor in factors {
             check_positive(OP, factor, "scale factors must be finite and positive")?;
         }
-        let mut report = sys::sm_scale_report {
-            faces_kept: 0,
-            faces_extruded: 0,
-            faces_nurbs: 0,
-            faces_were_nurbs: 0,
-            curves_kept: 0,
-            curves_stretched: 0,
-            curves_nurbs: 0,
-            curves_were_nurbs: 0,
-        };
+        let mut report = EMPTY_REPORT;
         // SAFETY: self is a live brep on the kernel thread; report outlives
         // the call.
         let status = unsafe {
@@ -589,16 +580,60 @@ impl Brep {
             )
         };
         Error::check(OP, status)?;
-        Ok(ScaleReport {
-            faces_kept: report.faces_kept,
-            faces_extruded: report.faces_extruded,
-            faces_nurbs: report.faces_nurbs,
-            faces_were_nurbs: report.faces_were_nurbs,
-            curves_kept: report.curves_kept,
-            curves_stretched: report.curves_stretched,
-            curves_nurbs: report.curves_nurbs,
-            curves_were_nurbs: report.curves_were_nurbs,
-        })
+        Ok(scale_report(&report))
+    }
+
+    /// Reflects the brep across the plane through `point` with `normal`,
+    /// which may have any finite length but zero: the point p goes to
+    /// `p - 2 ((p - point) · n) n` for the unit normal n.
+    ///
+    /// A reflection is an isometry, so every surface and curve keeps its kind
+    /// and its parameters: planes, cylinders, cones, spheres, tori and
+    /// surfaces of revolution (SMLib's fillets on circular edges), lines,
+    /// circles and ellipses, with their radii. Planes, circles and ellipses
+    /// move as a rigid motion would move them: by the reflection after one
+    /// across their own plane, which is rigid. Everything else is
+    /// [`scale_axes_keeping`](Brep::scale_axes_keeping)'s path with a factor
+    /// of -1 along the normal: each NURBS is reflected exactly, and its
+    /// analytic surface is rebuilt, found again or from its own description,
+    /// only where it lies on the NURBS at the same parameters. So faces keep
+    /// their (u, v) domains and edges their intervals and UV trim curves.
+    /// Each face's (u, v) now runs the other way round, so the faces' sides
+    /// and the order of the faces round each edge flip as SMLib's own
+    /// `SmBrep::Mirror` flips them, and the result is a valid solid with its
+    /// normals facing out and its volume unchanged. Every face and edge keeps
+    /// its index and [`Label`]; tolerances are unchanged. The returned report
+    /// counts what stayed analytic.
+    ///
+    /// Fails with `SHIM_ERR_BAD_SCALE`, leaving the brep alone, for a brep
+    /// [`scale_axes_keeping`](Brep::scale_axes_keeping) refuses.
+    pub fn mirror(&mut self, point: [f64; 3], normal: [f64; 3]) -> Result<ScaleReport, Error> {
+        const OP: &str = "sm_brep_mirror";
+        check_point(OP, point)?;
+        check_normal(OP, normal)?;
+        let mut report = EMPTY_REPORT;
+        // SAFETY: self is a live brep on the kernel thread; report outlives
+        // the call.
+        let status = unsafe {
+            sys::sm_brep_mirror(self.raw.as_ptr(), vec3(point), vec3(normal), &mut report)
+        };
+        Error::check(OP, status)?;
+        Ok(scale_report(&report))
+    }
+
+    /// SMLib's own reflection (`SmBrep::Mirror`) across the same plane as
+    /// [`mirror`](Brep::mirror), for comparison. It turns every curve into a
+    /// NURBS, lines and circles included, finds analytic surfaces again with
+    /// `SmBSplineSurface::CopyAndAddAnalytics` (which leaves tori NURBS), and
+    /// rebuilds every UV trim curve its own way.
+    pub fn mirror_stock(&mut self, point: [f64; 3], normal: [f64; 3]) -> Result<(), Error> {
+        const OP: &str = "SmBrep::Mirror";
+        check_point(OP, point)?;
+        check_normal(OP, normal)?;
+        // SAFETY: self is a live brep on the kernel thread.
+        let status =
+            unsafe { sys::sm_brep_mirror_stock(self.raw.as_ptr(), vec3(point), vec3(normal)) };
+        Error::check(OP, status)
     }
 
     /// Writes the brep to an SMLib binary file (`SmApiWriteBrepToFile`),
@@ -1885,6 +1920,30 @@ fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
 
 const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
+const EMPTY_REPORT: sys::sm_scale_report = sys::sm_scale_report {
+    faces_kept: 0,
+    faces_extruded: 0,
+    faces_nurbs: 0,
+    faces_were_nurbs: 0,
+    curves_kept: 0,
+    curves_stretched: 0,
+    curves_nurbs: 0,
+    curves_were_nurbs: 0,
+};
+
+fn scale_report(report: &sys::sm_scale_report) -> ScaleReport {
+    ScaleReport {
+        faces_kept: report.faces_kept,
+        faces_extruded: report.faces_extruded,
+        faces_nurbs: report.faces_nurbs,
+        faces_were_nurbs: report.faces_were_nurbs,
+        curves_kept: report.curves_kept,
+        curves_stretched: report.curves_stretched,
+        curves_nurbs: report.curves_nurbs,
+        curves_were_nurbs: report.curves_were_nurbs,
+    }
+}
+
 /// The rotation by `angle_deg` degrees about `axis`, counter-clockwise seen
 /// from its tip (Rodrigues' formula), row by row. `None` for a zero or
 /// non-finite axis or angle.
@@ -1958,6 +2017,18 @@ fn check_point(operation: &'static str, point: [f64; 3]) -> Result<(), Error> {
         Err(Error::InvalidArgument {
             operation,
             reason: "coordinates must be finite",
+        })
+    }
+}
+
+fn check_normal(operation: &'static str, normal: [f64; 3]) -> Result<(), Error> {
+    let length = normal.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if length.is_finite() && length > 0.0 {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument {
+            operation,
+            reason: "the normal must be finite and not zero",
         })
     }
 }
