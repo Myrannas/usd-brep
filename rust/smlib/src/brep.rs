@@ -484,6 +484,73 @@ impl Brep {
         unsafe { Sweep::from_raw(OP, out, faces, count) }
     }
 
+    /// [`sweep_face`](Brep::sweep_face) with draft: the sides lean
+    /// `draft_deg` (under 90 either way) from the sweep's direction. A
+    /// positive draft leans them into the face, so the end is the face shrunk
+    /// all round by `distance` times the draft's tangent, its outer edge in
+    /// and its holes out; a negative draft leans them out and grows it.
+    /// Corners stay sharp. A draft of 0 is [`sweep_face`](Brep::sweep_face).
+    ///
+    /// Each loop of the face is swept by `SmPrimitiveCreation::CreateTaperExtrude`
+    /// and the holes' solids cut from the outer loop's. A side swept from a
+    /// straight edge is a plane and one from an arc or circle a cone
+    /// ([`Surface::Cone`](crate::Surface::Cone)).
+    ///
+    /// [`Sweep::faces`] says what each face came from, as for
+    /// [`sweep_face`](Brep::sweep_face). Where a line meets an arc at an
+    /// angle, an outward draft can add a side standing on the corner, whose
+    /// `source_edge` is `None`.
+    ///
+    /// Refuses a draft whose sides meet before the end of the sweep, where
+    /// the face closes up or a hole leaning out swallows the end. The kernel
+    /// fails an outward draft where a line meets an arc at an angle (a D
+    /// shape).
+    pub fn sweep_face_tapered(
+        &self,
+        face: usize,
+        distance: f64,
+        draft_deg: f64,
+    ) -> Result<Sweep, Error> {
+        const OP: &str = "SmPrimitiveCreation::CreateTaperExtrude";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
+        };
+        if !distance.is_finite() || distance == 0.0 {
+            return invalid("sweep distance must be finite and non-zero");
+        }
+        if !(draft_deg.is_finite() && draft_deg.abs() < 90.0) {
+            return invalid("the draft angle must be finite and under 90 degrees either way");
+        }
+        let mut out = ptr::null_mut();
+        let mut faces = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; the outputs are
+        // written only on success.
+        let status = unsafe {
+            sys::sm_brep_sweep_face_tapered(
+                self.raw.as_ptr(),
+                face,
+                distance,
+                draft_deg,
+                &mut out,
+                &mut faces,
+                &mut count,
+            )
+        };
+        match status {
+            sys::SM_SHIM_ERR_NOT_PLANAR => return invalid("only a planar face can be swept"),
+            sys::SM_SHIM_ERR_DRAFT_CLOSES => {
+                return invalid("the draft closes the face up before the end of the sweep");
+            }
+            _ => Error::check(OP, status)?,
+        }
+        // SAFETY: on success faces holds count entries.
+        unsafe { Sweep::from_raw(OP, out, faces, count) }
+    }
+
     /// Revolves the planar face at `face` in [`faces`](Brep::faces) about the
     /// axis through `axis_point` along `axis_direction` by `angle_deg`, into
     /// a closed solid (`SmTopologySweep` with `SmRotationalSweepGeometry`).

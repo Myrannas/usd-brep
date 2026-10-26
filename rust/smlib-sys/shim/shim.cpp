@@ -677,8 +677,9 @@ void replace_surface(SmFace* face, std::unique_ptr<SmSurface> analytic) {
 }
 
 // CreateCurveSweepFromFaces makes every side a NURBS surface, so lines sweep
-// into planar NURBS and arcs and circles into cylindrical ones. Gives each side
-// that is a plane or a cylinder that analytic surface instead
+// into planar NURBS and arcs and circles into cylindrical ones;
+// CreateTaperExtrude's ruled sides are planar or conical NURBS. Gives each
+// side that is a plane, a cylinder or a cone that analytic surface instead
 // (SmBSplineSurface::CopyAndAddAnalytics, as SmPrimitiveCreation makes its
 // planes). SMLib's analytic surfaces are B-splines too: the copy is checked
 // against the NURBS and keeps its parameters, so the face keeps its domain
@@ -697,9 +698,8 @@ void make_sides_analytic(SmBrep& brep, const SmTArray<SmFace*>& sides) {
         }
         std::unique_ptr<SmSurface> analytic(raw);
         const SM_TYPE type = analytic->GetType();
-        const bool cylinder =
-            type == SmCylinder_TYPE || (type == SmCone_TYPE && static_cast<const SmCone*>(raw)->IsCylinder());
-        if ((type != SmPlane_TYPE && !cylinder) || !(analytic->GetNaturalUVDomain() == surface->GetNaturalUVDomain())) {
+        const bool round = type == SmCylinder_TYPE || type == SmCone_TYPE;
+        if ((type != SmPlane_TYPE && !round) || !(analytic->GetNaturalUVDomain() == surface->GetNaturalUVDomain())) {
             continue;
         }
         replace_surface(side, std::move(analytic));
@@ -5274,7 +5274,8 @@ sm_status sm_brep_merge_faces_keeping(sm_brep* brep, const uint32_t* keep, size_
 
 }  // extern "C"
 
-// Solids swept from faces, beyond sm_brep_sweep_face: revolves.
+// Solids swept from faces, beyond sm_brep_sweep_face: revolves and tapered
+// sweeps.
 
 namespace {
 
@@ -5400,18 +5401,36 @@ void make_tori(SmBrep& brep) {
     }
 }
 
-// Where a revolve's sides came from while booleans put the whole turn of a
-// face with holes together: a label (this feature id, never a caller's) whose
-// index is the source edge's.
-const uint32_t REVOLVE_SIDE = UINT32_MAX;
+// What a face of a swept solid came from, kept while booleans put the solid
+// together (a face with holes): a label with this feature id, never a
+// caller's, whose role is the sm_swept_role and whose index the source
+// edge's.
+const uint32_t SWEPT_ROLE = UINT32_MAX;
 
-void mark_side(SmFace& side, int32_t source_edge) {
+void mark_role(SmFace& face, int32_t role, int32_t source_edge) {
     sm_label label{};
     label.present = 1;
-    label.feature = REVOLVE_SIDE;
+    label.feature = SWEPT_ROLE;
     label.index = static_cast<uint32_t>(source_edge);
-    std::memcpy(label.role, "side", 5);
-    write_label(side, label);
+    std::snprintf(label.role, sizeof label.role, "%d", static_cast<int>(role));
+    write_label(face, label);
+}
+
+void mark_side(SmFace& side, int32_t source_edge) { mark_role(side, SM_SWEPT_SIDE, source_edge); }
+
+// The roles mark_role left on the solid's faces, in its face order, and the
+// solid without them or any other label.
+void take_roles(SmBrep& solid, std::vector<sm_swept_face>& roles) {
+    SmTArray<SmFace*> faces;
+    solid.GetFaces(faces);
+    roles.assign(faces.GetSize(), sm_swept_face{SM_SWEPT_SIDE, -1});
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const sm_label label = read_label(faces[i]);
+        if (!label.present || label.feature != SWEPT_ROLE) continue;
+        roles[i].role = static_cast<int32_t>(std::atoi(label.role));
+        roles[i].source_edge = roles[i].role == SM_SWEPT_SIDE ? static_cast<int32_t>(label.index) : -1;
+    }
+    remove_labels(solid);
 }
 
 // The frame a revolve works in: the axis along z through the origin, the
@@ -5458,10 +5477,8 @@ sm_status turn_part(const SmBrep& brep, const SmFace* face, const SmAxis2Placeme
     if (!is_manifold_solid(*solid)) return SM_SHIM_ERR_BAD_SWEEP;
     make_tori(*solid);
     remove_labels(*solid);
-    const sm_label start = {1, REVOLVE_SIDE, static_cast<uint32_t>(SM_SWEPT_START), "start"};
-    const sm_label end = {1, REVOLVE_SIDE, static_cast<uint32_t>(SM_SWEPT_END), "end"};
-    write_label(*profile, start);
-    if (SmFace* copy = sweep.GetToSame(profile)) write_label(*copy, end);
+    mark_role(*profile, SM_SWEPT_START, -1);
+    if (SmFace* copy = sweep.GetToSame(profile)) mark_role(*copy, SM_SWEPT_END, -1);
     for (const auto& [edge, index] : source_edge) {
         if (SmFace* side = sweep.GetToHigher(SM_CONST_CAST(SmEdge*, edge))) mark_side(*side, index);
     }
@@ -5514,6 +5531,22 @@ sm_status turn_loop(const SmBrep& brep, const SmFace* face, const SmAxis2Placeme
     return SM_SUCCESS;
 }
 
+// Cuts each of `holes` out of the solid (SmApiBooleanDifference).
+sm_status cut_holes(std::unique_ptr<SmBrep>& solid, std::vector<std::unique_ptr<SmBrep>>& holes) {
+    for (auto& hole : holes) {
+        SmBrep* a = solid.release();
+        SmBrep* result = nullptr;
+        const SmApiStatus status = SmApiBooleanDifference(a, hole.get(), result);
+        if (status != SM_SUCCESS || result != a) {
+            delete a;
+            return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+        }
+        hole.release();  // the boolean deleted it
+        solid.reset(result);
+    }
+    return SM_SUCCESS;
+}
+
 // A whole turn: each loop turned on its own, and the holes' rings cut out of
 // the outer loop's solid, leaving closed voids.
 sm_status turn_whole(const SmBrep& brep, const SmFace* face, const SmAxis2Placement& frame,
@@ -5534,18 +5567,7 @@ sm_status turn_whole(const SmBrep& brep, const SmFace* face, const SmAxis2Placem
         }
     }
     if (!solid) return SM_ERR;
-    for (auto& hole : holes) {
-        SmBrep* a = solid.release();
-        SmBrep* result = nullptr;
-        const SmApiStatus status = SmApiBooleanDifference(a, hole.get(), result);
-        if (status != SM_SUCCESS || result != a) {
-            delete a;
-            return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
-        }
-        hole.release();  // the boolean deleted it
-        solid.reset(result);
-    }
-    return SM_SUCCESS;
+    return cut_holes(solid, holes);
 }
 
 sm_status revolve_face(const SmBrep& brep, const SmFace* face, SmPoint3d base, SmVector3d axis, double angle,
@@ -5578,21 +5600,258 @@ sm_status revolve_face(const SmBrep& brep, const SmFace* face, SmPoint3d base, S
     status = whole ? turn_whole(brep, face, frame, solid) : turn_part(brep, face, frame, angle, solid);
     if (status != SM_SUCCESS) return status;
 
-    SmTArray<SmFace*> faces;
-    solid->GetFaces(faces);
-    roles.assign(faces.GetSize(), sm_swept_face{SM_SWEPT_SIDE, -1});
-    for (ULONG i = 0; i < faces.GetSize(); ++i) {
-        const sm_label label = read_label(faces[i]);
-        if (!label.present || label.feature != REVOLVE_SIDE) continue;
-        if (std::strcmp(label.role, "side") == 0) {
-            roles[i].source_edge = static_cast<int32_t>(label.index);
-        } else {
-            roles[i].role = static_cast<int32_t>(label.index);
-        }
-    }
-    remove_labels(*solid);
+    take_roles(*solid, roles);
     const SmApiStatus back = SmApiTransform(solid.get(), frame);
     if (back != SM_SUCCESS) return static_cast<sm_status>(back);
+    out = solid.release();
+    return SM_SUCCESS;
+}
+
+// The unit normal of `surface` at the point on it nearest `near`.
+bool normal_near(const SmSurface* surface, const SmPoint3d& near, SmVector3d& normal) {
+    SmPoint3d closest;
+    SmTArray<SmPoint2d> uvs;
+    double distance = 0.0;
+    return SmApiSurfaceClosestPoint(surface, near, closest, uvs, distance) == SM_SUCCESS && uvs.GetSize() > 0 &&
+           SmApiEvaluateSurfaceNormal(surface, SmVector2d(uvs[0].x, uvs[0].y), normal) == SM_SUCCESS;
+}
+
+// Puts `surface` under the face in place of its own, which it must match in
+// shape though not in parameters: reversed if need be to face the way the old
+// one did, as SmBrep::LocalOperation does, and with the face's UV trims made
+// again on it (SmFace::CreateUVTrimCurves), over its whole domain.
+sm_status rebuild_on(SmFace* face, std::unique_ptr<SmSurface> surface) {
+    SmPoint3d inside;
+    SmVector3d before, after;
+    if (SmApiFaceInternalPoint(face, inside) != SM_SUCCESS || !normal_near(face->GetSurface(), inside, before) ||
+        !normal_near(surface.get(), inside, after)) {
+        return SM_ERR;
+    }
+    SmStatus status = SM_SUCCESS;
+    if (before.Dot(after) < 0.0) {
+        status = surface->Reverse(SM_SP_U);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    }
+    status = face->RemoveUVTrimCurves();
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    const SmExtent2d domain = surface->GetNaturalUVDomain();
+    face->SetSurface(surface.release(), TRUE);
+    face->SetUVDomain(domain);
+    double mean_gap, max_gap, mean_vertex_gap, max_vertex_gap, mean_uv_gap, max_uv_gap;
+    status = face->CreateUVTrimCurves(FALSE, nullptr, nullptr, mean_gap, max_gap, mean_vertex_gap, max_vertex_gap,
+                                      mean_uv_gap, max_uv_gap);
+    return static_cast<sm_status>(status);
+}
+
+// Puts each planar NURBS face of the brep on a plane of its own: SMLib's
+// recogniser (SmPlane::IsNurbSurfacePlane) only takes patches whose
+// parameters run square across them, which a tapered wall's trapezoid
+// doesn't. The plane is made from the face's own edges
+// (SmSurface::CreatePlaneWith3DCurves).
+sm_status make_planes(SmBrep& brep) {
+    const SmContext* context = brep.GetContext();
+    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmFace* face = faces[i];
+        const SmSurface* surface = face->GetSurface();
+        SmPoint3d on_plane;
+        SmVector3d plane_normal;
+        if (!surface || surface->GetType() != SmBSplineSurface_TYPE || !plane_of(surface, on_plane, plane_normal)) {
+            continue;
+        }
+        SmTArray<ULONG> counts;
+        SmTArray<SmCurve*> curves;
+        SmTArray<SmOrientType> orients;
+        SmTArray<SmPoint3d> points;
+        SmStatus status = face->CreateCurvesFromFace(*context, SM_OT_SAME, counts, &curves, nullptr, orients, points);
+        std::vector<std::unique_ptr<SmCurve>> owned;
+        for (ULONG j = 0; j < curves.GetSize(); ++j) owned.emplace_back(curves[j]);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        SmSurface* raw = nullptr;
+        SmTArray<ULONG> loop_counts;
+        SmTArray<SmCurve*> ordered;
+        SmTArray<SmOrientType> ordered_orients;
+        status = SmSurface::CreatePlaneWith3DCurves(*context, curves, brep.GetTolerance(), raw, loop_counts, ordered,
+                                                    ordered_orients);
+        std::unique_ptr<SmSurface> plane(raw);
+        if (status != SM_SUCCESS || !plane) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+        const sm_status rebuilt = rebuild_on(face, std::move(plane));
+        if (rebuilt != SM_SUCCESS) return rebuilt;
+    }
+    return SM_SUCCESS;
+}
+
+// Copies of the curves of each edge loop of `face` (SmFace::CreateCurvesFromFace),
+// loop by loop, and which loop is the outer one.
+sm_status loop_curves(const SmFace* face, std::vector<std::vector<std::unique_ptr<SmCurve>>>& loops, size_t& outer) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    SmTArray<ULONG> counts;
+    SmTArray<SmCurve*> curves;
+    SmTArray<SmOrientType> orients;
+    SmTArray<SmPoint3d> points;
+    const SmStatus status = face->CreateCurvesFromFace(*context, SM_OT_SAME, counts, &curves, nullptr, orients, points);
+    std::vector<std::unique_ptr<SmCurve>> owned;
+    for (ULONG i = 0; i < curves.GetSize(); ++i) owned.emplace_back(curves[i]);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    size_t next = 0;
+    for (ULONG i = 0; i < counts.GetSize(); ++i) {
+        if (next + counts[i] > owned.size()) return SM_ERR;
+        loops.emplace_back();
+        for (ULONG j = 0; j < counts[i]; ++j) loops.back().push_back(std::move(owned[next++]));
+    }
+    // CreateCurvesFromFace takes the edge loops in the faceuse's order.
+    const SmFaceuse* use = face->GetUpwardFaceuse()->GetOrientation() == SM_OT_SAME ? face->GetUpwardFaceuse()
+                                                                                     : face->GetUpwardFaceuse()->GetMate();
+    SmTArray<SmLoopuse*> loopuses;
+    use->GetLoopuses(loopuses);
+    SmTArray<SmLoop*> outers;
+    face->GetOuterLoops(outers);
+    outer = loops.size();
+    size_t k = 0;
+    for (ULONG i = 0; i < loopuses.GetSize(); ++i) {
+        if (loopuses[i]->IsVertexLoopuse()) continue;
+        ULONG unused;
+        if (outers.FindElement(loopuses[i]->GetLoop(), unused)) outer = k;
+        ++k;
+    }
+    return outer < loops.size() && k == loops.size() ? SM_SUCCESS : SM_ERR;
+}
+
+// One loop's curves swept `height` along `direction` with sharp corners and
+// walls leaning `draft` degrees from it: towards the loop's inside when
+// positive, out when negative (SmPrimitiveCreation::CreateTaperExtrude,
+// which runs the loop anticlockwise about `direction` and offsets it to the
+// left for a positive draft). Both ends are capped.
+sm_status taper_loop(std::vector<std::unique_ptr<SmCurve>>& loop, const SmVector3d& direction, double height,
+                     double draft, std::unique_ptr<SmBrep>& solid) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    solid.reset(new (*context) SmBrep());
+    SmTArray<SmCurve*> curves;
+    for (auto& curve : loop) curves.Add(curve.get());
+    SmVector3d normal = direction;
+    SmPrimitiveCreation creator(solid->GetInfiniteRegion());
+    const SmStatus status = creator.CreateTaperExtrude(curves, height, draft, 3, normal, SM_OC_LINEAR_EXTENSION);
+    // It takes the curves on success; on failure they are still ours, but
+    // for any it deleted as duplicates.
+    for (auto& curve : loop) {
+        ULONG unused;
+        if (status == SM_SUCCESS || !curves.FindElement(curve.get(), unused)) curve.release();
+    }
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    return is_manifold_solid(*solid) ? SM_SUCCESS : SM_SHIM_ERR_BAD_SWEEP;
+}
+
+// Marks the faces of a loop swept by taper_loop from `face`: the start, on
+// the face's plane, the end, `height` along `direction`, and each side by the
+// edge of `face` its edge on the start lies along (source_edge). A side
+// standing on a corner of the loop, with no edge on the start, has none.
+// False when there's no start or no end: the sides met before the end, and
+// CreateTaperExtrude stopped there.
+bool mark_taper(SmBrep& solid, const SmBrep& brep, const SmFace* face, const SmVector3d& direction, double height,
+                bool caps, SmFace*& end) {
+    SmTArray<SmFace*> faces;
+    solid.GetFaces(faces);
+    SmPoint3d on_face;
+    SmApiFaceInternalPoint(face, on_face);
+    const double tolerance = std::max(1e3 * SM_ZONE_TOL_3D, 1e-9 * height);
+    SmFace* start = nullptr;
+    end = nullptr;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        double normal[3];
+        SmPoint3d inside;
+        if (!outward_plane(faces[i], normal) || SmApiFaceInternalPoint(faces[i], inside) != SM_SUCCESS ||
+            std::fabs(std::fabs(SmVector3d(normal[0], normal[1], normal[2]).Dot(direction)) - 1.0) > 1e-9) {
+            continue;
+        }
+        const double along = (inside - on_face).Dot(direction);
+        if (std::fabs(along) <= tolerance) {
+            start = faces[i];
+            if (caps) mark_role(*faces[i], SM_SWEPT_START, -1);
+        } else if (std::fabs(along - height) <= tolerance) {
+            end = faces[i];
+            if (caps) mark_role(*faces[i], SM_SWEPT_END, -1);
+        }
+    }
+    SmTArray<SmEdge*> all_edges;
+    brep.GetEdges(all_edges);
+    std::unordered_map<const SmEdge*, uint32_t> edge_index;
+    for (ULONG i = 0; i < all_edges.GetSize(); ++i) edge_index.emplace(all_edges[i], i);
+    SmTArray<SmEdge*> face_edges;
+    face->GetEdges(face_edges);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (faces[i] == start || faces[i] == end) continue;
+        mark_side(*faces[i], start ? source_edge(faces[i], start, face_edges, edge_index) : -1);
+    }
+    return start && end;
+}
+
+// Whether every edge of `inner` lies inside `outer`, a face in its plane,
+// and off its boundary (SmFace::CurveOnClassify).
+sm_status lies_inside(const SmFace* inner, const SmFace* outer, bool& inside) {
+    inside = true;
+    SmTArray<SmEdge*> edges;
+    inner->GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize() && inside; ++i) {
+        SmCurveClassification classes(edges[i]->GetCurve(), edges[i]->GetInterval(), NULL, outer->GetTolerance());
+        const SmStatus status = outer->CurveOnClassify(TRUE, classes);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        for (ULONG j = 0; j < classes.GetSize(); ++j) {
+            if (classes[j].m_vMid.GetPointClass() != SM_PC_FACE) inside = false;
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// The face swept `distance` along its outward normal (into the solid when
+// negative) with its walls leaning `draft` degrees: each loop swept by
+// taper_loop, the outer one leaning in and the holes out so the face shrinks
+// as a whole (grows for a negative draft), and the holes' solids cut from the
+// outer one's.
+sm_status taper_face(const SmBrep& brep, const SmFace* face, double distance, double draft, SmBrep*& out,
+                     std::vector<sm_swept_face>& roles) {
+    double normal[3];
+    if (!outward_plane(face, normal)) return SM_SHIM_ERR_NOT_PLANAR;
+    const SmVector3d direction = SmVector3d(normal[0], normal[1], normal[2]) * (distance < 0.0 ? -1.0 : 1.0);
+    const double height = std::fabs(distance);
+    std::vector<std::vector<std::unique_ptr<SmCurve>>> loops;
+    size_t outer = 0;
+    sm_status status = loop_curves(face, loops, outer);
+    if (status != SM_SUCCESS) return status;
+    std::unique_ptr<SmBrep> solid;
+    std::vector<std::unique_ptr<SmBrep>> holes;
+    SmFace* end = nullptr;
+    std::vector<SmFace*> hole_ends;
+    for (size_t i = 0; i < loops.size(); ++i) {
+        std::unique_ptr<SmBrep> swept;
+        status = taper_loop(loops[i], direction, height, i == outer ? draft : -draft, swept);
+        if (status != SM_SUCCESS) return status;
+        SmTArray<SmFace*> faces;
+        swept->GetFaces(faces);
+        make_sides_analytic(*swept, faces);
+        status = make_planes(*swept);
+        if (status != SM_SUCCESS) return status;
+        status = static_cast<sm_status>(swept->RemoveTopologicalEdgesAndVertices());
+        if (status != SM_SUCCESS) return status;
+        SmFace* swept_end = nullptr;
+        if (!mark_taper(*swept, brep, face, direction, height, i == outer, swept_end)) {
+            return SM_SHIM_ERR_DRAFT_CLOSES;
+        }
+        (i == outer ? end : hole_ends.emplace_back()) = swept_end;
+        (i == outer ? solid : holes.emplace_back()) = std::move(swept);
+    }
+    // A hole leaning out mustn't reach the outer loop's sides by the end.
+    for (const SmFace* hole_end : hole_ends) {
+        bool inside = false;
+        status = lies_inside(hole_end, end, inside);
+        if (status != SM_SUCCESS) return status;
+        if (!inside) return SM_SHIM_ERR_DRAFT_CLOSES;
+    }
+    status = cut_holes(solid, holes);
+    if (status != SM_SUCCESS) return status;
+    if (!is_manifold_solid(*solid)) return SM_SHIM_ERR_BAD_SWEEP;
+    take_roles(*solid, roles);
     out = solid.release();
     return SM_SUCCESS;
 }
@@ -5620,6 +5879,30 @@ sm_status sm_brep_revolve_face(const sm_brep* brep, size_t face, sm_vec3 axis_po
         std::vector<sm_swept_face> roles;
         const sm_status status = revolve_face(source, target, SmPoint3d(axis_point.x, axis_point.y, axis_point.z),
                                               axis, angle_deg, solid, roles);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> owned(solid);
+        std::unique_ptr<sm_swept_face[]> array(new sm_swept_face[roles.size()]);
+        std::copy(roles.begin(), roles.end(), array.get());
+        *out = handle_of(owned.release());
+        *faces = array.release();
+        *face_count = roles.size();
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_sweep_face_tapered(const sm_brep* brep, size_t face, double distance, double draft_deg,
+                                     sm_brep** out, sm_swept_face** faces, size_t* face_count) {
+    if (!brep || !out || !faces || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!std::isfinite(distance) || distance == 0.0) return SM_SHIM_ERR_BAD_SWEEP;
+    if (!std::isfinite(draft_deg) || std::fabs(draft_deg) >= 90.0) return SM_SHIM_ERR_BAD_DRAFT;
+    return guarded([&] {
+        const SmBrep& source = *brep_of(brep);
+        SmFace* target = face_at(source, face);
+        if (!target) return SM_SHIM_ERR_BAD_FACE;
+        SmBrep* solid = nullptr;
+        std::vector<sm_swept_face> roles;
+        const sm_status status = draft_deg == 0.0 ? sweep_face(source, target, distance, solid, roles)
+                                                  : taper_face(source, target, distance, draft_deg, solid, roles);
         if (status != SM_SUCCESS) return status;
         std::unique_ptr<SmBrep> owned(solid);
         std::unique_ptr<sm_swept_face[]> array(new sm_swept_face[roles.size()]);

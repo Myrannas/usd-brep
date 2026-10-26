@@ -9,9 +9,9 @@
 //! Fillets and chamfers ([`Brep::fillet`], [`Brep::chamfer`]) pick their
 //! edges with an [`EdgeQuery`]. Solids built at the origin can be placed on a
 //! face's [`Frame`] ([`Brep::place`]), and planar faces swept into prisms
-//! ([`Brep::sweep_face`]) or revolved ([`Brep::revolve_face`]), whether a
-//! solid's or ones built from lines, arcs and circles in a plane
-//! ([`Brep::planar_faces`]). [`Brep::offset_faces`]
+//! ([`Brep::sweep_face`], with draft [`Brep::sweep_face_tapered`]) or
+//! revolved ([`Brep::revolve_face`]), whether a solid's or ones built from
+//! lines, arcs and circles in a plane ([`Brep::planar_faces`]). [`Brep::offset_faces`]
 //! moves faces along their normals, extending or trimming their neighbours,
 //! as Parasolid's face offset does. Faces and edges can carry a [`Label`] that the kernel keeps
 //! through every later operation.

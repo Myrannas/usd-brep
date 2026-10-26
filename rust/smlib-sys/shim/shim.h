@@ -46,6 +46,8 @@ static const sm_status SM_SHIM_ERR_UNSUPPORTED_STEP = 2028;    /* a moved face n
 static const sm_status SM_SHIM_ERR_SPENT_TESSELLATION = 2030; /* the tessellation's mesh was already made */
 static const sm_status SM_SHIM_ERR_BAD_AXIS = 2031;            /* an axis isn't finite, has no direction or leaves the face's plane */
 static const sm_status SM_SHIM_ERR_AXIS_CROSSES_FACE = 2032;   /* a revolve's axis runs through the inside of its face */
+static const sm_status SM_SHIM_ERR_BAD_DRAFT = 2033;           /* a draft angle isn't finite and under 90 degrees either way */
+static const sm_status SM_SHIM_ERR_DRAFT_CLOSES = 2034;        /* a draft's sides meet before the end of the sweep */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -418,8 +420,8 @@ sm_status sm_brep_place(sm_brep *brep, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y
 sm_status sm_brep_sweep_face(const sm_brep *brep, size_t face, double distance, sm_brep **out,
                              sm_swept_face **faces, size_t *face_count);
 
-/* Frees the array sm_brep_sweep_face or sm_brep_revolve_face returns. NULL
- * is ignored. */
+/* Frees the array sm_brep_sweep_face, sm_brep_revolve_face or
+ * sm_brep_sweep_face_tapered returns. NULL is ignored. */
 void sm_swept_faces_free(sm_swept_face *faces);
 
 /* Revolves the planar face at an index of the brep's face list about the
@@ -437,6 +439,24 @@ void sm_swept_faces_free(sm_swept_face *faces);
  * sm_swept_faces_free. */
 sm_status sm_brep_revolve_face(const sm_brep *brep, size_t face, sm_vec3 axis_point, sm_vec3 axis_direction,
                                double angle_deg, sm_brep **out, sm_swept_face **faces, size_t *face_count);
+
+/* sm_brep_sweep_face with the sides leaning draft_deg (under 90 either way)
+ * from the sweep's direction: positive leans them into the face, so the end
+ * is the face shrunk all round (its outer loop in, its holes out), negative
+ * leans them out. Each loop is swept by SmPrimitiveCreation::CreateTaperExtrude
+ * with sharp corners, the holes' solids cut from the outer loop's. Sides
+ * swept from lines are planes and from arcs or circles cones; *faces says
+ * what each face came from as sm_brep_sweep_face's does, a side's source edge
+ * found from where its edge on the face lies. A side standing on a corner,
+ * which an outward draft can add where a line meets an arc, has source edge
+ * -1. A draft of 0 is sm_brep_sweep_face. SM_SHIM_ERR_BAD_DRAFT for an angle
+ * that isn't finite and under 90 degrees; SM_SHIM_ERR_DRAFT_CLOSES when the
+ * sides meet before the end, so the face closes up or a hole swallows the
+ * end; the kernel's status, or SM_SHIM_ERR_BAD_SWEEP, when it builds no
+ * solid (an outward draft where a line meets an arc at an angle). Free
+ * *faces with sm_swept_faces_free. */
+sm_status sm_brep_sweep_face_tapered(const sm_brep *brep, size_t face, double distance, double draft_deg,
+                                     sm_brep **out, sm_swept_face **faces, size_t *face_count);
 
 /* Merges faces that lie on one surface into one face, removing the edges
  * between them, and edges that lie on one curve into one edge

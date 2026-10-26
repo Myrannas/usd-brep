@@ -67,6 +67,11 @@ cargo test -p smlib
   which edge each side was turned from; an edge on the axis has none. Sides
   are planes, cylinders, cones, spheres and tori. This is a sketch's
   revolve.
+- `Brep::sweep_face_tapered` is `sweep_face` with draft: the sides lean in
+  (positive) or out by an angle, corners sharp
+  (`SmPrimitiveCreation::CreateTaperExtrude` per loop, holes cut out). Sides
+  from lines are planes and from arcs cones; it refuses a draft whose sides
+  meet before the end. This is a sketch's extrude with draft.
 - `Brep::merge_faces` merges faces lying on one surface and edges lying on
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come

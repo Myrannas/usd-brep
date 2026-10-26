@@ -68,6 +68,8 @@ impl Status {
             2030 => "SHIM_ERR_SPENT_TESSELLATION",
             2031 => "SHIM_ERR_BAD_AXIS",
             2032 => "SHIM_ERR_AXIS_CROSSES_FACE",
+            2033 => "SHIM_ERR_BAD_DRAFT",
+            2034 => "SHIM_ERR_DRAFT_CLOSES",
             _ => return None,
         })
     }

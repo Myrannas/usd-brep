@@ -456,3 +456,58 @@ sweep does, and reads its maps: `GetToHigher` gives each edge's side and
   the start and end nearly meet); 359.99 works. A 0.01 degree turn leaves
   its cylinders as surfaces of extrusion (0.001 and 0.1 degrees don't).
 
+### Draft
+
+`Brep::sweep_face_tapered` (`sm_brep_sweep_face_tapered`) is `sweep_face`
+with the sides leaning by a draft angle: positive leans them into the face,
+so the end is the face shrunk all round, negative out. It answers with a
+`Sweep` as `sweep_face` does.
+
+- `SmApiCreateTaperExtrude` works out the curves' normal itself and snaps
+  it to exactly z when within about 11 degrees of it, which would tilt the
+  sweep of a slightly tilted face. The shim calls
+  `SmPrimitiveCreation::CreateTaperExtrude` with the face's normal instead.
+  It offsets one closed chain of curves (it asserts there is one), so each
+  loop of the face, copied by `SmFace::CreateCurvesFromFace`, is swept on
+  its own: the outer loop leaning in, the holes out, so the face shrinks as a
+  whole. The holes' solids are cut from the outer loop's, and the faces
+  traced through the booleans by the temporary label Revolve uses. Corners
+  stay sharp (`SM_OC_LINEAR_EXTENSION`).
+- Sides are ruled between each curve and its offset. A side's edge on the
+  face lies on the edge it came from, which says which (as `sweep_face`'s
+  `source_edge`). Sides from arcs and circles come out as cones
+  (`CopyAndAddAnalytics`, now taken for any cone by `make_sides_analytic`,
+  whose translational sweeps only ever made planes and cylinders). Sides
+  from lines are trapezoids, which `SmPlane::IsNurbSurfacePlane` refuses:
+  it wants parameters that run square across the patch. Each planar NURBS
+  side is put on a plane made from its own edges
+  (`SmSurface::CreatePlaneWith3DCurves`), reversed to face as it did (as
+  `SmBrep::LocalOperation` does; turning the face over with `SwapUV` after
+  left its triangles wound against its normals) and given new UV trims.
+- Leaning out, `SM_OC_LINEAR_EXTENSION` fills each convex corner with two
+  lines from the corner, which become two flat triangles beside the
+  walls. Once on planes they merge into the walls
+  (`RemoveTopologicalEdgesAndVertices`), so there's one side per edge.
+- `CreateTaperExtrude` stops where the sides meet, without an end: a
+  square swept 30 at 30 degrees came back a pyramid 17.3 high. The shim
+  refuses that (`SM_SHIM_ERR_DRAFT_CLOSES`), and a hole that leans out
+  past the outer loop's end, which it checks with `SmFace::CurveOnClassify`
+  before the boolean (which otherwise failed with `SM_ERR`).
+- Where an arc meets another curve at an angle (a D shape), the arc's
+  offset is trimmed at the corner and its side ruled between the arc and
+  the trimmed offset: a NURBS near the drafted cone, whose corner edge is a
+  straight ruling where the true one is the cone's curve. The D swept 10
+  at 10 degrees comes out 0.31% under its true volume. Tangent profiles
+  (circles, slots, rounded rectangles) are exact. Leaning out, the D's
+  corners leave no closed solid and the shim returns
+  `SM_SHIM_ERR_BAD_SWEEP`. Tilting a straight prism's sides about their
+  edges with `SmBrep::LocalOperation` would make every corner exact: it
+  gives a square's frustum exactly, but returns an open solid once a side
+  is a cylinder.
+- Results (`rust/smlib/tests/draft.rs`): squares in and out, both ways
+  along the normal; circles, rounded squares and a square with a round
+  hole, flat and on a tilted plane; a block's top with a hole through it,
+  drafted and joined back on. All manifold, volumes within 1e-6 of the
+  frustums' (1e-9 in practice), sides traced to every edge, planes leaning
+  at the angle and cones of the draft's half-angle, meshes winding outward.
+

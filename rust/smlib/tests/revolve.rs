@@ -357,11 +357,21 @@ fn a_solids_face_turns_about_its_own_edge() {
             .position(|f| f.normal == Some([1.0, 0.0, 0.0]))
             .unwrap();
         let edges = block.edges().unwrap();
-        // About the face's edge along z at y = 0.
+        // About the face's edge along z at y = 0, clockwise looking down z:
+        // out of the block.
         let swept = block
-            .revolve_face(face, [10.0, 0.0, 0.0], [0.0, 0.0, 1.0], 90.0)
+            .revolve_face(face, [10.0, 0.0, 0.0], [0.0, 0.0, 1.0], -90.0)
             .unwrap();
         assert!(swept.prism.is_manifold().unwrap());
+        // Joined back on, it adds its own volume.
+        let joined = block
+            .try_clone()
+            .unwrap()
+            .union(swept.prism.try_clone().unwrap())
+            .unwrap();
+        assert!(joined.is_manifold().unwrap());
+        let added = joined.volume(1e-9).unwrap() - 6000.0;
+        assert!(close(added, swept.prism.volume(1e-9).unwrap()), "{added}");
         let sides_from: Vec<[f64; 3]> = swept
             .faces
             .iter()
