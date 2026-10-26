@@ -59,7 +59,7 @@ impl Label {
         if bytes.is_empty() || bytes.len() > MAX_ROLE_LEN || bytes.contains(&0) {
             return Err(Error::InvalidArgument {
                 operation,
-                reason: "a label's role must be 1 to 63 bytes without NUL",
+                reason: "a label's role must be 1 to 255 bytes without NUL",
             });
         }
         let mut raw = NO_LABEL;

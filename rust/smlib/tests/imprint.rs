@@ -521,3 +521,95 @@ fn steps_that_cant_be_built_are_refused() {
         );
     });
 }
+
+#[test]
+fn step_walls_take_the_labels_of_the_edges_they_stand_on() {
+    on_kernel(|k| {
+        let Imprint {
+            brep: mut solid,
+            edges,
+            ..
+        } = block(k).imprint(through_top(k)).unwrap();
+        for (n, edge) in edges.iter().enumerate() {
+            solid
+                .set_edge_label(edge.edge, &Label::new(3, "outline").with_index(n as u32))
+                .unwrap();
+        }
+        let square = square_of(&solid);
+        let all = solid.edges().unwrap();
+        // Each new edge's label, by where it runs.
+        let along: Vec<([f64; 3], Label)> = edges
+            .iter()
+            .map(|e| (all[e.edge].midpoint(), all[e.edge].label.clone().unwrap()))
+            .collect();
+        for distance in [3.0, -3.0] {
+            let moved = solid.try_clone().unwrap().offset_faces(&[square], distance).unwrap();
+            assert!(moved.is_manifold().unwrap());
+            let walls: Vec<_> = moved
+                .faces()
+                .unwrap()
+                .into_iter()
+                .filter(|f| f.label.as_ref().is_some_and(|l| l.role == "outline"))
+                .collect();
+            assert_eq!(walls.len(), 4, "{distance}");
+            // Each wall stands on the edge whose label it took.
+            for wall in walls {
+                let (at, label) = along
+                    .iter()
+                    .find(|(at, _)| (0..2).all(|i| at[i] >= wall.bounds[0][i] - 1e-4 && at[i] <= wall.bounds[1][i] + 1e-4))
+                    .unwrap();
+                assert_eq!(wall.label.as_ref(), Some(label), "{distance}: the wall at {at:?}");
+                assert!(wall.normal.unwrap()[2].abs() < 1e-9);
+            }
+        }
+        // The edges' own labels stay on them.
+        let moved = solid.offset_faces(&[square], 3.0).unwrap();
+        let labelled = moved.edges().unwrap().into_iter().filter(|e| e.label.as_ref().is_some_and(|l| l.role == "outline"));
+        assert_eq!(labelled.count(), 4);
+    });
+}
+
+#[test]
+fn a_push_through_keeps_an_imprint_on_the_faces_it_merges() {
+    on_kernel(|k| {
+        // A crate's lid with two bosses near its front edge and a panel
+        // imprinted between them, then the front pushed in under the bosses.
+        let mut part = Brep::cuboid(k, [-200.0, -150.0, -125.0], [400.0, 300.0, 265.0]).unwrap();
+        for x in [-165.0, 165.0] {
+            part = part.union(Brep::cylinder(k, [x, -115.0, 140.0], 8.0, 6.0).unwrap()).unwrap();
+        }
+        let panel = tool(k, [-50.0, -40.0, 100.0], [50.0, 40.0, 200.0]);
+        let Imprint { brep: mut part, edges, .. } = part.imprint(panel).unwrap();
+        for edge in &edges {
+            part.set_edge_label(edge.edge, &Label::new(3, "outline")).unwrap();
+        }
+        let lid = |b: &Brep| {
+            b.faces()
+                .unwrap()
+                .into_iter()
+                .filter(|f| f.normal.is_some_and(|n| n[2] > 0.999) && (f.bounds[0][2] - 140.0).abs() < 1e-4)
+                .count()
+        };
+        assert_eq!(lid(&part), 2, "the lid and the panel");
+        let front = part
+            .find_faces(
+                &smlib::FaceQuery::OnPlane {
+                    point: [0.0, -150.0, 0.0],
+                    normal: [0.0, -1.0, 0.0],
+                },
+                &Tolerance::default(),
+            )
+            .unwrap();
+        assert_eq!(part.offset_obstacles(&front, -30.0).unwrap().len(), 2);
+        let volume = part.volume(1e-9).unwrap();
+        let moved = part.offset_faces(&front, -30.0).unwrap();
+        assert!(moved.is_manifold().unwrap());
+        assert_eq!(lid(&moved), 2, "the panel is still apart from the lid");
+        let outline = moved.edges().unwrap();
+        let outline = outline.iter().filter(|e| e.label.as_ref().is_some_and(|l| l.role == "outline"));
+        assert_eq!(outline.count(), 4);
+        // What the push took: a slab of the box, less its rounds, and what it
+        // cut off the bosses.
+        assert!(moved.volume(1e-9).unwrap() < volume - 30.0 * 400.0 * 265.0 + 1.0);
+    });
+}
