@@ -613,3 +613,82 @@ fn a_push_through_keeps_an_imprint_on_the_faces_it_merges() {
         assert!(moved.volume(1e-9).unwrap() < volume - 30.0 * 400.0 * 265.0 + 1.0);
     });
 }
+
+#[test]
+fn merging_an_imprint_off_one_round_leaves_a_panel_on_another_as_it_was() {
+    on_kernel(|k| {
+        // A crate-sized block with its vertical edges rounded, and a 10 ×
+        // 60 panel imprinted through it along X: on the round at each end of
+        // its +Y side.
+        let mut part = Brep::cuboid(k, [-200.0, -150.0, -125.0], [400.0, 300.0, 265.0])
+            .unwrap()
+            .fillet(
+                &[smlib::EdgeBlend::round(
+                    EdgeQuery::ParallelTo {
+                        direction: [0.0, 0.0, 1.0],
+                    },
+                    20.0,
+                )],
+                &smlib::FilletOptions::default(),
+            )
+            .unwrap();
+        for face in part.faces().unwrap() {
+            part.set_face_label(face.index, &Label::new(BLOCK, "side").with_index(face.index as u32))
+                .unwrap();
+        }
+        let tool = Brep::cuboid(k, [-500.0, 135.0, 20.0], [1000.0, 10.0, 60.0]).unwrap();
+        let Imprint {
+            brep: mut part,
+            edges,
+            ..
+        } = part.imprint(tool).unwrap();
+        for edge in edges.iter().filter(|e| e.new) {
+            part.set_edge_label(edge.edge, &Label::new(TOOL, "outline")).unwrap();
+        }
+        let round_at = |face: &smlib::FaceGeometry, x: f64| {
+            matches!(face.surface, smlib::Surface::Cylinder { origin, .. }
+                if (origin[0] - x).abs() < 1e-6 && (origin[1] - 130.0).abs() < 1e-6)
+        };
+        // The panel on the +X round: the piece of it that doesn't reach
+        // the lid.
+        let panel = |b: &Brep| {
+            b.faces()
+                .unwrap()
+                .into_iter()
+                .find(|f| round_at(f, 180.0) && f.bounds[1][2] < 100.0)
+                .unwrap()
+        };
+        let before = panel(&part);
+        let area = part.face_centroid(before.index).unwrap().area;
+        // The arc from 5 to 15 off the round's axis along Y, 60 high.
+        let arc = 20.0 * ((15.0f64 / 20.0).asin() - (5.0f64 / 20.0).asin());
+        assert!((area - arc * 60.0).abs() < 1e-6 * area, "{area}");
+
+        // Merged back off the -X round, keeping every other edge.
+        let faces = part.faces().unwrap();
+        let on_far = |f: Option<u32>| f.is_some_and(|f| round_at(&faces[f as usize], -180.0));
+        let all = part.edges().unwrap();
+        let keep: Vec<usize> = all
+            .iter()
+            .filter(|e| e.label.is_none() || !e.faces.iter().all(|&f| on_far(f)))
+            .map(|e| e.index)
+            .collect();
+        assert_eq!(all.len() - keep.len(), 4);
+        part.merge_faces_keeping(&keep).unwrap();
+        let far: Vec<_> = part.faces().unwrap().into_iter().filter(|f| round_at(f, -180.0)).collect();
+        assert_eq!(far.len(), 1, "the -X round is one face again");
+        // The kept panel is as it was: its box, and its area.
+        let after = panel(&part);
+        assert_eq!(after.bounds, before.bounds);
+        assert_eq!(after.uv_min, before.uv_min);
+        assert_eq!(after.uv_max, before.uv_max);
+        assert!((part.face_centroid(after.index).unwrap().area - area).abs() < 1e-9 * area);
+        // And a later join over it works.
+        let volume = part.volume(1e-9).unwrap();
+        let joined = part
+            .union(Brep::cuboid(k, [190.0, 140.0, 40.0], [30.0, 30.0, 20.0]).unwrap())
+            .unwrap();
+        assert!(joined.is_manifold().unwrap());
+        assert!(joined.volume(1e-9).unwrap() > volume);
+    });
+}

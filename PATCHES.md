@@ -16,13 +16,16 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `4d13c5e` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: `Phase1SetupBrep` builds every face's surface cache and splits every edge, so a small edit still pays for the whole solid's edge preparation. | Add `SmTess::Phase1SetupFaces`, which sets up only the faces given (with caches for the faces sharing their edges, which split only those edges) exactly as `Phase1SetupBrep` would, and reports refinement or anything `Phase1SetupBrep` would recover from; and a `SplitFaceEdgesToUVSize` overload that splits only edges shared with given faces. Existing calls are unchanged. |
 | `7efc9ef` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: a face's surface cache, often the largest part of setting it up, is built again every tessellation though it depends only on the surface and the parameters. | `Phase1SetupFaces` takes an optional `SmTessSrfCacheStore`: faces take its caches for identical surfaces, and faces set up only to split shared edges leave theirs there. `SmTessSrfCache::SetFace` moves a cache to another face and tessellation. |
 | `76a3dbc` | `SmMemBlockMgr.h`, `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: Phase 2 subdivides and labels a face's surface cache, so a kept cache serves one face once, and faces whose surfaces stay while their boundaries move (beside a dragged fillet) build theirs in every tessellation. | Add `SmTessSrfCache::Copy`, a deep copy of a cache as `BuildTree` leaves it: the tree's node and node-data blocks byte for byte with their pointers mapped (`SmMemBlockMgr::CopyFrom`), B-spline subdivision surfaces with their exact knots; NULL for a cache holding anything else. `Phase1SetupFaces` gives the faces it tessellates copies and leaves originals in the store, which also gets copies of caches it builds when `SmTessSrfCacheStore::WantsCopy` says to. `SetFace` repoints nodes from the old face's surface to the new one's. |
+| `a9b66ee` | `SmBrep.cpp` | Found imprinting: `RemoveTopologicalEdgesAndVertices` tests each edge with `SmEdge::IsTopological`, which can expand one face's surface to cover the other's as a side effect, before it looks for the edge in the keep list. An edge kept between two pieces of a curved face (a panel imprinted on a crate's round, merged back off the round at the other end) leaves a piece on the stretched surface: its box grows by 12 mm, its area integral fails and a later union over it fails with `SM_ERR`. | Look for each edge in the keep list before testing it. Without a keep list the merge runs as before. |
 
 `source/SM_API` is unmodified. Each offset patch changes only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
 offset); solid offsets and shells take the code paths they always did. The
 tessellation patches only add methods and a class (`SmMemBlockMgr` gains a
 block copy and block accessors): `SmApiTessellate` and `Phase1SetupBrep`
-take the code paths they always did.
+take the code paths they always did. The merge patch changes only merges
+given a keep list: `RemoveTopologicalEdgesAndVertices()` without one, as
+every boolean's post-process and `Brep::merge_faces` call it, is as it was.
 
 ## Notes from the bring-up (no patch needed)
 
@@ -360,7 +363,9 @@ steps are shim and Rust only. What the shim relies on:
   to a plane does, the imprint still splits the face along the touching
   line.
 - `RemoveTopologicalEdgesAndVertices` without a keep list removes every
-  imprinted edge between two pieces of one surface. That includes
+  imprinted edge between two pieces of one surface. With one, it used to
+  test every edge before skipping the kept ones, which stretched a kept
+  curved piece's surface (patch `a9b66ee`). That includes
   `Brep::merge_faces` and the shim's own merges in Offset Face's
   push-through.
 - `SmBrep::LocalOperation` can't move a face away from another piece of its
