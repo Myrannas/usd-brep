@@ -42,6 +42,7 @@ static const sm_status SM_SHIM_ERR_BAD_SWEEP = 2024;           /* a zero sweep d
 static const sm_status SM_SHIM_ERR_UNSUPPORTED_FACE = 2025;    /* the face, or a blend on it, can't be moved this way */
 static const sm_status SM_SHIM_ERR_CHANGED_TOPOLOGY = 2026;    /* the move would make a face vanish (or appear) */
 static const sm_status SM_SHIM_ERR_OBSTRUCTED = 2027;          /* the move runs into features it can't cut through */
+static const sm_status SM_SHIM_ERR_UNSUPPORTED_STEP = 2028;    /* a moved face needs a step wall that can't be built */
 static const sm_status SM_SHIM_ERR_SPENT_TESSELLATION = 2030; /* the tessellation's mesh was already made */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
@@ -446,6 +447,19 @@ sm_status sm_brep_merge_faces(sm_brep *brep);
  * thinned past the chamfer on its rim) swallows the chamfer and meets the
  * plane beyond directly, as if the edge had never been chamfered, where it
  * runs along that plane's normal and nothing else stands near the chamfer.
+ * A picked face beside an unpicked face on its own surface (two pieces of
+ * one face, as an imprint splits it) steps away from it instead: the picked
+ * faces are swept along the move into prisms, which are joined (pulled out)
+ * or cut (pushed in), so a wall stands along each edge to such a face and
+ * every other neighbour stretches or is trimmed along its surface as
+ * before. The moved faces keep their labels; the walls have none. That
+ * needs every picked face planar, all facing one way, and every other
+ * neighbour standing along the move (a plane containing it, or a cylinder
+ * along it): SM_SHIM_ERR_UNSUPPORTED_STEP otherwise. SM_SHIM_ERR_OBSTRUCTED
+ * when the prisms don't add or take exactly their own volume, as when a
+ * face pushed in runs into a pocket under it. A step never pushes through
+ * anything in its way.
+ *
  * Otherwise the brep keeps its faces and edges, so a move that would make a
  * face vanish fails, with SM_SHIM_ERR_CHANGED_TOPOLOGY or
  * SM_SHIM_ERR_BROKE_SOLID (the kernel

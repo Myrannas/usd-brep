@@ -2935,6 +2935,18 @@ sm_status boolean_into(Op op, std::unique_ptr<SmBrep>& a, std::unique_ptr<SmBrep
     return SM_SUCCESS;
 }
 
+// Replaces the brep's faces with work's, in place, so the caller's handle
+// stays good. MergeBrep rather than CopyFaces, which classifies regions again
+// and can turn the solid inside out (a vent cut along a moved face).
+sm_status take_faces(SmBrep& brep, SmBrep& work) {
+    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
+    SmTArray<SmFace*> old_faces;
+    brep.GetFaces(old_faces);
+    const sm_status status = static_cast<sm_status>(brep.RemoveFaces(old_faces));
+    if (status != SM_SUCCESS) return status;
+    return static_cast<sm_status>(brep.MergeBrep(work, NULL, NULL, FALSE));
+}
+
 // Marks a picked face through the booleans that set obstacles aside.
 const ULONG PICK_ATTRIBUTE_ID = 0x534d504b;  // "SMPK"
 
@@ -3592,18 +3604,167 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     // with the pushed face) would come back on its own.
     if (shell_count(*work) != shell_count(brep)) return SM_SHIM_ERR_OBSTRUCTED;
 
-    // MergeBrep rather than CopyFaces, which classifies regions again and
-    // can turn the solid inside out (a vent cut along a moved face).
-    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
-    SmTArray<SmFace*> old_faces;
-    brep.GetFaces(old_faces);
-    if ((status = static_cast<sm_status>(brep.RemoveFaces(old_faces))) != SM_SUCCESS) return status;
-    return static_cast<sm_status>(brep.MergeBrep(*work, NULL, NULL, FALSE));
+    return take_faces(brep, *work);
+}
+
+// Steps. A picked face beside an unpicked face on its own surface, as the two
+// pieces of a face an imprint splits are, can't stretch that neighbour to
+// meet it: the neighbour's surface runs alongside the face's new place and
+// never reaches it. The move needs a new face there, a step wall swept along
+// the edge between them, and the offset executive never makes faces.
+//
+// For planar faces all moving one way, the step is what sweeping the faces
+// along the move into prisms and joining them (pulled out) or cutting them
+// (pushed in) makes, as long as every other neighbour stands along the move:
+// then each prism side beside one lies on its surface and merges into it,
+// stretched or trimmed as the offset would. The prisms must add or take
+// exactly their own volume; anything else means the move runs into
+// something, and it's refused rather than cut through.
+
+// How much of the prisms' own volume a step may add or take beyond them:
+// well past the 1e-8 volumes are found to, and far short of any
+// obstruction worth the name.
+const double STEP_VOLUME_TOLERANCE = 1e-6;
+
+// Whether two faces lie on one surface: the same surface, the same plane, or
+// the same cylinder, sphere or torus.
+bool same_surface(const SmFace* a, const SmFace* b, double tolerance) {
+    const SmSurface* first = a->GetSurface();
+    const SmSurface* second = b->GetSurface();
+    if (!first || !second) return false;
+    if (first == second) return true;
+    SmPoint3d point_a, point_b;
+    SmVector3d normal_a, normal_b;
+    const bool planar_a = plane_of(first, point_a, normal_a);
+    const bool planar_b = plane_of(second, point_b, normal_b);
+    if (planar_a || planar_b) {
+        return planar_a && planar_b && 1.0 - std::fabs(normal_a.Dot(normal_b)) < 1e-12 &&
+               std::fabs((point_b - point_a).Dot(normal_a)) <= tolerance;
+    }
+    const sm_face_info info_a = describe_face(a);
+    const sm_face_info info_b = describe_face(b);
+    if (info_a.kind != info_b.kind || std::fabs(info_a.radius - info_b.radius) > tolerance ||
+        std::fabs(info_a.minor_radius - info_b.minor_radius) > tolerance) {
+        return false;
+    }
+    const SmVector3d axis(info_a.axis[0], info_a.axis[1], info_a.axis[2]);
+    const SmVector3d other_axis(info_b.axis[0], info_b.axis[1], info_b.axis[2]);
+    const SmVector3d apart(info_b.origin[0] - info_a.origin[0], info_b.origin[1] - info_a.origin[1],
+                           info_b.origin[2] - info_a.origin[2]);
+    switch (info_a.kind) {
+        case SM_SURFACE_CYLINDER:
+            return 1.0 - std::fabs(axis.Dot(other_axis)) < 1e-12 &&
+                   (apart - axis * apart.Dot(axis)).Length() <= tolerance;
+        case SM_SURFACE_SPHERE:
+            return apart.Length() <= tolerance;
+        case SM_SURFACE_TORUS:
+            return 1.0 - std::fabs(axis.Dot(other_axis)) < 1e-12 && apart.Length() <= tolerance;
+        default:
+            return false;
+    }
+}
+
+// Whether a picked face meets an unpicked face on its own surface.
+bool needs_steps(const SmTArray<SmFace*>& picked, double tolerance) {
+    std::unordered_set<const SmFace*> moving;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) moving.insert(picked[i]);
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        for (const SmFace* other : neighbours_of(picked[i])) {
+            if (!moving.count(other) && same_surface(picked[i], other, tolerance)) return true;
+        }
+    }
+    return false;
+}
+
+sm_status brep_volume(SmBrep& brep, double& volume) {
+    return static_cast<sm_status>(SmApiBrepComputeVolume(&brep, 1e-8, volume));
+}
+
+// How much of the prisms a step would add or take that isn't theirs: what of
+// them lies inside the part when pulled out, or outside it when pushed in.
+// Booleans with the small prisms first, so only what's left, usually nothing,
+// is measured, not the whole part.
+sm_status step_overlap(const SmBrep& brep, const SmBrep& tool, bool pulled, double& overlap) {
+    overlap = 0.0;
+    std::unique_ptr<SmBrep> part;
+    std::unique_ptr<SmBrep> prisms;
+    sm_status status = SM_SUCCESS;
+    if ((status = copy_of(brep, part)) != SM_SUCCESS || (status = copy_of(tool, prisms)) != SM_SUCCESS) return status;
+    status = pulled ? boolean_into(SmApiBooleanIntersection, prisms, std::move(part))
+                    : boolean_into(SmApiBooleanDifference, prisms, std::move(part));
+    if (status != SM_SUCCESS || prisms->GetNumFaces() == 0) return status;
+    return brep_volume(*prisms, overlap);
+}
+
+// The move with step walls (see above). SM_SHIM_ERR_UNSUPPORTED_STEP when a
+// picked face isn't planar, they don't all face one way, or a neighbour that
+// isn't on a picked face's own surface doesn't stand along the move;
+// SM_SHIM_ERR_OBSTRUCTED when the prisms reach into the part pulled out, or
+// out of it pushed in, so wouldn't add or take exactly their own volume.
+// The moved faces keep their labels; the walls have none.
+sm_status offset_with_steps(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance) {
+    const double tolerance = brep.GetTolerance();
+    std::unordered_set<const SmFace*> moving;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) moving.insert(picked[i]);
+    SmVector3d move;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        double outward[3];
+        if (!outward_plane(picked[i], outward)) return SM_SHIM_ERR_UNSUPPORTED_STEP;
+        const SmVector3d normal(outward[0], outward[1], outward[2]);
+        if (i == 0) {
+            move = normal;
+        } else if (normal.Dot(move) < 1.0 - 1e-12) {
+            return SM_SHIM_ERR_UNSUPPORTED_STEP;
+        }
+        for (const SmFace* other : neighbours_of(picked[i])) {
+            if (moving.count(other) || same_surface(picked[i], other, tolerance)) continue;
+            if (!other->GetSurface() || !invariant_under(other->GetSurface(), move)) {
+                return SM_SHIM_ERR_UNSUPPORTED_STEP;
+            }
+        }
+    }
+
+    std::unique_ptr<SmBrep> tool;
+    sm_status status = SM_SUCCESS;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        SmBrep* swept = nullptr;
+        std::vector<sm_swept_face> roles;
+        if ((status = sweep_face(brep, picked[i], distance, swept, roles)) != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> prism(swept);
+        // The prism's far end is the face where it moved to.
+        SmTArray<SmFace*> faces;
+        prism->GetFaces(faces);
+        for (ULONG f = 0; f < faces.GetSize(); ++f) {
+            if (roles[f].role == SM_SWEPT_END) write_label(*faces[f], read_label(picked[i]));
+        }
+        if (!tool) {
+            tool = std::move(prism);
+        } else if ((status = boolean_into(SmApiBooleanUnion, tool, std::move(prism))) != SM_SUCCESS) {
+            return status;
+        }
+    }
+    double swept = 0.0;
+    double overlap = 0.0;
+    if ((status = brep_volume(*tool, swept)) != SM_SUCCESS ||
+        (status = step_overlap(brep, *tool, distance > 0.0, overlap)) != SM_SUCCESS) {
+        return status;
+    }
+    if (std::fabs(overlap) > STEP_VOLUME_TOLERANCE * swept) return SM_SHIM_ERR_OBSTRUCTED;
+    std::unique_ptr<SmBrep> work;
+    if ((status = copy_of(brep, work)) != SM_SUCCESS) return status;
+    status = distance > 0.0 ? boolean_into(SmApiBooleanUnion, work, std::move(tool))
+                            : boolean_into(SmApiBooleanDifference, work, std::move(tool));
+    if (status != SM_SUCCESS) return status;
+    if ((status = check_solid(*work)) != SM_SUCCESS) return status;
+    if (shell_count(*work) != shell_count(brep)) return SM_SHIM_ERR_OBSTRUCTED;
+    return take_faces(brep, *work);
 }
 
 // The offset with whatever it runs into cut through, or as before when
-// nothing is in its way.
+// nothing is in its way; with step walls where a face moves away from
+// another piece of its own surface.
 sm_status offset_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance) {
+    if (needs_steps(picked, brep.GetTolerance())) return offset_with_steps(brep, picked, distance);
     Motions motions;
     std::vector<Obstacle> obstacles;
     std::vector<Plug> plugs;

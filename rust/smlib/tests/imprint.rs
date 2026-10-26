@@ -1,5 +1,6 @@
 //! Imprints on the real kernel: a tool's boundary split into a solid's faces
-//! as edges, and taken back off with a keep-list merge.
+//! as edges, taken back off with a keep-list merge, and the pieces it leaves
+//! moved with Offset Face, which steps away from the rest of their face.
 //!
 //! As in `cases.rs`, every test sends its kernel work to one shared kernel
 //! thread.
@@ -8,7 +9,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 
-use smlib::{Brep, Imprint, Kernel, Label, TessellationParams};
+use smlib::{Brep, EdgeQuery, Error, Imprint, Kernel, Label, TessellationParams, Tolerance};
 
 type Job = Box<dyn FnOnce(&Kernel) + Send>;
 
@@ -305,5 +306,218 @@ fn bad_keep_lists_are_refused() {
         assert!(solid.merge_faces_keeping(&[12]).is_err());
         assert!(solid.merge_faces_keeping(&[1, 1]).is_err());
         assert!(solid.merge_faces_keeping(&[usize::MAX]).is_err());
+    });
+}
+
+fn status_name(error: &Error) -> Option<&'static str> {
+    match error {
+        Error::Kernel { status, .. } => status.name(),
+        _ => None,
+    }
+}
+
+/// The block with the 20 × 10 square imprinted on its top, and the square.
+fn panel(k: &Kernel) -> (Brep, usize) {
+    let Imprint { brep, .. } = block(k).imprint(through_top(k)).unwrap();
+    let square = square_of(&brep);
+    (brep, square)
+}
+
+fn square_of(brep: &Brep) -> usize {
+    let faces = brep.faces().unwrap();
+    top_face_pieces(brep)
+        .into_iter()
+        .find(|&f| faces[f].bounds[1][0] < 10.1)
+        .unwrap()
+}
+
+/// The block with a slab imprinted from y = -5 up and taken back off every
+/// face but the top, and the top's piece from y = -5 to its +Y edge.
+fn edge_piece(solid: Brep, k: &Kernel) -> (Brep, usize) {
+    let slab = tool(k, [-60.0, -5.0, -30.0], [60.0, 40.0, 30.0]);
+    let Imprint {
+        brep: mut solid,
+        edges,
+        ..
+    } = solid.imprint(slab).unwrap();
+    let all = solid.edges().unwrap();
+    let on_top =
+        |f: Option<u32>| f.is_some_and(|f| top_face_pieces(&solid).contains(&(f as usize)));
+    let imprinted: Vec<usize> = edges.iter().map(|e| e.edge).collect();
+    let keep: Vec<usize> = (0..all.len())
+        .filter(|e| !imprinted.contains(e) || all[*e].faces.iter().any(|&f| on_top(f)))
+        .collect();
+    solid.merge_faces_keeping(&keep).unwrap();
+    let faces = solid.faces().unwrap();
+    let piece = top_face_pieces(&solid)
+        .into_iter()
+        .find(|&f| faces[f].bounds[0][1] > -5.1)
+        .unwrap();
+    (solid, piece)
+}
+
+#[test]
+fn a_panel_steps_out_and_in_from_the_rest_of_its_face() {
+    on_kernel(|k| {
+        for distance in [3.0, -3.0] {
+            let (solid, square) = panel(k);
+            let volume = solid.volume(1e-9).unwrap();
+            let label = solid.faces().unwrap()[square].label.clone();
+            let moved = solid.offset_faces(&[square], distance).unwrap();
+
+            assert!(moved.is_manifold().unwrap());
+            let change = moved.volume(1e-9).unwrap() - volume;
+            assert!(
+                (change - 200.0 * distance).abs() < 1e-3,
+                "{distance}: {change}"
+            );
+            // The square moved, four walls round it: 7 - 1 + 1 + 4 faces, and
+            // 16 edges + 4 along its new place + 4 up the corners.
+            assert_eq!((moved.face_count(), moved.edge_count()), (11, 24));
+            let faces = moved.faces().unwrap();
+            let height = 20.0 + distance;
+            let at = |f: &&smlib::FaceGeometry| {
+                f.bounds[1][0] < 10.1
+                    && (f.bounds[0][2] - height).abs() < 1e-4
+                    && f.normal.is_some()
+            };
+            let square: Vec<_> = faces
+                .iter()
+                .filter(|f| f.normal.is_some_and(|n| n[2] > 0.999))
+                .filter(at)
+                .collect();
+            assert_eq!(square.len(), 1);
+            assert_eq!(square[0].label, label, "the panel keeps its label");
+            let walls: Vec<_> = faces.iter().filter(|f| f.label.is_none()).collect();
+            assert_eq!(walls.len(), 4);
+            for wall in walls {
+                assert!(wall.normal.unwrap()[2].abs() < 1e-9);
+                assert!((wall.bounds[1][2] - wall.bounds[0][2] - distance.abs()).abs() < 1e-4);
+            }
+        }
+    });
+}
+
+#[test]
+fn a_piece_reaching_the_edge_steps_beside_the_imprint_and_stretches_the_sides() {
+    on_kernel(|k| {
+        for distance in [3.0, -3.0] {
+            let (solid, piece) = edge_piece(block(k), k);
+            assert_eq!(solid.face_count(), 7);
+            let labels = |b: &Brep| {
+                let mut labels: Vec<Label> = b
+                    .faces()
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|f| f.label)
+                    .collect();
+                labels.sort();
+                labels
+            };
+            let before = labels(&solid);
+            let volume = solid.volume(1e-9).unwrap();
+            let moved = solid.offset_faces(&[piece], distance).unwrap();
+
+            assert!(moved.is_manifold().unwrap());
+            let change = moved.volume(1e-9).unwrap() - volume;
+            assert!(
+                (change - 3500.0 * distance).abs() < 1e-3,
+                "{distance}: {change}"
+            );
+            // One wall, along the imprint; +X, -X and +Y stretch or are
+            // trimmed, and stay one face each.
+            assert_eq!(moved.face_count(), 8);
+            assert_eq!(labels(&moved), before);
+            let faces = moved.faces().unwrap();
+            let walls: Vec<_> = faces.iter().filter(|f| f.label.is_none()).collect();
+            assert_eq!(walls.len(), 1);
+            assert!(walls[0].normal.unwrap()[1].abs() > 0.999);
+        }
+    });
+}
+
+#[test]
+fn both_pieces_moved_together_need_no_step() {
+    on_kernel(|k| {
+        let (solid, _) = panel(k);
+        let top = top_face_pieces(&solid);
+        let volume = solid.volume(1e-9).unwrap();
+        let moved = solid.offset_faces(&top, 3.0).unwrap();
+        assert!(moved.is_manifold().unwrap());
+        assert_eq!(moved.face_count(), 7);
+        assert!((moved.volume(1e-9).unwrap() - volume - 18000.0).abs() < 1e-3);
+    });
+}
+
+#[test]
+fn steps_that_cant_be_built_are_refused() {
+    on_kernel(|k| {
+        // A pocket under the panel, up to 2 below the top: pushed in 3, the
+        // panel would cut into it; pushed in 1, it clears it.
+        let (solid, _) = panel(k);
+        let pocket = Brep::cuboid(k, [-5.0, -3.0, -30.0], [10.0, 6.0, 48.0]).unwrap();
+        let holed = solid.difference(pocket).unwrap();
+        let square = square_of(&holed);
+        let error = holed
+            .try_clone()
+            .unwrap()
+            .offset_faces(&[square], -3.0)
+            .unwrap_err();
+        assert_eq!(status_name(&error), Some("SHIM_ERR_OBSTRUCTED"), "{error}");
+        assert!(
+            holed
+                .offset_faces(&[square], -1.0)
+                .unwrap()
+                .is_manifold()
+                .unwrap()
+        );
+
+        // A chamfer along the top's +Y edge, beside the piece: it doesn't
+        // stand along the move.
+        let mut chamfered = block(k);
+        let faces = chamfered.faces().unwrap();
+        let facing = |axis: usize| {
+            faces
+                .iter()
+                .find(|f| f.normal.is_some_and(|n| n[axis] > 0.999))
+                .unwrap()
+                .index as u32
+        };
+        let (top, back) = (facing(2), facing(1));
+        let edge = chamfered
+            .edges()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.faces.contains(&Some(top)) && e.faces.contains(&Some(back)))
+            .unwrap()
+            .index;
+        chamfered = chamfered
+            .chamfer(&EdgeQuery::Indices(vec![edge]), 2.0, &Tolerance::default())
+            .unwrap();
+        let (solid, piece) = edge_piece(chamfered, k);
+        let error = solid.offset_faces(&[piece], 3.0).unwrap_err();
+        assert_eq!(
+            status_name(&error),
+            Some("SHIM_ERR_UNSUPPORTED_STEP"),
+            "{error}"
+        );
+
+        // A rod's side split round its middle: the piece is curved.
+        let rod = Brep::cylinder(k, [0.0, 0.0, -20.0], 10.0, 40.0).unwrap();
+        let Imprint { brep: rod, .. } = rod
+            .imprint(tool(k, [-20.0, -20.0, 0.0], [20.0, 20.0, 30.0]))
+            .unwrap();
+        let faces = rod.faces().unwrap();
+        let upper = faces
+            .iter()
+            .find(|f| f.normal.is_none() && f.bounds[0][2] > -1e-3)
+            .unwrap()
+            .index;
+        let error = rod.offset_faces(&[upper], 1.0).unwrap_err();
+        assert_eq!(
+            status_name(&error),
+            Some("SHIM_ERR_UNSUPPORTED_STEP"),
+            "{error}"
+        );
     });
 }

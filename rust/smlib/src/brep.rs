@@ -751,6 +751,21 @@ impl Brep {
     /// along the plane's normal, and nothing but the chamfer and what meets it
     /// near where the face passes.
     ///
+    /// A picked face beside an unpicked face on its own surface, as the two
+    /// pieces of a face an [`imprint`](Brep::imprint) splits are, can't
+    /// stretch that neighbour to meet it, so it steps away from it: the
+    /// picked faces are swept along the move into prisms, joined when pulled
+    /// out and cut when pushed in, which stands a wall along each edge to
+    /// such a face while every other neighbour stretches or is trimmed along
+    /// its surface as before. A panel imprinted on a lid rises or sinks. The
+    /// moved faces keep their [`Label`]s, and the walls have none. That needs
+    /// every picked face planar, all facing one way, and every other
+    /// neighbour standing along the move (a plane containing it, or a
+    /// cylinder along it); otherwise `SHIM_ERR_UNSUPPORTED_STEP`. A step never
+    /// pushes through anything: `SHIM_ERR_OBSTRUCTED` when the prisms don't
+    /// add or take exactly their own volume, as when a face pushed in runs
+    /// into a pocket under it.
+    ///
     /// With nothing in the way the topology doesn't change, so every face and
     /// edge keeps its [`Label`]: the moved faces and the neighbours that
     /// stretch alike. A move that would otherwise shrink a face to nothing

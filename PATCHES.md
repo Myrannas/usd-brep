@@ -334,9 +334,9 @@ are. The shim's `make_sides_analytic` does it after the sweep:
 
 ## Notes from the imprint work (no patch needed)
 
-`Brep::imprint` and `Brep::imprint_classified` (`sm_brep_imprint`) and
-`Brep::merge_faces_keeping` (`sm_brep_merge_faces_keeping`) are shim and Rust
-only. What the shim relies on:
+`Brep::imprint` and `Brep::imprint_classified` (`sm_brep_imprint`),
+`Brep::merge_faces_keeping` (`sm_brep_merge_faces_keeping`) and Offset Face's
+steps are shim and Rust only. What the shim relies on:
 
 - `SmMerge::ManifoldBoolean` with `SM_BO_IMPRINT` (or `bImprinting`) returns
   as soon as the intersection is inserted and the loops are checked, before
@@ -363,3 +363,15 @@ only. What the shim relies on:
   imprinted edge between two pieces of one surface. That includes
   `Brep::merge_faces` and the shim's own merges in Offset Face's
   push-through.
+- `SmBrep::LocalOperation` can't move a face away from another piece of its
+  own surface, as a panel an imprint leaves on a lid: the offset executive
+  only stretches and trims neighbours, and a neighbour on the face's own
+  surface never meets its new place. It reports a broken solid, and the
+  push-through took the wrong region (a 3 mm sink of an imprinted panel on
+  the sample crate took 357165 mm³ for 36000). So the shim's Offset Face
+  recognises such moves first and builds them from the faces swept into
+  prisms, joined or cut, with a wall where the face leaves its own surface
+  (see `sm_brep_offset_faces`): planar faces only, every other neighbour
+  standing along the move, and the prisms adding or taking exactly their
+  own volume, or it refuses (`SM_SHIM_ERR_UNSUPPORTED_STEP`,
+  `SM_SHIM_ERR_OBSTRUCTED`). Steps never reach the push-through.
