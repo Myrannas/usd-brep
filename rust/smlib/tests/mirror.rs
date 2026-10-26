@@ -695,55 +695,9 @@ fn mirrors_across_bad_planes_are_refused() {
                 block.mirror(point, normal),
                 Err(smlib::Error::InvalidArgument { .. })
             ));
-            assert!(matches!(
-                block.mirror_stock(point, normal),
-                Err(smlib::Error::InvalidArgument { .. })
-            ));
         }
         let [low, high] = block.bounding_box().unwrap();
         assert!(low[0] > -1e-3 && high[0] < 40.0 + 1e-3);
-    });
-}
-
-#[test]
-fn the_stock_mirror_rebuilds_trims_and_turns_curves_into_nurbs() {
-    on_kernel(|k| {
-        let params = TessellationParams::default();
-        for (name, make) in [("part", part as fn(&Kernel) -> Brep), ("ring", ring)] {
-            let before = make(k);
-            let faces = before.faces().unwrap();
-            let volume = before.volume(1e-9).unwrap();
-            let mut stock = make(k);
-            let start = std::time::Instant::now();
-            stock
-                .mirror_stock([300.0, 0.0, 0.0], [1.0, 0.0, 0.0])
-                .unwrap();
-            let took = start.elapsed();
-            let after = stock.faces().unwrap();
-            assert!(stock.is_manifold().unwrap());
-            assert_eq!(face_labels(&after), face_labels(&faces));
-            assert!(relative(stock.volume(1e-9).unwrap(), volume) < 1e-8);
-            assert_eq!(inside_out(&stock.tessellate(&params).unwrap()), 0);
-            let moved = faces
-                .iter()
-                .zip(&after)
-                .filter(|(a, b)| (a.uv_min, a.uv_max) != (b.uv_min, b.uv_max))
-                .count();
-            println!(
-                "{name}: stock {took:?}, kinds {:?}, {moved} domains moved",
-                kinds(&after)
-            );
-            // Mirroring it back with mirror() says what its curves became.
-            let report = stock.mirror([300.0, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap();
-            println!("{name}: {report:?}");
-            assert_eq!(report.curves_were_nurbs as usize, before.edge_count());
-            if name == "ring" {
-                // SMLib finds no torus in the reflected NURBS.
-                assert_eq!(kinds(&after), ["other"]);
-            } else {
-                assert!(moved > 0);
-            }
-        }
     });
 }
 

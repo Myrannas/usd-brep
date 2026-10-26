@@ -688,98 +688,143 @@ moved rather than offset, so it needed no kernel change.
 ## Notes from the transforms (no patch needed)
 
 `Brep::transform`, `translate` and `rotate_about` move a brep rigidly with
-`SmApiTransform`; `Brep::scale_about` and `scale_axes_about` scale it with
-`SmBrep::Transform` and a scale. Nothing in the kernel changed.
+`SmApiTransform`. `Brep::scale_axes_keeping` and `scale_about` scale it, and
+`Brep::mirror` reflects it, in the shim (`sm_brep_scale_keeping`,
+`sm_brep_mirror`), which works out every surface and curve anew rather than
+calling the kernel's own scale or mirror. Nothing in the kernel changed.
 
-- `SmApiScaleByPt` (and `SmApiScale`) pass `bScaleTol = TRUE`, which resets
-  the brep's tolerance to the band its new size falls in
-  (`SizeEstimateToZoneTol3d`: 1e-5 for a 400 mm part, 1e-4 once it's doubled),
-  sets every face's, edge's and vertex's tolerance to that, shrinking any a
-  boolean grew, and moves the context's model size estimate as well. So the
-  shim's `sm_brep_scale` composes the same transform but passes `FALSE`, and
-  then scales every tolerance it read before, the brep's included, by the
-  largest factor. A scale is then a similarity in every respect: a ×2 or ×0.5
-  scale of a rounded box with a chamfered hole integrates to 8 or 1/8 of its
-  volume within 1e-12, where keeping the tolerances gave 3e-9 and the
-  kernel's own tolerance handling 1.6e-8. Parts with spheres, cones and tori
-  agree to 6e-9.
-- Unequal factors (or a negative one, which the shim refuses) make
-  `SmBrep::Transform` call `TurnToNURBS` first: every surface and curve
-  becomes a NURBS, planes included, though planar NURBS still read as planar.
-- Labels ride through every transform: `SmBrep::Transform` notifies faces,
-  edges and vertices with `SM_NO_PRE_EDIT`, and `SM_AB_COPY` attributes stay.
+- Labels ride through every transform: `SmApiTransform` notifies faces,
+  edges and vertices with `SM_NO_PRE_EDIT`, `SM_AB_COPY` attributes stay, and
+  the shim's scale replaces geometry under the same faces and edges.
 - A rigid motion moves surface placements, not parameterisations: every
   face's (u, v) domain is unchanged, and the moved brep tessellates to the
-  same triangles, vertex for vertex within `f32` rounding (2e-5 mm on a
-  400 mm part). The tessellation keys still change, since they hash the
-  moved geometry bit for bit.
-
-`Brep::scale_axes_keeping` (`sm_brep_scale_keeping`) is the non-uniform scale
-that keeps what it can analytic, without touching the kernel either:
-
+  same vertices within `f32` rounding (2e-5 mm on a 400 mm part). The
+  tessellation keys still change, since they hash the moved geometry bit for
+  bit (see Meshes, below).
+- The kernel's own scale doesn't serve. `SmApiScaleByPt` (and `SmApiScale`)
+  pass `bScaleTol = TRUE`, which resets the brep's tolerance to the band its
+  new size falls in (`SizeEstimateToZoneTol3d`: 1e-5 for a 400 mm part, 1e-4
+  once it's doubled), sets every face's, edge's and vertex's tolerance to
+  that, shrinking any a boolean grew, and moves the context's model size
+  estimate as well. Unequal factors make `SmBrep::Transform` call
+  `TurnToNURBS` first: every surface and curve becomes a NURBS, planes
+  included. `TurnToNURBS` replaces each edge's curve with `SmEdge::SetCurve`,
+  which drops the edge's UV trim curves, and the first call that needs them
+  rebuilds them its own way, so the tessellation depends on what ran first:
+  on a crate stretched ×2 in X, computing the volume before tessellating
+  moved 466 vertices.
+- So the shim scales every tolerance it read before, the brep's included, by
+  the largest factor, and a scale is a similarity in every respect. A ×2
+  scale of the transform tests' part integrates to 8 times its volume within
+  1e-9 (the integrator's accuracy as asked), a torus within 6e-9; the
+  kernel's own scale, resetting the tolerances, gave 1.6e-8 on the part.
 - SMLib's analytic surfaces and curves are B-splines with an analytic
   description on top. Their own `Transform` scales the NURBS and derives the
   description from it again (`SmPlane::Transform` calls
   `IsNurbSurfacePlane`), and refuses only a scale that isn't uniform. So the
-  shim scales each face's and edge's NURBS exactly (knots and weights stay,
-  so parameters do) and rebuilds the analytic surface or curve where the
-  scaled NURBS still is one: `SmPlane::IsNurbSurfacePlane`,
-  `SmCone::IsNurbSurfaceCone`, `SmSphere::IsNurbSurfaceSphere`,
-  `SmCircle::IsNurbCurveCircle`. An ellipse is an `SmEllipse` through the
-  images of the circle's axes, made over the scaled NURBS (its constructor
-  takes one, as `IsNurbCurveCircle` hands its NURBS to `SmCircle`), when the
-  NURBS runs on it between its start and end angles. A stretched cylinder is
-  an `SmSurfOfExtrusion` of such an ellipse, made as
-  `SmSurfOfExtrusion::IsNurbSurfaceSurfOfExtrusion` makes one, except that
-  recogniser's profile is a NURBS of the iso curve. Every candidate must have
-  the scaled NURBS's domain and lie on it at 25 (u, v) or 9 parameters to a
-  thousandth of the tolerance, or the NURBS stays.
+  shim makes each face's surface and each edge's curve as the transform
+  takes it:
+  - Under equal factors, a copy moved by its own `Transform`, which keeps
+    its kind; `SmOffsetSurface::Transform` scales its distance with it.
+  - Under a mirror, planes, circles and ellipses take the rigid motion that
+    moves their own plane as the mirror does (see the mirrors, below).
+  - Otherwise each B-spline's NURBS is scaled exactly (knots and weights
+    stay, so parameters do) and the analytic surface or curve rebuilt where
+    the scaled NURBS still is one: `SmPlane::IsNurbSurfacePlane`,
+    `SmCone::IsNurbSurfaceCone`, `SmSphere::IsNurbSurfaceSphere`,
+    `SmCircle::IsNurbCurveCircle`. An ellipse is an `SmEllipse` through the
+    images of the circle's axes, made over the scaled NURBS (its
+    constructor takes one, as `IsNurbCurveCircle` hands its NURBS to
+    `SmCircle`), when the NURBS runs on it between its start and end angles.
+    A stretched cylinder is an `SmSurfOfExtrusion` of such an ellipse, made
+    as `SmSurfOfExtrusion::IsNurbSurfaceSurfOfExtrusion` makes one, except
+    that recogniser's profile is a NURBS of the iso curve. A surface of
+    extrusion under any scale is its profile, scaled as an edge's curve is,
+    swept along the scaled vector.
+  - An offset surface under unequal factors has no exact image: its image
+    isn't an offset of anything, `SmOffsetSurface::Transform` refuses, and
+    SMLib's own route (`SmOffsetExecutive::ReplaceImplicitOffsets`)
+    approximates it as a NURBS. The shim refuses it
+    (`SM_SHIM_ERR_BAD_SCALE`). The face offset makes one when it offsets a
+    NURBS face (a chamfer on a circular edge); the hollow's inside faces
+    came out planes, cylinders and NURBS on every body tried.
+  - A curve that isn't a B-spline is refused the same way under anything
+    but equal factors. None turned up.
+- Every new surface and curve must have the old one's parameter domain and
+  lie where the transform takes the old one, at the same parameters, at 25
+  (u, v) or 9 parameters, to a thousandth of the brep's tolerance, or the
+  NURBS stays (or, where there is no NURBS to fall back on, the scale is
+  refused). So faces keep their domains, edges their intervals and UV trim
+  curves.
+- It is all or nothing. Every new surface and curve is made and checked, on
+  copies, before the brep changes, and so is everything a mirror's
+  topology flip needs (each face with both sides in shells, each edge used
+  an even number of times); a brep in which two faces share one surface or
+  two edges one curve, which it would transform twice, is refused too (none
+  turned up: booleans give each piece of a split face its own surface). Then
+  the new surfaces and curves take the old ones' places (`SmEdge::SetCurve`
+  as `TurnToNURBS` does it, `SmFace::SetSurface` keeping the face's domain),
+  the UV trim curves, which replacing drops, are put back, and the
+  tolerances scale. Those setters can't fail; if a mirror's flip does after
+  the geometry has changed, it says so (`SM_SHIM_ERR_BROKE_SOLID`).
 - Fitting an `SmEllipse` to another interval with
   `SmBSplineCurve::ScaleKnotVector` killed the process; making it over the
   scaled NURBS sidesteps that (arcs of fillets run by arc length).
 - `SmTorus::IsNurbSurfaceTorus` doesn't recognise a scaled torus, which is
-  why `CopyAndAddAnalytics` leaves it out; under equal factors every surface
-  and curve scales itself in place instead.
-- `TurnToNURBS` replaces each edge's curve with `SmEdge::SetCurve`, which
-  drops the edge's UV trim curves; the first call that needs them rebuilds
-  them its own way. So after `scale_axes_about` the tessellation depends on
-  what ran first: on a crate stretched ×2 in X, computing the volume before
-  tessellating moved 466 vertices. `scale_axes_keeping` copies every trim
-  first and puts it back, and tessellates the same either way.
+  why `CopyAndAddAnalytics` leaves it out; under equal factors a torus
+  scales itself, and under a mirror it is built from its own description.
 - `SmApiWriteBrepToFile` and `SmApiReadBrepFromFile` (`Brep::write_file`,
   `read_file`) bring back every surface, ellipse extrusions included, but no
   labels, scaled or not. Reading recognises analytic surfaces again: a crate
-  stretched by `scale_axes_about` comes back with planes.
+  stretched by `SmBrep::Transform` comes back with planes.
+- What each kind of surface becomes, over 12 bodies made by the primitives,
+  fillets, revolves, pipes, drafts, hollows, face moves and face offsets
+  (`tests/transform_bodies.rs`): a turn and a uniform scale keep every kind;
+  a mirror keeps every kind; a stretch along z, then along x
+  (`scale_axes_keeping` without extrusions) gives
+
+  | Kind | Stretch z | Stretch x |
+  |---|---|---|
+  | plane | kept | kept |
+  | cylinder | kept 15, NURBS 12 | kept 6, NURBS 21 |
+  | cone | kept 1, NURBS 1 | NURBS 2 |
+  | sphere, torus, surface of revolution | NURBS | NURBS |
+  | surface of extrusion | kept | kept |
+  | NURBS | NURBS | NURBS |
+  | offset surface | refused | refused |
+
+  Every cylinder and cone along the stretched axis stays one, and every
+  plane stays a plane. Labels, (u, v) domains, manifoldness and outward
+  faces hold through all of them, and the volume to 1e-6 (the integrator).
+  On an M-series Mac in release, a turn of all 12 takes 0.9 ms (the
+  26-face filleted box 0.18 ms), a uniform scale 1.6 ms, a stretch 1.5 to
+  1.9 ms and a mirror 13 ms (a drafted D with a NURBS side 4.5 ms of it).
 
 ## Notes from the mirrors (no patch needed)
 
-`Brep::mirror` (`sm_brep_mirror`) reflects a brep across a plane and keeps
-every surface and curve what it was, and `Brep::combine` gathers a
-pattern's copies without booleans. Nothing in the kernel changed.
-
 - SMLib has its own reflection, `SmBrep::Mirror`, which `SmBrep::Transform`
-  uses for a matrix with a negative determinant (`Brep::mirror_stock` wraps
-  it). It reflects each curve with `CreateMirrorCurve`, which every curve
-  class takes from `SmBSplineCurve`: a plain NURBS copy, so lines and circles
-  become NURBS. It reflects each surface the same way and finds analytic
-  surfaces again with `CopyAndAddAnalytics`, which leaves out tori, so a
-  torus comes back as a NURBS surface of revolution. It then drops every UV
-  trim curve and builds them again its own way, and 7 of the test part's 16
-  faces come back reparameterised. It takes about 15 ms on that part.
+  uses for a matrix with a negative determinant. It reflects each curve with
+  `CreateMirrorCurve`, which every curve class takes from `SmBSplineCurve`:
+  a plain NURBS copy, so lines and circles become NURBS. It reflects each
+  surface the same way and finds analytic surfaces again with
+  `CopyAndAddAnalytics`, which leaves out tori, so a torus comes back as a
+  NURBS surface of revolution. It then drops every UV trim curve and builds
+  them again its own way: 7 of the transform tests' part's 16 faces came back
+  reparameterised, in about 15 ms. The shim no longer wraps it.
 - The shim keeps `SmBrep::Mirror`'s topology flip. A reflection turns each
   surface's (u, v) round, so its normal Su × Sv points into the solid: each
   face's two faceuses trade shells, and each edge's edgeuses reverse their
   radial order pair by pair. When the brep has more than one region,
   `FindAndSetInfiniteRegion` runs again afterwards. The shim puts each
   faceuse in the other's place in its shell's list rather than at the end.
-- Geometry follows `scale_axes_keeping` with factors (1, 1, -1) after a
-  turn, and keeps parameters wherever it can:
+- Geometry is the scale's with factors (1, 1, -1) after a turn, and keeps
+  parameters wherever it can:
   - Planes, circles and ellipses move by a rigid motion: the reflection
     after a reflection across their own plane, which leaves that plane in
     place. Their own `Transform` then keeps their NURBS, as it does under
     `SmApiTransform`.
-  - Lines take `SmLine::Transform` with the -1 factor.
-  - NURBS are reflected exactly.
+  - Lines take `SmLine::Transform` with the -1 factor, and NURBS are
+    reflected exactly.
   - Cylinders, cones and spheres are found again in their reflected NURBS
     (`IsNurbSurfaceCone`, which flags the reversed angle as inside-out, and
     `IsNurbSurfaceSphere`).
@@ -788,45 +833,118 @@ pattern's copies without booleans. Nothing in the kernel changed.
     empty, and evaluating that torus crashed. The `SmTorus` constructor
     never sets its own `m_bInsideOut`, which its header calls "not fully
     supported", and keeps the reversed minor circle as its generating
-    circle's inside-out flag instead.
+    circle's inside-out flag instead. A reflection takes the point at minor
+    angle v to the one at -v, so the minor circle's range of angles, [a, b],
+    becomes [-b, -a]. A revolved torus runs from 0 to 360, where keeping the
+    range happens to work too; a pipe's bend runs from 90 to 450, and kept,
+    its reflection lay half a turn round the tube and fell back to a NURBS.
   - Surfaces of revolution, which SMLib makes for fillets on circular edges,
     are built from their reflected generating curve with
     `SmSurfOfRevolution::CreateCanonical`, `AdjustSTEPUVDomain` and
-    `Reparameterize`.
-  - Every rebuilt surface must lie on the reflected NURBS at the same
-    parameters, or the NURBS stays.
-- `scale_keeping`, which both `scale_axes_keeping` and `mirror` use,
-  now refuses (`SM_SHIM_ERR_BAD_SCALE`) a brep in which two faces share one
-  surface or two edges share one curve, since it would transform that
-  surface or curve twice. No such brep turned up: booleans give each piece
-  of a split face its own surface.
-- Results (`tests/mirror.rs`) on the transform tests' part (planes,
-  cylinders, a cone, a sphere and a NURBS chamfer), a torus and a bracket
-  with rounded hole rims:
+    `Reparameterize`, and surfaces of extrusion from theirs.
+  - An offset surface is its base, reflected as any face's surface is, with
+    its distance negated, since the base's normal turns over: what
+    `SmOffsetSurface::CreateMirrorSurface` does, except that it reflects the
+    base with `SmBSplineSurface::CreateMirrorSurface`, a NURBS.
+- Results (`tests/mirror.rs`, `tests/transform_bodies.rs`) on the transform
+  tests' part (planes, cylinders, a cone, a sphere and a NURBS chamfer), a
+  torus, a bracket with rounded hole rims and the 12 bodies above:
   - Every kind, label, (u, v) domain and tolerance is kept.
   - It is manifold, its volume is kept to 1e-10 to 1e-7 (the integrator,
-    as for a turn), and it costs 0.4 to 1.1 ms.
+    as for a turn), and it costs up to 4.5 ms.
   - Later fillets, chamfers, booleans and face offsets take it.
   - It tessellates to the original's vertices reflected, within `f32`
-    rounding, with every triangle wound the other way round. On one planar
-    face of the part, the top with a chamfered hole and a ball cut out of
-    its corner, some quads split along the other diagonal: 29 to 62 of
-    3138 triangles, and as many after a second reflection back. A
-    `scale_axes_keeping` there and back does the same (39), and rigid turns
-    don't. Keeping the faceuses' list order, and moving planes and circles
-    rigidly rather than finding them again, changed nothing there. The
-    torus matches exactly (0 of 15760).
-- `Brep::combine` (`sm_brep_combine`) wraps `SmBrep::MergeBrep`, which
-  copies another brep's topology and attributes in without intersecting it,
-  mapping its infinite region onto this one's. Copies of a solid that
-  neither touch nor overlap come out as one valid brep of several lumps: it
-  is manifold, its volume is the sum to 1e-8, and the copies keep their
-  labels. A boolean then takes them all as one tool, with the result that
-  joining them one at a time gives (`tests/mirror.rs`). It passes
-  `bAddAnalytics = FALSE`, so surfaces keep their types.
+    rounding, with every triangle wound the other way round. On some faces
+    quads split along the other diagonal: 29 to 62 of the part's 3138
+    triangles, 216 of a hollow pipe's 2432, and as many after a second
+    reflection back. A scale there and back does the same (39 on the part),
+    and rigid turns mostly don't (56 of the pipe's). Keeping the faceuses'
+    list order, and moving planes and circles rigidly rather than finding
+    them again, changed nothing there. The torus matches exactly (0 of
+    15760).
 - A half of a part, mirrored and joined to the other half, has the whole
   part's volume to 1e-10. Its planes, its cylinders and its fillets'
   surfaces of revolution that cross the mirror plane merge back into one
   face each with `merge_faces`. A sphere that crosses it doesn't merge across
   its seam. Joining the two halves cut from the part, with no mirror at all,
   leaves that sphere in three pieces; with the mirrored half it is in four.
+
+## Notes from combining copies (no patch needed)
+
+- `Brep::combine` (`sm_brep_combine`) wraps `SmBrep::MergeBrep`, which
+  copies another brep's topology and attributes in without intersecting it,
+  mapping its infinite region onto this one's. Copies of a solid that
+  neither touch nor overlap come out as one valid brep of several lumps: it
+  is manifold, its volume is the sum to 1e-8, and the copies keep their
+  labels, their faces after this brep's in their own order. A boolean then
+  takes them all as one tool, with the result that joining them one at a
+  time gives. It passes `bAddAnalytics = FALSE`, so surfaces keep their
+  types.
+- Solids that touch, overlap or nest would merge into a brep that isn't a
+  valid solid, so it checks first. Bounding boxes apart by more than both
+  tolerances (`SmApiBrepBoundingBox`, which is loose round curved faces:
+  0.3 mm round a box with 5 mm rounds) settle it at once. Otherwise
+  `SmTopologySolver::BrepBrepSolve` looks for two points of their surfaces
+  within both tolerances, and none found, a point of each face classified
+  against the other (`Point3DClassify`) must lie in its infinite region.
+  Solids that aren't apart are refused with `SM_SHIM_ERR_NOT_APART`, the
+  brep unchanged.
+- `SM_API` already has the query, `SmApiBrepRelationship`, which
+  `Brep::relationship` binds. Combine doesn't call it: it searches for the
+  closest approach however far, and when the surfaces meet it samples
+  either's vertices and face points against the other to tell touching from
+  overlapping, which can take a second (1.1 s for a hollowed box with a
+  chamfered hole against itself) and which a combine doesn't need. Bounding
+  the search at the tolerance halved the cost of combining a pattern. It
+  also calls a solid in a cavity of the other apart; combine refuses that,
+  since the copy would belong in the cavity's region.
+- `BrepBrepSolve`'s closest approach is exact between planes and spheres
+  (blocks and balls 0.01 to 300 apart, to 1e-12) but falls short beside a
+  cylinder: two of the crate's bolts (radius 8) side by side read 4.45 closer
+  than they are, 9.6 at 45°, and two 25 mm vents 14. In every case tried it
+  never read further than the truth, so what it calls apart is, but round
+  copies closer than about 0.3 to 0.6 of their radius are refused though
+  apart, and a solid inside a cylinder can read as overlapping. The leaf
+  solver, `SmTLSFaceFace`, minimises over each face's whole (u, v) box
+  rather than its trimmed face; where the cylinders' shortfall comes from
+  wasn't pinned down.
+- `MergeBrep` adds topology without dropping the brep's cache of spatial
+  trees (`SmBrepCache`), which `BrepBrepSolve` builds, so a query after a
+  combine saw only what the brep held before it: copy 2 of a pattern read
+  29.7 mm from the tool, its distance from copy 0, when copy 1 lay 4.6 mm
+  away. The shim notifies the brep with `SM_NO_PRE_EDIT` before merging,
+  which drops the cache as every other edit does.
+- On an M-series Mac in release, combining a copy that's apart takes 0.05 to
+  0.5 ms on the 12 bodies; refusing one that touches 1 to 23 ms, one that
+  overlaps 1 to 450 ms (the hollowed box with a chamfered hole), one on top
+  of itself up to 1.1 s. Patterns of the crate's bolts (a cylinder of radius
+  8 and height 6), combined copy by copy and then joined to a plate in one
+  union, against a union per copy:
+
+  | Pattern | Combine | One union | Union per copy |
+  |---|---|---|---|
+  | the crate's 4 | 0.5 ms | 2.3 ms | 3.0 ms |
+  | 12 round a circle | 1.4 ms | 6.7 ms | 11.9 ms |
+  | 100 round a circle | 28 ms | 103 ms | 541 ms |
+  | 10 by 10 grid | 41 ms | 103 ms | 537 ms |
+
+  `Brep::relationship` on two bolts takes about 3 ms apart and 11 to 14 ms
+  touching or overlapping, where it samples.
+
+## Notes from moving meshes (no patch needed)
+
+- A face's tessellation key hashes its surface, trim and boundary as they
+  lie, so moving or mirroring a body misses every key (0 of each body's
+  faces kept one). `Mesh::transform` and `Mesh::mirror` let a caller keep a
+  body's mesh from before the move and move it instead: positions, normals,
+  edge polylines and the faces' `Surface`s move, surface (u, v)s stay, since
+  the brep's surfaces keep their parameters, and a mirror turns every
+  triangle round. A reflected surface's angles run the other way round its
+  axis, which `Surface` has no way to say; the mesher reads only its
+  origin, axis, radius and half-angle.
+- Against the moved brep's own tessellation, on the 12 bodies: the same
+  vertices within 1.5e-5 mm, the same triangles but for the pipe's 56 of
+  2432 and a hollowed box's 12 of 380; against the mirrored brep's, the same vertices within 8e-6 mm and
+  0 to 216 of the triangles split along the other diagonal. Either is a
+  watertight mesh of the moved or mirrored solid facing out, though not bit
+  for bit the one it would make.

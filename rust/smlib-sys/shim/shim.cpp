@@ -54,17 +54,23 @@
 #include <SmMerge.h>
 #include <SmOffsetExecutive.h>
 #include <SmOffsetGeometryCreation.h>
+#include <SmOffsetSurface.h>
 #include <SmPlane.h>
+#include <SmPointClass.h>
 #include <SmPoly.h>
 #include <SmPrimitiveCreation.h>
+#include <SmRegion.h>
 #include <SmRotationalSweepGeometry.h>
 #include <SmShell.h>
+#include <SmSolutionArray.h>
 #include <SmSphere.h>
 #include <SmSurfOfExtrusion.h>
 #include <SmSurfOfRevolution.h>
 #include <SmSurfTypes.h>
 #include <SmTess.h>
+#include <SmTol.h>
 #include <SmTopologyIntersector.h>
+#include <SmTopologySolver.h>
 #include <SmTopologySweep.h>
 #include <SmTorus.h>
 #include <SmVertex.h>
@@ -4077,6 +4083,46 @@ sm_status offset_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double d
     return push_through(brep, picked, distance, obstacles, plugs);
 }
 
+// Whether a point lies outside a solid: in its infinite region, not in its
+// material, a cavity of it or on its boundary.
+bool outside(const SmBrep& solid, const SmPoint3d& point) {
+    SmPointClassification found;
+    if (solid.Point3DClassify(point, SmTol::GetZoneTol3d(static_cast<const SmContext*>(NULL)), FALSE, found) !=
+            SM_SUCCESS ||
+        found.GetPointClass() != SM_PC_REGION) {
+        return false;
+    }
+    const SmRegion* region = static_cast<const SmRegion*>(found.GetObject());
+    return region != NULL && region->IsInfiniteRegion();
+}
+
+// Whether two solids are apart: no two points of their surfaces within both
+// tolerances (SmTopologySolver::BrepBrepSolve, looking no further), and a
+// point of each outside the other, which then holds for every point. As
+// SmApiBrepRelationship decides it, but for a solid in a cavity of the other,
+// which isn't apart here, and without its sampling to tell solids that meet
+// touching from overlapping. Failing safe: not apart when a point can't be
+// had or classified.
+sm_status apart(const SmBrep& a, const SmBrep& b, bool& out) {
+    out = false;
+    SmSolutionArray solutions;
+    const double gap = a.GetTolerance().val + b.GetTolerance().val;
+    const SmStatus status =
+        SmTopologySolver::BrepBrepSolve(&a, &b, SM_SO_MINIMIZE, SM_SR_SINGLE, SM_ZONE_TOL_3D, gap * gap, NULL, solutions);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    if (solutions.GetSize() > 0 && !(solutions[0].m_vStart.m_dSolutionValue > gap)) return SM_SUCCESS;
+    SmTArray<SmFace*> faces_a, faces_b;
+    a.GetFaces(faces_a);
+    b.GetFaces(faces_b);
+    SmPoint3d on_a, on_b;
+    if (faces_a.GetSize() == 0 || faces_b.GetSize() == 0 || faces_a[0]->CalculateAnInternalPoint(on_a) != SM_SUCCESS ||
+        faces_b[0]->CalculateAnInternalPoint(on_b) != SM_SUCCESS) {
+        return SM_SUCCESS;
+    }
+    out = outside(a, on_b) && outside(b, on_a);
+    return SM_SUCCESS;
+}
+
 }  // namespace
 
 extern "C" {
@@ -4360,52 +4406,6 @@ sm_status sm_brep_transform(sm_brep* brep, const double rotation[9], sm_vec3 tra
     });
 }
 
-sm_status sm_brep_scale(sm_brep* brep, sm_vec3 point, sm_vec3 factors) {
-    if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
-    const auto positive = [](double f) { return std::isfinite(f) && f > SM_EFF_ZERO; };
-    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) || !positive(factors.x) ||
-        !positive(factors.y) || !positive(factors.z)) {
-        return SM_SHIM_ERR_BAD_SCALE;
-    }
-    return guarded([&] {
-        SmBrep& solid = *brep_of(brep);
-        SmTArray<SmVertex*> vertices;
-        SmTArray<SmEdge*> edges;
-        SmTArray<SmFace*> faces;
-        solid.GetVertices(vertices);
-        solid.GetEdges(edges);
-        solid.GetFaces(faces);
-        std::vector<double> vertex_tolerances, edge_tolerances, face_tolerances;
-        for (ULONG i = 0; i < vertices.GetSize(); ++i) vertex_tolerances.push_back(vertices[i]->GetTolerance().val);
-        for (ULONG i = 0; i < edges.GetSize(); ++i) edge_tolerances.push_back(edges[i]->GetTolerance().val);
-        for (ULONG i = 0; i < faces.GetSize(); ++i) face_tolerances.push_back(faces[i]->GetTolerance().val);
-        const double brep_tolerance = solid.GetTolerance().val;
-        // SmApiScaleByPt's composition: scale about the origin, then move the
-        // origin's image so that the point stays put.
-        SmAxis2Placement move;
-        move.Translate(SmVector3d(point.x * (1.0 - factors.x), point.y * (1.0 - factors.y),
-                                  point.z * (1.0 - factors.z)));
-        const SmVector3d scale(factors.x, factors.y, factors.z);
-        // Not the kernel's tolerance scaling, which resets every tolerance to
-        // a band picked from the brep's new size (1e-5 to 1e-4 for a ×2 crate),
-        // shrinking any a boolean grew, and moves the context's model size.
-        const SmStatus status = solid.Transform(move, &scale, FALSE);
-        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
-        const double by = std::max({factors.x, factors.y, factors.z});
-        for (ULONG i = 0; i < vertices.GetSize(); ++i) {
-            vertices[i]->SetTolerance(SmZoneTol3d(vertex_tolerances[i] * by), FALSE, FALSE);
-        }
-        for (ULONG i = 0; i < edges.GetSize(); ++i) {
-            edges[i]->SetTolerance(SmZoneTol3d(edge_tolerances[i] * by), FALSE, FALSE);
-        }
-        for (ULONG i = 0; i < faces.GetSize(); ++i) {
-            faces[i]->SetTolerance(SmZoneTol3d(face_tolerances[i] * by), FALSE, FALSE);
-        }
-        solid.SetTolerance(SmZoneTol3d(brep_tolerance * by), FALSE, FALSE);
-        return SM_SUCCESS;
-    });
-}
-
 sm_status sm_brep_tolerance(const sm_brep* brep, double* out) {
     if (!brep || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
     return guarded([&] {
@@ -4443,12 +4443,47 @@ sm_status sm_brep_merge_faces(sm_brep* brep) {
     return guarded([&] { return static_cast<sm_status>(brep_of(brep)->RemoveTopologicalEdgesAndVertices()); });
 }
 
+sm_status sm_brep_relationship(const sm_brep* a, const sm_brep* b, int32_t* relationship, double* distance) {
+    if (!a || !b || !relationship || !distance) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        int found = 0;
+        double gap = 0.0;
+        const SmApiStatus status = SmApiBrepRelationship(brep_of(a), brep_of(b), found, gap);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        *relationship = found;
+        *distance = gap;
+        return SM_SUCCESS;
+    });
+}
+
 sm_status sm_brep_combine(sm_brep* brep, const sm_brep* other) {
     if (!brep || !other) return SM_SHIM_ERR_NULL_ARGUMENT;
     if (brep_of(brep) == brep_of(other)) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
-    // FALSE: keep every surface's type, as copied.
-    return guarded(
-        [&] { return static_cast<sm_status>(brep_of(brep)->MergeBrep(*brep_of(other), NULL, NULL, FALSE)); });
+    return guarded([&] {
+        SmBrep& into = *brep_of(brep);
+        const SmBrep& from = *brep_of(other);
+        // Boxes apart by more than both tolerances leave nothing to ask.
+        SmPoint3d low_a, high_a, low_b, high_b;
+        SmApiStatus status = SmApiBrepBoundingBox(&into, FALSE, low_a, high_a);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        status = SmApiBrepBoundingBox(&from, FALSE, low_b, high_b);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        const double gap = into.GetTolerance().val + from.GetTolerance().val;
+        const bool boxes_apart = low_a.x > high_b.x + gap || low_b.x > high_a.x + gap || low_a.y > high_b.y + gap ||
+                                 low_b.y > high_a.y + gap || low_a.z > high_b.z + gap || low_b.z > high_a.z + gap;
+        if (!boxes_apart) {
+            bool separate = false;
+            const sm_status found = apart(into, from, separate);
+            if (found != SM_SUCCESS) return found;
+            if (!separate) return SM_SHIM_ERR_NOT_APART;
+        }
+        // MergeBrep adds to the brep without dropping its cache of spatial
+        // trees, which the query above built, so a later query would miss
+        // what it adds.
+        into.Notify(SM_NO_PRE_EDIT, &into, NULL, NULL);
+        // FALSE: keep every surface's type, as copied.
+        return static_cast<sm_status>(into.MergeBrep(from, NULL, NULL, FALSE));
+    });
 }
 
 sm_status sm_brep_create_tapered_prism(const sm_vec3* points, size_t count, double height, double draft_deg,
@@ -4725,29 +4760,53 @@ void sm_mesh_free(sm_mesh* mesh) { delete mesh; }
 
 }  // extern "C"
 
-// Non-uniform scales that keep surfaces and curves analytic where the scale
-// leaves them so (sm_brep_scale_keeping).
+// Scales and reflections that keep every surface and curve what it can be
+// (sm_brep_scale_keeping, sm_brep_mirror).
 //
 // SmBrep::Transform turns every surface and curve into a NURBS before a
 // non-uniform scale (TurnToNURBS), since SMLib's analytic surfaces and curves
-// refuse one. They are B-splines too, though: each keeps a NURBS of itself,
-// and its own Transform scales that NURBS and derives its analytic description
-// from it again (SmPlane::Transform), refusing only a scale that isn't
-// uniform. So this scales each face's and edge's NURBS exactly, which keeps
-// its knots and weights and so its parameters, and makes it analytic again
-// where the scaled NURBS still is: a plane always, a cylinder or cone along a
-// scale axis whose other two factors are equal, a circle in a plane the scale
-// keeps round. A circle the scale stretches becomes an ellipse, and with
-// extrusions a cylinder stretched across its axis becomes an ellipse swept
-// along a line (SmSurfOfExtrusion). A candidate is taken only when it has the
-// scaled NURBS's domain and lies on it at the same parameters, so every edge
-// keeps its interval and every UV trim curve stays right. Replacing a face's
-// surface or an edge's curve drops the trims, so they are put back after.
+// refuse one, and SmBrep::Mirror turns every curve into one. They are
+// B-splines too, though: each keeps a NURBS of itself, and its own Transform
+// scales that NURBS and derives its analytic description from it again
+// (SmPlane::Transform). So this works out each face's surface and each edge's
+// curve anew, as the transform takes it:
 //
-// A reflection (sm_brep_mirror) is the same scale with a factor of -1 and a
-// turn after it. It keeps every kind, but it turns each surface's (u, v)
-// round, so the normal Su x Sv now points into the solid; the faces' sides
-// and the order of faces round each edge flip as SmBrep::Mirror flips them.
+// - Under equal factors each takes its own Transform, which keeps its kind,
+//   an offset surface's distance scaled with it.
+// - Under a reflection, planes, circles and ellipses take the rigid motion
+//   that moves their own plane as the reflection does (the reflection after
+//   one across that plane), through their own Transform, which keeps their
+//   NURBS and parameters. An offset surface's base is reflected as any
+//   surface is, and its distance negated, as
+//   SmOffsetSurface::CreateMirrorSurface does.
+// - Otherwise a B-spline's NURBS is scaled exactly, which keeps its knots and
+//   weights and so its parameters, and the analytic surface or curve is
+//   rebuilt wherever the scaled NURBS still is one: a plane always, a cylinder
+//   or cone along a scale axis whose other two factors are equal, a circle in
+//   a plane the scale keeps round, a surface of extrusion always (its profile
+//   scaled), and under a reflection every kind (cylinders, cones and spheres
+//   found again; tori and surfaces of revolution, which SMLib can't find in a
+//   NURBS, built from their own description). A circle the scale stretches
+//   becomes an ellipse, and with extrusions a cylinder stretched across its
+//   axis an ellipse swept along a line (SmSurfOfExtrusion). Anything else
+//   stays the scaled NURBS.
+//
+// Every new surface and curve must have the old one's parameter domain and lie
+// where the transform takes the old one, at the same parameters, to a
+// thousandth of the brep's tolerance, so faces keep their domains and edges
+// their intervals and UV trim curves. All of it is worked out on copies before
+// the brep changes, so a surface or curve with no exact image (an offset
+// surface stretched, a curve that isn't a B-spline under anything but equal
+// factors), one that two faces or edges share, or a kernel failure leaves the
+// brep as it was. Then the new surfaces and curves take the old ones' places,
+// the UV trim curves (which replacing drops) are put back, and every
+// tolerance scales by the largest factor, rather than being reset to a band
+// from the brep's new size as SmApiScaleByPt does.
+//
+// A reflection turns each surface's (u, v) round, so the normal Su x Sv
+// points into the solid: the faces' two sides trade shells and the order of
+// the faces round each edge reverses, as SmBrep::Mirror does, and the
+// infinite region is found again.
 
 namespace {
 
@@ -4767,6 +4826,11 @@ struct Scaling {
         return out;
     }
     double largest() const { return std::max({std::fabs(factors.x), std::fabs(factors.y), std::fabs(factors.z)}); }
+    // Equal positive factors: every surface and curve keeps its kind under
+    // its own Transform.
+    bool uniform() const {
+        return factors.x > 0.0 && SM_ARE_SAME(factors.x, factors.y) && SM_ARE_SAME(factors.x, factors.z);
+    }
     bool reflects() const { return factors.x * factors.y * factors.z < 0.0; }
     // Equal factors but for their signs: angles and shapes stay.
     bool similar() const {
@@ -4791,55 +4855,71 @@ struct Scaling {
     }
 };
 
-// The largest distance between two surfaces at the same (u, v), over a grid
-// on the domain.
-double surface_gap(const SmSurface& a, const SmSurface& b, const SmExtent2d& domain) {
-    double gap = 0.0;
-    for (int i = 0; i <= 4; ++i) {
-        for (int j = 0; j <= 4; ++j) {
-            const SmPoint2d uv = domain.Evaluate(i / 4.0, j / 4.0);
-            SmPoint3d p, q;
-            if (a.EvaluatePoint(uv, p) != SM_SUCCESS || b.EvaluatePoint(uv, q) != SM_SUCCESS) return HUGE_VAL;
-            gap = std::max(gap, (p - q).Length());
+// What a surface or curve became.
+enum class Became { kSame, kExtruded, kStretched, kNurbs, kWasNurbs };
+
+// What a new surface or curve must match: where the scaling takes the old one,
+// at the same parameters, over its whole domain.
+struct Image {
+    const Scaling& scaling;
+    double tolerance;
+
+    // The surface at a 5 x 5 grid over the old one's domain, against the old
+    // one there moved.
+    bool holds(const SmSurface& candidate, const SmSurface& original) const {
+        const SmExtent2d domain = original.GetNaturalUVDomain();
+        if (!(candidate.GetNaturalUVDomain() == domain)) return false;
+        for (int i = 0; i <= 4; ++i) {
+            for (int j = 0; j <= 4; ++j) {
+                const SmPoint2d uv = domain.Evaluate(i / 4.0, j / 4.0);
+                SmPoint3d p, q;
+                if (candidate.EvaluatePoint(uv, p) != SM_SUCCESS || original.EvaluatePoint(uv, q) != SM_SUCCESS ||
+                    !((p - scaling.point(q)).Length() <= tolerance)) {
+                    return false;
+                }
+            }
         }
+        return true;
     }
-    return gap;
-}
 
-// The largest distance between two curves at the same parameter.
-double curve_gap(const SmCurve& a, const SmCurve& b, const SmExtent1d& interval) {
-    double gap = 0.0;
-    for (int i = 0; i <= 8; ++i) {
-        const double t = interval.Evaluate(i / 8.0);
-        SmPoint3d p, q;
-        if (a.EvaluatePoint(t, p) != SM_SUCCESS || b.EvaluatePoint(t, q) != SM_SUCCESS) return HUGE_VAL;
-        gap = std::max(gap, (p - q).Length());
+    // The curve at 9 parameters across the old one's interval.
+    bool holds(const SmCurve& candidate, const SmCurve& original) const {
+        const SmExtent1d interval = original.GetNaturalInterval();
+        if (!(candidate.GetNaturalInterval() == interval)) return false;
+        for (int i = 0; i <= 8; ++i) {
+            const double t = interval.Evaluate(i / 8.0);
+            SmPoint3d p, q;
+            if (candidate.EvaluatePoint(t, p) != SM_SUCCESS || original.EvaluatePoint(t, q) != SM_SUCCESS ||
+                !((p - scaling.point(q)).Length() <= tolerance)) {
+                return false;
+            }
+        }
+        return true;
     }
-    return gap;
-}
 
-// Takes the candidate if it stands in for the scaled NURBS exactly; deletes it
-// otherwise.
+    // Takes a candidate for `original`'s image if it holds; deletes it
+    // otherwise.
+    template <typename T, typename Original>
+    T* take(T* candidate, const Original& original) const {
+        if (candidate && holds(*candidate, original)) return candidate;
+        delete candidate;
+        return nullptr;
+    }
+};
+
+// A copy of a surface or curve moved by its own Transform.
 template <typename T>
-T* if_same_surface(T* candidate, const SmBSplineSurface& scaled, double tolerance) {
-    const SmExtent2d domain = scaled.GetNaturalUVDomain();
-    if (candidate && candidate->GetNaturalUVDomain() == domain &&
-        surface_gap(*candidate, scaled, domain) <= tolerance) {
-        return candidate;
-    }
-    delete candidate;
-    return nullptr;
-}
-
-template <typename T>
-T* if_same_curve(T* candidate, const SmBSplineCurve& scaled, double tolerance) {
-    const SmExtent1d interval = scaled.GetNaturalInterval();
-    if (candidate && candidate->GetNaturalInterval() == interval &&
-        curve_gap(*candidate, scaled, interval) <= tolerance) {
-        return candidate;
-    }
-    delete candidate;
-    return nullptr;
+sm_status moved_copy(const SmContext& context, const T& object, const SmAxis2Placement& move,
+                     const SmVector3d* scale, std::unique_ptr<T>& out) {
+    T* raw = nullptr;
+    SmStatus status = object.Copy(context, raw);
+    std::unique_ptr<T> copy(raw);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    if (!copy) return static_cast<sm_status>(SM_ERR);
+    status = copy->Transform(move, scale);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    out = std::move(copy);
+    return SM_SUCCESS;
 }
 
 // Whether a curve runs along the ellipse centred on `centre` with unit axes
@@ -4854,8 +4934,8 @@ bool runs_on_ellipse(const SmBSplineCurve& curve, const SmPoint3d& centre, const
     const SmExtent1d interval = curve.GetNaturalInterval();
     SmPoint3d start, end;
     if (curve.EvaluatePoint(interval.GetMin(), start) != SM_SUCCESS ||
-        curve.EvaluatePoint(interval.GetMax(), end) != SM_SUCCESS || (start - at(step.GetMin())).Length() > tolerance ||
-        (end - at(step.GetMax())).Length() > tolerance) {
+        curve.EvaluatePoint(interval.GetMax(), end) != SM_SUCCESS || !((start - at(step.GetMin())).Length() <= tolerance) ||
+        !((end - at(step.GetMax())).Length() <= tolerance)) {
         return false;
     }
     const SmVector3d z = x * y;
@@ -4865,8 +4945,8 @@ bool runs_on_ellipse(const SmBSplineCurve& curve, const SmPoint3d& centre, const
         const SmVector3d d = p - centre;
         const double u = d.Dot(x) / rx;
         const double v = d.Dot(y) / ry;
-        if (std::fabs(std::sqrt(u * u + v * v) - 1.0) * std::max(rx, ry) > tolerance ||
-            std::fabs(d.Dot(z)) > tolerance) {
+        if (!(std::fabs(std::sqrt(u * u + v * v) - 1.0) * std::max(rx, ry) <= tolerance) ||
+            !(std::fabs(d.Dot(z)) <= tolerance)) {
             return false;
         }
     }
@@ -4885,11 +4965,68 @@ SmEllipse* scaled_ellipse(const SmContext& context, const SmEllipse& ellipse, co
     const SmVector3d y = scaling.vector(position.GetYAxisRef() * ellipse.GetYRadius());
     const double rx = x.Length();
     const double ry = y.Length();
-    if (rx <= 0.0 || ry <= 0.0 || std::fabs(x.Dot(y)) > 1e-12 * rx * ry) return nullptr;
+    if (!(rx > 0.0) || !(ry > 0.0) || !(std::fabs(x.Dot(y)) <= 1e-12 * rx * ry)) return nullptr;
     const SmPoint3d centre = scaling.point(position.GetOriginRef());
     const SmExtent1d step = ellipse.GetSTEPInterval();
     if (!runs_on_ellipse(scaled, centre, x / rx, y / ry, rx, ry, step, tolerance)) return nullptr;
     return new (context) SmEllipse(centre, x / rx, y / ry, step, rx, ry, 3, &context, &scaled);
+}
+
+// The circle, or the ellipse, the scaled NURBS of an ellipse or circle still
+// is. NULL when it is neither.
+SmCurve* analytic_curve(const SmContext& context, const SmEllipse& original, const SmBSplineCurve& scaled,
+                        const Image& image, bool& stretched) {
+    stretched = false;
+    SmCircle* circle = nullptr;
+    if (SmCircle::IsNurbCurveCircle(context, &scaled, circle)) {
+        if (SmCircle* same = image.take(circle, original)) return same;
+    }
+    SmEllipse* ellipse =
+        image.take(scaled_ellipse(context, original, scaled, image.scaling, image.tolerance), original);
+    stretched = ellipse != nullptr;
+    return ellipse;
+}
+
+// The curve the scaling takes `curve` to, with the same parameters, and what
+// it became. SM_SHIM_ERR_BAD_SCALE when it has no exact image this can make.
+sm_status curve_image(const SmContext& context, const SmCurve& curve, const Image& image,
+                      std::unique_ptr<SmCurve>& out, Became& became) {
+    const Scaling& scaling = image.scaling;
+    const bool nurbs = curve.GetType() == SmBSplineCurve_TYPE;
+    became = nurbs ? Became::kWasNurbs : Became::kSame;
+    sm_status status = SM_SUCCESS;
+    std::unique_ptr<SmCurve> moved;
+    if (scaling.uniform()) {
+        status = moved_copy(context, curve, scaling.move, &scaling.factors, moved);
+    } else if (scaling.mirror() && curve.IsKindOf(SmEllipse_TYPE)) {
+        const SmAxis2Placement& position = static_cast<const SmEllipse&>(curve).GetPosition();
+        status = moved_copy(context, curve, scaling.turn_for(position.GetOriginRef(), position.GetZAxis()), nullptr,
+                            moved);
+    } else if (nurbs || curve.GetType() == SmLine_TYPE) {
+        // A NURBS scales exactly, and SmLine::Transform keeps a line a line.
+        status = moved_copy(context, curve, scaling.move, &scaling.factors, moved);
+    } else if (curve.IsKindOf(SmBSplineCurve_TYPE)) {
+        std::unique_ptr<SmBSplineCurve> scaled(new (context)
+                                                   SmBSplineCurve(static_cast<const SmBSplineCurve&>(curve)));
+        status = static_cast<sm_status>(scaled->Transform(scaling.move, &scaling.factors));
+        if (status != SM_SUCCESS) return status;
+        bool stretched = false;
+        if (curve.IsKindOf(SmEllipse_TYPE)) {
+            moved.reset(analytic_curve(context, static_cast<const SmEllipse&>(curve), *scaled, image, stretched));
+        }
+        if (moved) {
+            became = stretched ? Became::kStretched : Became::kSame;
+        } else {
+            moved = std::move(scaled);
+            became = Became::kNurbs;
+        }
+    } else {
+        return SM_SHIM_ERR_BAD_SCALE;
+    }
+    if (status != SM_SUCCESS) return status;
+    if (!moved || !image.holds(*moved, curve)) return SM_SHIM_ERR_BAD_SCALE;
+    out = std::move(moved);
+    return SM_SUCCESS;
 }
 
 // A cylinder stretched across its axis as an ellipse swept along a line, with
@@ -4897,7 +5034,7 @@ SmEllipse* scaled_ellipse(const SmContext& context, const SmEllipse& ellipse, co
 // builds one, but from the ellipse the cylinder's circles scale to rather than
 // from a NURBS of it); NULL when it isn't one.
 SmSurfOfExtrusion* ellipse_extrusion(const SmContext& context, const SmCone& cylinder, const SmBSplineSurface& scaled,
-                                     const Scaling& scaling, double tolerance) {
+                                     const Image& image) {
     if (!cylinder.IsCylinder()) return nullptr;
     const ULONG degree_u = scaled.GetDegree(SM_SP_U);
     const ULONG degree_v = scaled.GetDegree(SM_SP_V);
@@ -4909,9 +5046,11 @@ SmSurfOfExtrusion* ellipse_extrusion(const SmContext& context, const SmCone& cyl
     const double start = linear_u ? domain.GetMin().x : domain.GetMin().y;
     const double end = linear_u ? domain.GetMax().x : domain.GetMax().y;
     SmPoint3d origin, line_end;
-    scaled.EvaluatePoint(domain.GetMin(), origin);
-    scaled.EvaluatePoint(domain.Evaluate(linear_u ? 1.0 : 0.0, linear_u ? 0.0 : 1.0), line_end);
-    SmVector3d sweep = (line_end - origin) / (end - start);
+    if (scaled.EvaluatePoint(domain.GetMin(), origin) != SM_SUCCESS ||
+        scaled.EvaluatePoint(domain.Evaluate(linear_u ? 1.0 : 0.0, linear_u ? 0.0 : 1.0), line_end) != SM_SUCCESS) {
+        return nullptr;
+    }
+    const SmVector3d sweep = (line_end - origin) / (end - start);
 
     // The cylinder's circle there, exactly, and the ellipse it scales to.
     SmBSplineCurve* raw = nullptr;
@@ -4919,42 +5058,40 @@ SmSurfOfExtrusion* ellipse_extrusion(const SmContext& context, const SmCone& cyl
     const std::unique_ptr<SmBSplineCurve> iso(raw);
     SmCircle* circle_raw = nullptr;
     if (!SmCircle::IsNurbCurveCircle(context, iso.get(), circle_raw)) return nullptr;
-    const std::unique_ptr<SmCircle> circle(if_same_curve(circle_raw, *iso, tolerance));
+    const Scaling unmoved{SmVector3d(1.0, 1.0, 1.0), SmAxis2Placement()};
+    const std::unique_ptr<SmCircle> circle(Image{unmoved, image.tolerance}.take(circle_raw, *iso));
     if (!circle) return nullptr;
     raw = nullptr;
     if (scaled.CreateIsoParametricCurve(context, across, start, 0.0, raw) != SM_SUCCESS || !raw) return nullptr;
     const std::unique_ptr<SmBSplineCurve> scaled_iso(raw);
-    std::unique_ptr<SmEllipse> ellipse(scaled_ellipse(context, *circle, *scaled_iso, scaling, tolerance));
+    std::unique_ptr<SmEllipse> ellipse(scaled_ellipse(context, *circle, *scaled_iso, image.scaling, image.tolerance));
     if (!ellipse) return nullptr;
 
     // As the recogniser does, so that the analytic and NURBS domains agree.
     if (!SM_IS_ZERO(start)) {
         SmAxis2Placement shift;
         shift.Translate(-start * sweep);
-        ellipse->Transform(shift);
+        if (ellipse->Transform(shift) != SM_SUCCESS) return nullptr;
         origin -= start * sweep;
     }
     const SmExtent1d profile = ellipse->GetSTEPInterval();
     const SmExtent2d analytic(SmPoint2d(profile.GetMin(), start), SmPoint2d(profile.GetMax(), end));
-    SmSurfOfExtrusion* extrusion =
-        new (context) SmSurfOfExtrusion(ellipse.release(), origin, sweep, analytic, linear_u ? TRUE : FALSE);
-    if (extrusion->Reparameterize(domain) != SM_SUCCESS) {
-        delete extrusion;
-        return nullptr;
-    }
-    return if_same_surface(extrusion, scaled, tolerance);
+    std::unique_ptr<SmSurfOfExtrusion> extrusion(
+        new (context) SmSurfOfExtrusion(ellipse.release(), origin, sweep, analytic, linear_u ? TRUE : FALSE));
+    if (extrusion->Reparameterize(domain) != SM_SUCCESS) return nullptr;
+    return extrusion.release();
 }
 
-// The torus a reflection (with equal factors otherwise) takes a torus to,
-// from its own description, since SmTorus::IsNurbSurfaceTorus can't find one
-// in a NURBS: centre and axes reflected, radii scaled, and the minor circle
-// running the other way round its new axis (SmTorus keeps that as its
-// generating circle's inside-out flag). NULL for any other scale, or when it
-// doesn't lie on the scaled NURBS at the same parameters.
+// The torus a reflection takes a torus to, from its own description, since
+// SmTorus::IsNurbSurfaceTorus can't find one in a reflected NURBS: centre and
+// axes reflected, and the minor circle running the other way round its new
+// axis. A reflection turns x × y round, so the point at minor angle v lies
+// at -v: SmTorus keeps the direction as its generating circle's inside-out
+// flag, and the minor circle's range of angles, [a, b], becomes [-b, -a].
+// NULL for any other scale.
 SmTorus* reflected_torus(const SmContext& context, const SmTorus& original, const SmBSplineSurface& scaled,
-                         const Scaling& scaling, double tolerance) {
-    const double by = scaling.largest();
-    if (!scaling.reflects() || !scaling.similar()) return nullptr;
+                         const Scaling& scaling) {
+    if (!scaling.mirror()) return nullptr;
     const SmEllipse* circle = dynamic_cast<const SmEllipse*>(original.GetGenCurve());
     if (!circle) return nullptr;
     SmAxis2Placement frame;
@@ -4965,148 +5102,207 @@ SmTorus* reflected_torus(const SmContext& context, const SmTorus& original, cons
     SmVector3d y = scaling.vector(frame.GetYAxisRef());
     x.Unitize();
     y.Unitize();
-    SmTorus* torus = new (context)
-        SmTorus(scaling.point(frame.GetOriginRef()), x, y, original.GetSTEPUVDomain(), major * by, minor * by, swap,
-                circle->GetInsideOut() ? FALSE : TRUE, nullptr, &context);
-    if (torus->Reparameterize(scaled.GetNaturalUVDomain()) != SM_SUCCESS) {
-        delete torus;
-        return nullptr;
-    }
-    return if_same_surface(torus, scaled, tolerance);
+    const SmExtent2d step = original.GetSTEPUVDomain();
+    const SmExtent2d turned(SmPoint2d(step.GetMin().x, -step.GetMax().y), SmPoint2d(step.GetMax().x, -step.GetMin().y));
+    std::unique_ptr<SmTorus> torus(new (context) SmTorus(scaling.point(frame.GetOriginRef()), x, y, turned, major,
+                                                         minor, swap, circle->GetInsideOut() ? FALSE : TRUE, nullptr,
+                                                         &context));
+    if (torus->Reparameterize(scaled.GetNaturalUVDomain()) != SM_SUCCESS) return nullptr;
+    return torus.release();
 }
 
-SmCurve* analytic_curve(const SmContext& context, const SmEllipse& original, const SmBSplineCurve& scaled,
-                        const Scaling& scaling, double tolerance, bool& stretched);
-
-// A copy of a curve, reflected (or scaled) exactly: a circle or ellipse that
-// stays one (under a mirror, moved by the turn that moves its plane), and
-// anything else as its NURBS.
-SmBSplineCurve* scaled_copy(const SmContext& context, const SmBSplineCurve& curve, const Scaling& scaling,
-                            double tolerance) {
-    if (scaling.mirror() && curve.IsKindOf(SmEllipse_TYPE)) {
-        SmCurve* copy = nullptr;
-        if (curve.Copy(context, copy) != SM_SUCCESS || !copy) return nullptr;
-        const SmAxis2Placement& position = static_cast<const SmEllipse&>(curve).GetPosition();
-        if (copy->Transform(scaling.turn_for(position.GetOriginRef(), position.GetZAxis())) != SM_SUCCESS) {
-            delete copy;
-            return nullptr;
-        }
-        return static_cast<SmBSplineCurve*>(copy);
-    }
-    std::unique_ptr<SmBSplineCurve> scaled(new (context) SmBSplineCurve(curve));
-    if (scaled->Transform(scaling.move, &scaling.factors) != SM_SUCCESS) return nullptr;
-    if (curve.IsKindOf(SmEllipse_TYPE)) {
-        bool stretched = false;
-        SmCurve* analytic =
-            analytic_curve(context, static_cast<const SmEllipse&>(curve), *scaled, scaling, tolerance, stretched);
-        if (analytic) return static_cast<SmBSplineCurve*>(analytic);
-    }
-    return scaled.release();
-}
-
-// The surface of revolution a reflection (with equal factors otherwise)
-// takes one to, from its own description: its generating curve reflected and
-// revolved the other way round the reflected axis, which keeps the angle
-// running as before. SMLib makes a fillet on a circular edge as one. NULL for
-// any other scale, or when it doesn't lie on the scaled NURBS at the same
-// parameters.
+// The surface of revolution a reflection takes one to, from its own
+// description: its generating curve reflected and revolved the other way
+// round the reflected axis, which keeps the angle running as before. SMLib
+// makes a fillet on a circular edge as one. NULL for any other scale.
 SmSurfOfRevolution* reflected_revolution(const SmContext& context, const SmSurfOfRevolution& original,
-                                         const SmBSplineSurface& scaled, const Scaling& scaling, double tolerance) {
-    if (!scaling.reflects() || !scaling.similar()) return nullptr;
+                                         const SmBSplineSurface& scaled, const Image& image) {
+    const Scaling& scaling = image.scaling;
+    if (!scaling.mirror()) return nullptr;
     const SmBSplineCurve* generator = original.GetGenCurve();
     if (!generator) return nullptr;
-    SmBSplineCurve* reflected = scaled_copy(context, *generator, scaling, tolerance);
-    if (!reflected) return nullptr;
+    std::unique_ptr<SmCurve> reflected;
+    Became became = Became::kSame;
+    if (curve_image(context, *generator, image, reflected, became) != SM_SUCCESS ||
+        !reflected->IsKindOf(SmBSplineCurve_TYPE)) {
+        return nullptr;
+    }
     const SmAxis2Placement& position = original.GetPosition();
     const SmVector3d axis = scaling.vector(position.GetXAxisRef()) * scaling.vector(position.GetYAxisRef());
-    SmSurfOfRevolution* surface = nullptr;
+    SmSurfOfRevolution* raw = nullptr;
     // It owns the generating curve from here, even when it fails.
-    if (SmSurfOfRevolution::CreateCanonical(context, reflected, scaling.point(position.GetOriginRef()), axis, surface,
-                                            original.GetSwapUV()) != SM_SUCCESS ||
-        !surface) {
-        delete surface;
-        return nullptr;
-    }
-    if (surface->AdjustSTEPUVDomain(original.GetSTEPUVDomain()) != SM_SUCCESS ||
+    const SmStatus status =
+        SmSurfOfRevolution::CreateCanonical(context, static_cast<SmBSplineCurve*>(reflected.release()),
+                                            scaling.point(position.GetOriginRef()), axis, raw, original.GetSwapUV());
+    std::unique_ptr<SmSurfOfRevolution> surface(raw);
+    if (status != SM_SUCCESS || !surface || surface->AdjustSTEPUVDomain(original.GetSTEPUVDomain()) != SM_SUCCESS ||
         surface->Reparameterize(scaled.GetNaturalUVDomain()) != SM_SUCCESS) {
-        delete surface;
         return nullptr;
     }
-    return if_same_surface(surface, scaled, tolerance);
+    return surface.release();
 }
 
-// The analytic surface the scaled NURBS of `original` still is, of
-// `original`'s own kind, or with extrusions an ellipse swept along a line;
-// NULL when it is neither.
+// The surface of extrusion any scale takes one to: its generating curve
+// scaled as an edge's curve is, swept along the scaled vector. NULL when the
+// curve has no exact image.
+SmSurfOfExtrusion* scaled_extrusion(const SmContext& context, const SmSurfOfExtrusion& original,
+                                    const SmBSplineSurface& scaled, const Image& image) {
+    const Scaling& scaling = image.scaling;
+    const SmBSplineCurve* generator = original.GetGenCurve();
+    if (!generator) return nullptr;
+    std::unique_ptr<SmCurve> moved;
+    Became became = Became::kSame;
+    if (curve_image(context, *generator, image, moved, became) != SM_SUCCESS ||
+        !moved->IsKindOf(SmBSplineCurve_TYPE)) {
+        return nullptr;
+    }
+    // The profile's own range of parameters, in case it changed kind.
+    const SmExtent1d profile = static_cast<const SmBSplineCurve&>(*moved).GetSTEPInterval();
+    const SmExtent2d step = original.GetSTEPUVDomain();
+    const SmExtent2d analytic(SmPoint2d(profile.GetMin(), step.GetMin().y),
+                              SmPoint2d(profile.GetMax(), step.GetMax().y));
+    // GetSwapUVBit isn't const, though it only reads the bit.
+    const SmBoolean swap = SM_CONST_CAST(SmSurfOfExtrusion&, original).GetSwapUVBit();
+    std::unique_ptr<SmSurfOfExtrusion> surface(new (context) SmSurfOfExtrusion(
+        static_cast<SmBSplineCurve*>(moved.release()), scaling.point(original.GetOrigin()),
+        scaling.vector(original.GetExtrusionVector()), analytic, swap));
+    if (surface->Reparameterize(scaled.GetNaturalUVDomain()) != SM_SUCCESS) return nullptr;
+    return surface.release();
+}
+
+// The analytic surface of `original`'s own kind the scaled NURBS of it still
+// is, or with extrusions an ellipse swept along a line; NULL when it is
+// neither.
 SmSurface* analytic_surface(const SmContext& context, const SmSurface& original, const SmBSplineSurface& scaled,
-                            const Scaling& scaling, bool extrusions, double tolerance, bool& extruded) {
+                            const Image& image, bool extrusions, bool& extruded) {
     extruded = false;
     const SM_TYPE type = original.GetType();
     if (type == SmPlane_TYPE) {
         // SmPlane::Transform's ladder of tolerances.
         for (double scale : {1.0, 10.0, 100.0, 1000.0}) {
             SmPlane* plane = nullptr;
-            if (SmPlane::IsNurbSurfacePlane(context, &scaled, plane, scale)) {
-                return if_same_surface(plane, scaled, tolerance);
-            }
+            if (SmPlane::IsNurbSurfacePlane(context, &scaled, plane, scale)) return image.take(plane, original);
         }
         return nullptr;
     }
     if (type == SmCone_TYPE || type == SmCylinder_TYPE) {
         SmCone* cone = nullptr;
         if (SmCone::IsNurbSurfaceCone(context, &scaled, cone)) {
-            if (SmCone* same = if_same_surface(cone, scaled, tolerance)) return same;
+            if (SmCone* same = image.take(cone, original)) return same;
         }
         if (!extrusions) return nullptr;
-        SmSurfOfExtrusion* extrusion =
-            ellipse_extrusion(context, static_cast<const SmCone&>(original), scaled, scaling, tolerance);
+        SmSurfOfExtrusion* extrusion = image.take(
+            ellipse_extrusion(context, static_cast<const SmCone&>(original), scaled, image), original);
         extruded = extrusion != nullptr;
         return extrusion;
     }
     if (type == SmSphere_TYPE) {
         SmSphere* sphere = nullptr;
-        if (SmSphere::IsNurbSurfaceSphere(context, &scaled, sphere)) return if_same_surface(sphere, scaled, tolerance);
+        if (SmSphere::IsNurbSurfaceSphere(context, &scaled, sphere)) return image.take(sphere, original);
         return nullptr;
     }
-    if (type == SmSurfOfRevolution_TYPE) {
-        return reflected_revolution(context, static_cast<const SmSurfOfRevolution&>(original), scaled, scaling,
-                                    tolerance);
-    }
     if (type == SmTorus_TYPE) {
-        if (SmTorus* torus = reflected_torus(context, static_cast<const SmTorus&>(original), scaled, scaling, tolerance)) {
-            return torus;
-        }
-        SmTorus* torus = nullptr;
-        if (SmTorus::IsNurbSurfaceTorus(context, &scaled, torus)) return if_same_surface(torus, scaled, tolerance);
+        return image.take(reflected_torus(context, static_cast<const SmTorus&>(original), scaled, image.scaling),
+                          original);
+    }
+    if (type == SmSurfOfRevolution_TYPE) {
+        return image.take(
+            reflected_revolution(context, static_cast<const SmSurfOfRevolution&>(original), scaled, image), original);
+    }
+    if (type == SmSurfOfExtrusion_TYPE) {
+        return image.take(scaled_extrusion(context, static_cast<const SmSurfOfExtrusion&>(original), scaled, image),
+                          original);
     }
     return nullptr;
 }
 
-// The analytic curve the scaled NURBS of an ellipse or circle still is: a
-// circle, or the ellipse its axes scale to. NULL when it is neither.
-SmCurve* analytic_curve(const SmContext& context, const SmEllipse& original, const SmBSplineCurve& scaled,
-                        const Scaling& scaling, double tolerance, bool& stretched) {
-    stretched = false;
-    SmCircle* circle = nullptr;
-    if (SmCircle::IsNurbCurveCircle(context, &scaled, circle)) {
-        if (SmCircle* same = if_same_curve(circle, scaled, tolerance)) return same;
+// The surface the scaling takes `surface` to, with the same parameters, and
+// what it became. SM_SHIM_ERR_BAD_SCALE when it has no exact image this can
+// make.
+sm_status surface_image(const SmContext& context, const SmSurface& surface, const Image& image, bool extrusions,
+                        std::unique_ptr<SmSurface>& out, Became& became) {
+    const Scaling& scaling = image.scaling;
+    const SM_TYPE type = surface.GetType();
+    const bool nurbs = type == SmBSplineSurface_TYPE;
+    became = nurbs ? Became::kWasNurbs : Became::kSame;
+    sm_status status = SM_SUCCESS;
+    std::unique_ptr<SmSurface> moved;
+    if (scaling.uniform()) {
+        status = moved_copy(context, surface, scaling.move, &scaling.factors, moved);
+    } else if (scaling.mirror() && type == SmPlane_TYPE) {
+        const SmAxis2Placement& position = static_cast<const SmPlane&>(surface).GetPosition();
+        status = moved_copy(context, surface, scaling.turn_for(position.GetOriginRef(), position.GetZAxis()), nullptr,
+                            moved);
+    } else if (scaling.mirror() && type == SmOffsetSurface_TYPE) {
+        // Its base reflected as a face's surface is, keeping its kind (where
+        // SmOffsetSurface::CreateMirrorSurface makes it a NURBS), and its
+        // distance negated, since the base's normal turns over.
+        const SmOffsetSurface& offset = static_cast<const SmOffsetSurface&>(surface);
+        const SmSurface* base = offset.GetBaseSurface();
+        if (!base) return SM_SHIM_ERR_BAD_SCALE;
+        std::unique_ptr<SmSurface> reflected;
+        Became base_became = Became::kSame;
+        status = surface_image(context, *base, image, false, reflected, base_became);
+        if (status == SM_SUCCESS) {
+            moved.reset(new (context) SmOffsetSurface(-offset.GetOffsetDistance(), *reflected, TRUE));
+            reflected.release();
+        }
+    } else if (nurbs) {
+        status = moved_copy(context, surface, scaling.move, &scaling.factors, moved);
+    } else if (surface.IsKindOf(SmBSplineSurface_TYPE)) {
+        std::unique_ptr<SmBSplineSurface> scaled(
+            new (context) SmBSplineSurface(static_cast<const SmBSplineSurface&>(surface)));
+        status = static_cast<sm_status>(scaled->Transform(scaling.move, &scaling.factors));
+        if (status != SM_SUCCESS) return status;
+        bool extruded = false;
+        moved.reset(analytic_surface(context, surface, *scaled, image, extrusions, extruded));
+        if (moved) {
+            became = extruded ? Became::kExtruded : Became::kSame;
+        } else {
+            moved = std::move(scaled);
+            became = Became::kNurbs;
+        }
+    } else {
+        // An offset surface under unequal factors: its image isn't an offset
+        // of anything, and SMLib's offsets refuse such a scale.
+        return SM_SHIM_ERR_BAD_SCALE;
     }
-    SmEllipse* ellipse =
-        if_same_curve(scaled_ellipse(context, original, scaled, scaling, tolerance), scaled, tolerance);
-    stretched = ellipse != nullptr;
-    return ellipse;
+    if (status != SM_SUCCESS) return status;
+    if (!moved || !image.holds(*moved, surface)) return SM_SHIM_ERR_BAD_SCALE;
+    out = std::move(moved);
+    return SM_SUCCESS;
+}
+
+void count(Became became, uint32_t& kept, uint32_t& changed, uint32_t& nurbs, uint32_t& were_nurbs) {
+    switch (became) {
+        case Became::kSame:
+            ++kept;
+            break;
+        case Became::kExtruded:
+        case Became::kStretched:
+            ++changed;
+            break;
+        case Became::kNurbs:
+            ++nurbs;
+            break;
+        case Became::kWasNurbs:
+            ++were_nurbs;
+            break;
+    }
 }
 
 // A reflection reverses the order of the faces round an edge, so each pair
 // of edgeuses (one face's two sides) swaps places, as in SmBrep::Mirror.
-void reverse_radial_order(SmEdge& edge) {
+bool reverse_radial_order(SmEdge& edge) {
     SmTArray<SmEdgeuse*> uses;
     edge.GetEdgeuses(uses);
-    for (ULONG i = 0; i < uses.GetSize(); ++i) edge.Remove(uses[i]);
-    for (ULONG i = 0; i + 1 < uses.GetSize(); i += 2) {
-        edge.PostInsert(uses[i + 1]);
-        edge.PostInsert(uses[i]);
+    for (ULONG i = 0; i < uses.GetSize(); ++i) {
+        if (edge.Remove(uses[i]) != SM_SUCCESS) return false;
     }
+    for (ULONG i = 0; i + 1 < uses.GetSize(); i += 2) {
+        if (edge.PostInsert(uses[i + 1]) != SM_SUCCESS || edge.PostInsert(uses[i]) != SM_SUCCESS) return false;
+    }
+    return true;
 }
 
 // Where an object sits in its owner's list: first, or after another.
@@ -5119,61 +5315,105 @@ ListPlace place_of(const SmOwningTopology& owner, const SmTopology* object) {
     return {owner.GetList() == object || owner.GetSize() == 1, object->GetLast()};
 }
 
-void put_at(SmOwningTopology& owner, SmTopology* object, const ListPlace& place) {
-    if (place.first) {
-        owner.PreInsert(object);
-    } else {
-        owner.InsertAfter(object, place.after);
-    }
+bool put_at(SmOwningTopology& owner, SmTopology* object, const ListPlace& place) {
+    return (place.first ? owner.PreInsert(object) : owner.InsertAfter(object, place.after)) == SM_SUCCESS;
 }
 
 // A reflection turns a face's normal to its other side, so its two faceuses
 // trade shells, as in SmBrep::Mirror, each taking the other's place in its
-// shell's list so that a second reflection gives back the same order.
-void swap_sides(SmFace& face) {
+// shell's list so that a second reflection gives back the same order. A face
+// with both sides in one shell stays as it is, as there.
+bool swap_sides(SmFace& face) {
     SmFaceuse *first = nullptr, *second = nullptr;
     face.GetFaceuses(first, second);
-    if (!first || !second) return;
-    SmShell* a = first->GetShell();
-    SmShell* b = second->GetShell();
-    if (a == b) return;
+    SmShell* a = first ? first->GetShell() : nullptr;
+    SmShell* b = second ? second->GetShell() : nullptr;
+    if (!a || !b) return false;
+    if (a == b) return true;
     const ListPlace in_a = place_of(*a, first);
     const ListPlace in_b = place_of(*b, second);
-    a->Remove(first);
-    b->Remove(second);
-    put_at(*a, second, in_a);
-    put_at(*b, first, in_b);
+    return a->Remove(first) == SM_SUCCESS && b->Remove(second) == SM_SUCCESS && put_at(*a, second, in_a) &&
+           put_at(*b, first, in_b);
 }
 
 sm_status scale_keeping(SmBrep& brep, const Scaling& scaling, bool extrusions, sm_scale_report& report) {
     const SmContext& context = *brep.GetContext();
-    // Analytic candidates must lie on the scaled NURBS far inside the
-    // tolerance the scale leaves the brep, so they change nothing.
+    // New surfaces and curves must lie where the old ones move to far inside
+    // the tolerance the scale leaves the brep, so they change nothing.
     const double by = scaling.largest();
-    const double tolerance = 1e-3 * brep.GetTolerance().val * by;
-    // Every analytic surface and curve scales itself uniformly, and keeps
-    // its kind; SMLib can't recognise a torus in a NURBS.
-    const bool uniform = SM_ARE_SAME(scaling.factors.x, scaling.factors.y) &&
-                         SM_ARE_SAME(scaling.factors.x, scaling.factors.z);
+    const Image image{scaling, 1e-3 * brep.GetTolerance().val * by};
     SmTArray<SmVertex*> vertices;
     SmTArray<SmEdge*> edges;
     SmTArray<SmFace*> faces;
     brep.GetVertices(vertices);
     brep.GetEdges(edges);
     brep.GetFaces(faces);
-    // Only what this knows how to scale exactly, each surface and curve once.
+
+    // Each surface and curve once: replacing one that two faces or edges
+    // share would leave the other's dangling.
     SmTArray<SmSurface*> surfaces;
     SmTArray<SmCurve*> curves;
     brep.GetSurfaces(surfaces);
     brep.GetCurves(curves);
     if (surfaces.GetSize() != faces.GetSize() || curves.GetSize() != edges.GetSize()) return SM_SHIM_ERR_BAD_SCALE;
-    for (ULONG i = 0; i < edges.GetSize(); ++i) {
-        const SmCurve* curve = edges[i]->GetCurve();
-        if (!curve || !curve->IsKindOf(SmBSplineCurve_TYPE)) return SM_SHIM_ERR_BAD_SCALE;
-    }
     for (ULONG i = 0; i < faces.GetSize(); ++i) {
-        const SmSurface* surface = faces[i]->GetSurface();
-        if (!surface || !surface->IsKindOf(SmBSplineSurface_TYPE)) return SM_SHIM_ERR_BAD_SCALE;
+        if (!faces[i]->GetSurface()) return SM_SHIM_ERR_BAD_SCALE;
+    }
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        if (!edges[i]->GetCurve()) return SM_SHIM_ERR_BAD_SCALE;
+    }
+    if (scaling.reflects()) {
+        // The topology flips as a solid's does: each face has its two sides,
+        // and each edge its faces' sides in pairs.
+        for (ULONG i = 0; i < faces.GetSize(); ++i) {
+            SmFaceuse *first = nullptr, *second = nullptr;
+            faces[i]->GetFaceuses(first, second);
+            if (!first || !second || !first->GetShell() || !second->GetShell()) return SM_SHIM_ERR_BAD_SCALE;
+        }
+        for (ULONG i = 0; i < edges.GetSize(); ++i) {
+            SmTArray<SmEdgeuse*> uses;
+            edges[i]->GetEdgeuses(uses);
+            if (uses.GetSize() % 2 != 0) return SM_SHIM_ERR_BAD_SCALE;
+        }
+    }
+
+    // Every new curve and surface, before anything changes.
+    sm_scale_report counts;
+    std::memset(&counts, 0, sizeof counts);
+    std::vector<std::unique_ptr<SmCurve>> new_curves(edges.GetSize());
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        Became became = Became::kSame;
+        const sm_status status = curve_image(context, *edges[i]->GetCurve(), image, new_curves[i], became);
+        if (status != SM_SUCCESS) return status;
+        count(became, counts.curves_kept, counts.curves_stretched, counts.curves_nurbs, counts.curves_were_nurbs);
+    }
+    std::vector<std::unique_ptr<SmSurface>> new_surfaces(faces.GetSize());
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        Became became = Became::kSame;
+        const sm_status status =
+            surface_image(context, *faces[i]->GetSurface(), image, extrusions, new_surfaces[i], became);
+        if (status != SM_SUCCESS) return status;
+        count(became, counts.faces_kept, counts.faces_extruded, counts.faces_nurbs, counts.faces_were_nurbs);
+    }
+
+    // Every edgeuse pair's UV trim curve, held by one of the two, which
+    // replacing a curve or surface drops.
+    std::vector<std::pair<SmEdgeuse*, std::unique_ptr<SmBSplineCurve>>> trims;
+    std::set<const SmEdgeuse*> held;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmTArray<SmEdgeuse*> uses;
+        faces[i]->GetUpwardEdgeuses(uses);
+        for (ULONG j = 0; j < uses.GetSize(); ++j) {
+            SmEdgeuse* owner = nullptr;
+            const SmBSplineCurve* trim = uses[j]->GetUVTrimCurve(&owner);
+            if (!trim || !owner || !held.insert(owner).second) continue;
+            SmCurve* raw = nullptr;
+            const SmStatus status = trim->Copy(context, raw);
+            std::unique_ptr<SmCurve> copy(raw);
+            if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+            if (!copy || !copy->IsKindOf(SmBSplineCurve_TYPE)) return static_cast<sm_status>(SM_ERR);
+            trims.emplace_back(owner, static_cast<SmBSplineCurve*>(copy.release()));
+        }
     }
     std::vector<double> vertex_tolerances, edge_tolerances, face_tolerances;
     for (ULONG i = 0; i < vertices.GetSize(); ++i) vertex_tolerances.push_back(vertices[i]->GetTolerance().val);
@@ -5183,108 +5423,42 @@ sm_status scale_keeping(SmBrep& brep, const Scaling& scaling, bool extrusions, s
     std::vector<SmBoolean> rectangular;
     for (ULONG i = 0; i < faces.GetSize(); ++i) rectangular.push_back(faces[i]->GetRectangularTrim());
 
-    // Every edgeuse pair's UV trim curve, held by one of the two.
-    std::vector<std::pair<SmEdgeuse*, std::unique_ptr<SmBSplineCurve>>> trims;
-    for (ULONG i = 0; i < faces.GetSize(); ++i) {
-        SmTArray<SmEdgeuse*> uses;
-        faces[i]->GetUpwardEdgeuses(uses);
-        for (ULONG j = 0; j < uses.GetSize(); ++j) {
-            SmEdgeuse* owner = nullptr;
-            const SmBSplineCurve* trim = uses[j]->GetUVTrimCurve(&owner);
-            const bool kept = std::any_of(trims.begin(), trims.end(), [&](const auto& t) { return t.first == owner; });
-            if (!trim || !owner || kept) continue;
-            SmCurve* copy = nullptr;
-            if (trim->Copy(context, copy) != SM_SUCCESS || !copy) {
-                delete copy;
-                return SM_ERR;
-            }
-            trims.emplace_back(owner, static_cast<SmBSplineCurve*>(copy));
-        }
-    }
-
+    // From here on nothing fails on a valid solid.
     brep.Notify(SM_NO_PRE_EDIT, &brep, NULL, NULL);
     SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
     for (ULONG i = 0; i < vertices.GetSize(); ++i) {
         vertices[i]->Notify(SM_NO_PRE_EDIT, vertices[i], &brep, NULL);
         vertices[i]->SetPoint(scaling.point(vertices[i]->GetPoint()));
     }
-
     for (ULONG i = 0; i < edges.GetSize(); ++i) {
         SmEdge* edge = edges[i];
-        SmCurve* curve = edge->GetCurve();
         edge->Notify(SM_NO_PRE_EDIT, edge, &brep, NULL);
-        const SM_TYPE type = curve->GetType();
-        // Lines and NURBS scale as they are; SmLine::Transform keeps it a line.
-        if (uniform || type == SmLine_TYPE || type == SmBSplineCurve_TYPE) {
-            SER(curve->Transform(scaling.move, &scaling.factors));
-            ++(type == SmBSplineCurve_TYPE ? report.curves_were_nurbs : report.curves_kept);
-            continue;
-        }
-        if (scaling.mirror() && curve->IsKindOf(SmEllipse_TYPE)) {
-            const SmAxis2Placement& position = static_cast<SmEllipse*>(curve)->GetPosition();
-            SER(curve->Transform(scaling.turn_for(position.GetOriginRef(), position.GetZAxis())));
-            ++report.curves_kept;
-            continue;
-        }
-        std::unique_ptr<SmBSplineCurve> scaled(new (context) SmBSplineCurve(*static_cast<SmBSplineCurve*>(curve)));
-        SER(scaled->Transform(scaling.move, &scaling.factors));
-        SmCurve* replacement = nullptr;
-        if (curve->IsKindOf(SmEllipse_TYPE)) {
-            bool stretched = false;
-            replacement =
-                analytic_curve(context, *static_cast<SmEllipse*>(curve), *scaled, scaling, tolerance, stretched);
-            if (replacement) ++(stretched ? report.curves_stretched : report.curves_kept);
-        }
-        if (!replacement) {
-            replacement = scaled.release();
-            ++report.curves_nurbs;
-        }
         // As TurnToNURBS replaces an edge's curve.
+        SmCurve* replacement = new_curves[i].release();
         edge->SetCurve(NULL, TRUE);
         replacement->SetOwner(NULL);
         edge->SetCurve(replacement, FALSE);
         replacement->SetOwner(edge);
     }
-
     for (ULONG i = 0; i < faces.GetSize(); ++i) {
         SmFace* face = faces[i];
-        SmSurface* surface = face->GetSurface();
         face->Notify(SM_NO_PRE_EDIT, face, &brep, NULL);
-        if (uniform || surface->GetType() == SmBSplineSurface_TYPE) {
-            SER(surface->Transform(scaling.move, &scaling.factors));
-            ++(surface->GetType() == SmBSplineSurface_TYPE ? report.faces_were_nurbs : report.faces_kept);
-            continue;
-        }
-        if (scaling.mirror() && surface->GetType() == SmPlane_TYPE) {
-            const SmAxis2Placement& position = static_cast<SmPlane*>(surface)->GetPosition();
-            SER(surface->Transform(scaling.turn_for(position.GetOriginRef(), position.GetZAxis())));
-            ++report.faces_kept;
-            continue;
-        }
-        std::unique_ptr<SmBSplineSurface> scaled(
-            new (context) SmBSplineSurface(*static_cast<SmBSplineSurface*>(surface)));
-        SER(scaled->Transform(scaling.move, &scaling.factors));
-        bool extruded = false;
-        SmSurface* replacement = analytic_surface(context, *surface, *scaled, scaling, extrusions, tolerance, extruded);
-        if (replacement) {
-            ++(extruded ? report.faces_extruded : report.faces_kept);
-        } else {
-            replacement = scaled.release();
-            ++report.faces_nurbs;
-        }
         const SmExtent2d domain = face->GetUVDomain();
-        face->SetSurface(replacement, TRUE);
+        face->SetSurface(new_surfaces[i].release(), TRUE);
         face->SetUVDomain(domain);
     }
     if (scaling.reflects()) {
-        for (ULONG i = 0; i < edges.GetSize(); ++i) reverse_radial_order(*edges[i]);
-        for (ULONG i = 0; i < faces.GetSize(); ++i) swap_sides(*faces[i]);
+        for (ULONG i = 0; i < edges.GetSize(); ++i) {
+            if (!reverse_radial_order(*edges[i])) return SM_SHIM_ERR_BROKE_SOLID;
+        }
+        for (ULONG i = 0; i < faces.GetSize(); ++i) {
+            if (!swap_sides(*faces[i])) return SM_SHIM_ERR_BROKE_SOLID;
+        }
     }
     for (auto& [owner, trim] : trims) owner->SetUVTrimCurve(trim.release(), 0.0, TRUE);
     for (ULONG i = 0; i < faces.GetSize(); ++i) {
         if (rectangular[i] == TRUE) faces[i]->SetIsRectangularTrim(TRUE);
     }
-
     for (ULONG i = 0; i < vertices.GetSize(); ++i) {
         vertices[i]->SetTolerance(SmZoneTol3d(vertex_tolerances[i] * by), FALSE, FALSE);
     }
@@ -5295,22 +5469,21 @@ sm_status scale_keeping(SmBrep& brep, const Scaling& scaling, bool extrusions, s
         faces[i]->SetTolerance(SmZoneTol3d(face_tolerances[i] * by), FALSE, FALSE);
     }
     brep.SetTolerance(SmZoneTol3d(brep_tolerance * by), FALSE, FALSE);
-    SmTArray<SmRegion*> regions;
-    brep.GetRegions(regions);
-    if (scaling.reflects() && regions.GetSize() > 1) {
-        SmTemporaryChangeValue<SmBoolean> quiet(brep.m_bEditingEnabled, FALSE);
-        SER(brep.FindAndSetInfiniteRegion());
+    if (scaling.reflects()) {
+        // As SmBrep::Mirror does. The regions are the ones there were, so this
+        // finds the same infinite region; failing to, it leaves it as it was.
+        SmTArray<SmRegion*> regions;
+        brep.GetRegions(regions);
+        if (regions.GetSize() > 1) {
+            SmTemporaryChangeValue<SmBoolean> quiet(brep.m_bEditingEnabled, FALSE);
+            if (brep.FindAndSetInfiniteRegion() != SM_SUCCESS) return SM_SHIM_ERR_BROKE_SOLID;
+        }
     }
+    report = counts;
     return SM_SUCCESS;
 }
 
-// A unit vector square to n.
-SmVector3d square_to(const SmVector3d& n) {
-    const SmVector3d a = std::fabs(n.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
-    SmVector3d x = a - n * a.Dot(n);
-    x.Unitize();
-    return x;
-}
+bool finite(const sm_vec3& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); }
 
 }  // namespace
 
@@ -5320,19 +5493,20 @@ sm_status sm_brep_scale_keeping(sm_brep* brep, sm_vec3 point, sm_vec3 factors, i
                                 sm_scale_report* report) {
     if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
     const auto positive = [](double f) { return std::isfinite(f) && f > SM_EFF_ZERO; };
-    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) || !positive(factors.x) ||
-        !positive(factors.y) || !positive(factors.z)) {
+    if (!finite(point) || !positive(factors.x) || !positive(factors.y) || !positive(factors.z)) {
         return SM_SHIM_ERR_BAD_SCALE;
     }
     return guarded([&] {
         Scaling scaling;
         scaling.factors = SmVector3d(factors.x, factors.y, factors.z);
+        // SmApiScaleByPt's composition: scale about the origin, then move the
+        // origin's image so that the point stays put.
         scaling.move.Translate(SmVector3d(point.x * (1.0 - factors.x), point.y * (1.0 - factors.y),
                                           point.z * (1.0 - factors.z)));
         sm_scale_report counts;
         std::memset(&counts, 0, sizeof counts);
         const sm_status status = scale_keeping(*brep_of(brep), scaling, extrusions != 0, counts);
-        if (report) *report = counts;
+        if (status == SM_SUCCESS && report) *report = counts;
         return status;
     });
 }
@@ -5340,10 +5514,7 @@ sm_status sm_brep_scale_keeping(sm_brep* brep, sm_vec3 point, sm_vec3 factors, i
 sm_status sm_brep_mirror(sm_brep* brep, sm_vec3 point, sm_vec3 normal, sm_scale_report* report) {
     if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
     const double length = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
-    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) || !std::isfinite(length) ||
-        length < SM_EFF_ZERO) {
-        return SM_SHIM_ERR_BAD_FRAME;
-    }
+    if (!finite(point) || !std::isfinite(length) || length < SM_EFF_ZERO) return SM_SHIM_ERR_BAD_FRAME;
     return guarded([&] {
         // p goes to R p + 2 (point . n) n, with R = I - 2 n n^T: a scale by -1
         // along z, then the turn taking x and y where R takes them (and z to
@@ -5358,23 +5529,8 @@ sm_status sm_brep_mirror(sm_brep* brep, sm_vec3 point, sm_vec3 normal, sm_scale_
         sm_scale_report counts;
         std::memset(&counts, 0, sizeof counts);
         const sm_status status = scale_keeping(*brep_of(brep), scaling, false, counts);
-        if (report) *report = counts;
+        if (status == SM_SUCCESS && report) *report = counts;
         return status;
-    });
-}
-
-sm_status sm_brep_mirror_stock(sm_brep* brep, sm_vec3 point, sm_vec3 normal) {
-    if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
-    const double length = std::sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
-    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) || !std::isfinite(length) ||
-        length < SM_EFF_ZERO) {
-        return SM_SHIM_ERR_BAD_FRAME;
-    }
-    return guarded([&] {
-        const SmVector3d n(normal.x / length, normal.y / length, normal.z / length);
-        const SmVector3d x = square_to(n);
-        const SmAxis2Placement plane(SmPoint3d(point.x, point.y, point.z), x, n * x);
-        return static_cast<sm_status>(brep_of(brep)->Mirror(plane));
     });
 }
 

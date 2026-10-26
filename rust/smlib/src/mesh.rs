@@ -111,6 +111,88 @@ impl Mesh {
         self.indices.as_chunks::<3>().0.iter().copied()
     }
 
+    /// Moves the mesh rigidly, as [`Brep::transform`](crate::Brep::transform)
+    /// moves the brep it came from: the point p goes to `rotation · p +
+    /// translation`, with `rotation` given row by row, and the normals, the
+    /// edges' polylines and the faces' [`Surface`]s turn with it. Each vertex
+    /// keeps its surface (u, v), as each surface keeps its parameters, and
+    /// each face its domain and [`Label`].
+    ///
+    /// A moved brep's own tessellation is these triangles to within
+    /// rounding, but its [`FaceKey`](crate::FaceKey)s differ, since they hash
+    /// the geometry where it lies: a caller that keeps triangles by key can
+    /// keep a body's from before it moved and move them. `rotation` must be
+    /// a rotation to within 1e-9, as for
+    /// [`Brep::transform`](crate::Brep::transform); otherwise this fails and
+    /// leaves the mesh alone.
+    pub fn transform(
+        &mut self,
+        rotation: [[f64; 3]; 3],
+        translation: [f64; 3],
+    ) -> Result<(), Error> {
+        if !is_rotation(&rotation) || !translation.iter().all(|c| c.is_finite()) {
+            return Err(Error::InvalidArgument {
+                operation: "Mesh::transform",
+                reason: "the rotation must be orthonormal with determinant +1, and the translation finite",
+            });
+        }
+        self.map(&rotation, translation, false);
+        Ok(())
+    }
+
+    /// Reflects the mesh as [`Brep::mirror`](crate::Brep::mirror) reflects
+    /// the brep it came from, across the plane through `point` with
+    /// `normal`: the point p goes to `p - 2 ((p - point) · n) n` for the unit
+    /// normal n. The normals reflect too, so they still point out of the
+    /// solid, and every triangle turns round, so it is still
+    /// counter-clockwise seen from outside. Each vertex keeps its surface
+    /// (u, v), as each surface keeps its parameters; a surface's angles now
+    /// run the other way round its axis, which [`Surface`] doesn't record.
+    /// As with [`transform`](Mesh::transform), the mirrored brep's own
+    /// tessellation is these triangles to within rounding. Fails, leaving
+    /// the mesh alone, for a point or normal that isn't finite or a zero
+    /// normal.
+    pub fn mirror(&mut self, point: [f64; 3], normal: [f64; 3]) -> Result<(), Error> {
+        let length = normal.iter().map(|c| c * c).sum::<f64>().sqrt();
+        if !point.iter().all(|c| c.is_finite()) || !length.is_finite() || length == 0.0 {
+            return Err(Error::InvalidArgument {
+                operation: "Mesh::mirror",
+                reason: "the point and normal must be finite, and the normal not zero",
+            });
+        }
+        let n = normal.map(|c| c / length);
+        let reflection: [[f64; 3]; 3] =
+            std::array::from_fn(|i| std::array::from_fn(|j| f64::from(i == j) - 2.0 * n[i] * n[j]));
+        let along = 2.0 * (point[0] * n[0] + point[1] * n[1] + point[2] * n[2]);
+        self.map(&reflection, n.map(|c| along * c), true);
+        Ok(())
+    }
+
+    /// Takes every point p to `linear · p + translation` and every direction
+    /// d to `linear · d`, turning the triangles round when `linear` reflects.
+    fn map(&mut self, linear: &[[f64; 3]; 3], translation: [f64; 3], reflects: bool) {
+        let vector = |v: [f64; 3]| linear.map(|row| row[0] * v[0] + row[1] * v[1] + row[2] * v[2]);
+        let point = |p: [f64; 3]| {
+            let q = vector(p);
+            [q[0] + translation[0], q[1] + translation[1], q[2] + translation[2]]
+        };
+        let narrow = |p: [f64; 3]| p.map(|c| c as f32);
+        for p in self.positions.iter_mut().chain(self.edges.iter_mut().flat_map(|e| &mut e.polyline)) {
+            *p = narrow(point(p.map(f64::from)));
+        }
+        for n in &mut self.normals {
+            *n = narrow(vector(n.map(f64::from)));
+        }
+        for face in &mut self.faces {
+            face.surface = face.surface.mapped(point, vector);
+        }
+        if reflects {
+            for triangle in self.indices.as_chunks_mut::<3>().0 {
+                triangle.swap(1, 2);
+            }
+        }
+    }
+
     /// Copies a shim mesh into Rust-owned arrays.
     ///
     /// # Safety
@@ -293,6 +375,89 @@ pub enum Surface {
         /// SMLib's surface type id (`SmSurfTypes.h`).
         kernel_type: i32,
     },
+}
+
+impl Surface {
+    /// The surface with its points taken by `point` and its directions by
+    /// `vector`, which together are a rigid motion or a reflection.
+    fn mapped(&self, point: impl Fn([f64; 3]) -> [f64; 3], vector: impl Fn([f64; 3]) -> [f64; 3]) -> Surface {
+        match *self {
+            Surface::Plane {
+                origin,
+                normal,
+                u_axis,
+            } => Surface::Plane {
+                origin: point(origin),
+                normal: vector(normal),
+                u_axis: vector(u_axis),
+            },
+            Surface::Cylinder {
+                origin,
+                axis,
+                ref_dir,
+                radius,
+            } => Surface::Cylinder {
+                origin: point(origin),
+                axis: vector(axis),
+                ref_dir: vector(ref_dir),
+                radius,
+            },
+            Surface::Cone {
+                origin,
+                axis,
+                ref_dir,
+                radius,
+                half_angle,
+            } => Surface::Cone {
+                origin: point(origin),
+                axis: vector(axis),
+                ref_dir: vector(ref_dir),
+                radius,
+                half_angle,
+            },
+            Surface::Sphere {
+                center,
+                axis,
+                ref_dir,
+                radius,
+            } => Surface::Sphere {
+                center: point(center),
+                axis: vector(axis),
+                ref_dir: vector(ref_dir),
+                radius,
+            },
+            Surface::Torus {
+                center,
+                axis,
+                ref_dir,
+                major_radius,
+                minor_radius,
+            } => Surface::Torus {
+                center: point(center),
+                axis: vector(axis),
+                ref_dir: vector(ref_dir),
+                major_radius,
+                minor_radius,
+            },
+            Surface::Nurbs { .. } | Surface::Other { .. } => self.clone(),
+        }
+    }
+}
+
+/// Whether `r`, row by row, is a rotation to within 1e-9: unit columns,
+/// perpendicular, the third the cross product of the first two, as the shim
+/// checks for [`Brep::transform`](crate::Brep::transform).
+fn is_rotation(r: &[[f64; 3]; 3]) -> bool {
+    let column = |j: usize| [r[0][j], r[1][j], r[2][j]];
+    let [x, y, z] = [column(0), column(1), column(2)];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let cross = [
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    ];
+    let unit = |v: [f64; 3]| (dot(v, v).sqrt() - 1.0).abs() <= 1e-9;
+    unit(x) && unit(y) && dot(x, y).abs() <= 1e-9 && (0..3).all(|i| (cross[i] - z[i]).abs() <= 1e-9)
 }
 
 /// A B-rep edge: where two faces meet, and so a candidate UV seam.

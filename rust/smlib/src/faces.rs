@@ -138,6 +138,35 @@ pub struct ScaleReport {
     pub curves_were_nurbs: u32,
 }
 
+/// How two solids lie, from
+/// [`Brep::relationship`](crate::Brep::relationship).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Relationship {
+    /// Their surfaces are more than both breps' tolerances apart, and
+    /// neither lies in the other's material. A solid in a cavity of the
+    /// other is apart.
+    Apart {
+        /// Their surfaces' closest approach.
+        gap: f64,
+    },
+    /// Their surfaces meet, and no sample of either's vertices and face
+    /// points lies inside the other.
+    Touching,
+    /// Their surfaces meet, and a sample of one's points lies inside the
+    /// other.
+    Overlapping,
+    /// The other lies in this one's material.
+    Contains {
+        /// The gap between their walls.
+        gap: f64,
+    },
+    /// This lies in the other's material.
+    Inside {
+        /// The gap between their walls.
+        gap: f64,
+    },
+}
+
 /// A closed solid swept from a planar face by
 /// [`Brep::sweep_face`](crate::Brep::sweep_face) (a prism) or
 /// [`Brep::revolve_face`](crate::Brep::revolve_face).

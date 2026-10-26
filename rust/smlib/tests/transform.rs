@@ -436,21 +436,16 @@ fn a_uniform_scale_keeps_surfaces_analytic() {
 }
 
 #[test]
-fn a_non_uniform_scale_turns_every_surface_into_a_nurbs() {
+fn a_non_uniform_scale_stretches_the_part() {
     on_kernel(|k| {
         let before = part(k);
         let volume = before.volume(1e-9).unwrap();
         let mut stretched = part(k);
         stretched
-            .scale_axes_about([0.0; 3], [2.0, 1.0, 1.0])
+            .scale_axes_keeping([0.0; 3], [2.0, 1.0, 1.0], false)
             .unwrap();
         let faces = stretched.faces().unwrap();
         assert!(stretched.is_manifold().unwrap());
-        assert!(
-            kinds(&faces).iter().all(|&kind| kind == "nurbs"),
-            "{:?}",
-            kinds(&faces)
-        );
         assert_eq!(face_labels(&faces), face_labels(&before.faces().unwrap()));
         assert_eq!(edge_labels(&stretched), edge_labels(&before));
         assert!(relative(stretched.volume(1e-9).unwrap(), 2.0 * volume) < 1e-6);
@@ -467,7 +462,6 @@ fn a_non_uniform_scale_turns_every_surface_into_a_nurbs() {
         }
         assert_near("min", min, [-400.0, -150.0, -125.0], 1e-3);
         assert_near("max", max, [400.0, 150.0, 125.0], 1e-3);
-        // Planes stay flat as NURBS, so they still report an outward normal.
         assert!(faces.iter().filter(|f| f.normal.is_some()).count() >= 6);
     });
 }
@@ -483,7 +477,7 @@ fn scales_that_arent_positive_are_refused() {
             ));
         }
         assert!(matches!(
-            block.scale_axes_about([0.0; 3], [1.0, -1.0, 1.0]),
+            block.scale_axes_keeping([0.0; 3], [1.0, -1.0, 1.0], false),
             Err(Error::InvalidArgument { .. })
         ));
         assert!(matches!(
@@ -634,27 +628,23 @@ fn a_stretch_across_the_cylinders_keeps_the_planes() {
 }
 
 #[test]
-fn keeping_analytics_is_repeatable_where_the_stock_scale_isnt() {
+fn a_scale_keeps_its_trims_so_tessellating_is_repeatable() {
     on_kernel(|k| {
         let params = TessellationParams::default();
-        let stock = |solid: &mut Brep| solid.scale_axes_about([0.0; 3], [2.0, 1.0, 1.0]).unwrap();
-        let keeping = |solid: &mut Brep| {
-            solid
-                .scale_axes_keeping([0.0; 3], [2.0, 1.0, 1.0], true)
-                .unwrap();
-        };
-        let mesh_after = |scale: &dyn Fn(&mut Brep), volume_first: bool| {
+        let mesh_after = |factors: [f64; 3], volume_first: bool| {
             let mut solid = part(k);
-            scale(&mut solid);
+            solid.scale_axes_keeping([0.0; 3], factors, true).unwrap();
             if volume_first {
                 solid.volume(1e-9).unwrap();
             }
             solid.tessellate(&params).unwrap()
         };
-        // The stock scale drops the UV trim curves, and the first call that
-        // needs them rebuilds them its own way.
-        assert_ne!(mesh_after(&stock, true), mesh_after(&stock, false));
-        assert_eq!(mesh_after(&keeping, true), mesh_after(&keeping, false));
+        // SmBrep::Transform drops the UV trim curves under a non-uniform
+        // scale, and the first call that needs them rebuilds them its own
+        // way, so what the mesh is depended on what was asked first.
+        for factors in [[2.0, 1.0, 1.0], [1.5; 3], [1.0, 0.5, 3.0]] {
+            assert_eq!(mesh_after(factors, true), mesh_after(factors, false));
+        }
     });
 }
 

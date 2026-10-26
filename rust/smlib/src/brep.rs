@@ -10,7 +10,8 @@ use smlib_sys as sys;
 use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
 use crate::faces::{
-    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, ScaleReport, Sweep,
+    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Relationship,
+    ScaleReport, Sweep,
 };
 use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::imprint::{Imprint, ImprintEdge};
@@ -503,59 +504,45 @@ impl Brep {
     /// p goes to `point + factor · (p - point)`. The factor must be finite
     /// and positive.
     ///
-    /// A uniform scale keeps every surface and curve's type: planes,
-    /// cylinders, cones, spheres and tori stay what they are. The volume
-    /// scales by `factor³`. Every face and edge keeps its index and
-    /// [`Label`]. The brep's tolerance, and every face's, edge's and
-    /// vertex's, scale with it, so every gap stays within the tolerance it
-    /// was within; other breps and the kernel's own tolerance are untouched.
+    /// A uniform scale keeps every surface and curve's kind and parameters:
+    /// planes, cylinders, cones, spheres, tori and offset surfaces stay what
+    /// they are. The volume scales by `factor³`. Every face and edge keeps
+    /// its index and [`Label`]. The brep's tolerance, and every face's,
+    /// edge's and vertex's, scale with it, so every gap stays within the
+    /// tolerance it was within; other breps and the kernel's own tolerance
+    /// are untouched. It is [`scale_axes_keeping`](Brep::scale_axes_keeping)
+    /// with equal factors, and fails as that does, leaving the brep alone.
     pub fn scale_about(&mut self, point: [f64; 3], factor: f64) -> Result<(), Error> {
-        self.scale_axes_about(point, [factor; 3])
+        self.scale_axes_keeping(point, [factor; 3], false).map(|_| ())
     }
 
     /// Scales the brep about `point` by a factor along each of x, y and z:
     /// the point p goes to `point + factors * (p - point)`, axis by axis.
     /// The factors must be finite and positive.
     ///
-    /// Unequal factors turn every surface and curve into a NURBS first
-    /// (`SmBrep::TurnToNURBS`), as SMLib does for any scale that would bend
-    /// an analytic surface out of its kind: a cylinder stretched across its
-    /// axis is no longer a cylinder. Equal factors are
-    /// [`scale_about`](Brep::scale_about). Tolerances scale by the largest
-    /// factor.
-    pub fn scale_axes_about(&mut self, point: [f64; 3], factors: [f64; 3]) -> Result<(), Error> {
-        const OP: &str = "SmBrep::Transform";
-        check_point(OP, point)?;
-        for factor in factors {
-            check_positive(OP, factor, "scale factors must be finite and positive")?;
-        }
-        // SAFETY: self is a live brep on the kernel thread.
-        let status = unsafe { sys::sm_brep_scale(self.raw.as_ptr(), vec3(point), vec3(factors)) };
-        Error::check(OP, status)
-    }
-
-    /// Scales the brep about `point` by a factor along each of x, y and z,
-    /// as [`scale_axes_about`](Brep::scale_axes_about) does, but keeps every
-    /// surface and curve analytic that the scale leaves so, rather than
-    /// turning them all into NURBS: planes and lines always, a cylinder or
-    /// cone along a scale axis whose other two factors are equal (its radius
-    /// and height scaled), spheres and tori under equal factors, and circles
-    /// in a plane the scale keeps round. A circle the scale stretches becomes
-    /// an ellipse where the images of its axes stay square. With
-    /// `extrusions`, a cylinder stretched across its axis becomes an ellipse
-    /// swept along a line (`SmSurfOfExtrusion`, which
+    /// SMLib's own scale (`SmBrep::Transform`) turns every surface and curve
+    /// into a NURBS before a non-uniform scale; this keeps every one analytic
+    /// that the scale leaves so: everything under equal factors, and
+    /// otherwise planes and lines, a cylinder or cone along a scale axis
+    /// whose other two factors are equal (its radius and height scaled),
+    /// circles in a plane the scale keeps round, and surfaces of extrusion. A
+    /// circle the scale stretches becomes an ellipse where the images of its
+    /// axes stay square. With `extrusions`, a cylinder stretched across its
+    /// axis becomes an ellipse swept along a line (`SmSurfOfExtrusion`, which
     /// [`Surface`](crate::Surface) reports as `Other`); without, a NURBS, as
-    /// is everything else the scale distorts.
+    /// is every other surface the scale distorts (spheres and tori among
+    /// them).
     ///
-    /// Each face's and edge's NURBS is scaled exactly, so it keeps its
-    /// parameters, and the analytic surface or curve that replaces it is
-    /// taken only where it lies on it at the same parameters: faces keep
-    /// their (u, v) domains and edges their intervals and UV trim curves.
-    /// Every face and edge keeps its index and [`Label`]; tolerances scale as
-    /// in [`scale_axes_about`](Brep::scale_axes_about). Fails with
-    /// `SHIM_ERR_BAD_SCALE`, leaving the brep alone, for a brep with a surface
-    /// or curve that isn't a B-spline of some kind (an offset surface, or a
-    /// curve on a surface), or that two faces or edges share.
+    /// Each new surface and curve keeps the old one's parameters and lies
+    /// where the scale takes the old one, so faces keep their (u, v) domains
+    /// and edges their intervals and UV trim curves. Every face and edge
+    /// keeps its index and [`Label`]. The brep's tolerance, and every
+    /// face's, edge's and vertex's, scale by the largest factor. The
+    /// returned report counts what stayed analytic. All of it is worked out
+    /// before the brep changes: it fails with `SHIM_ERR_BAD_SCALE`, leaving
+    /// the brep alone, for a surface or curve with no exact image (an offset
+    /// surface under unequal factors, a curve that isn't a B-spline) or one
+    /// that two faces or edges share.
     pub fn scale_axes_keeping(
         &mut self,
         point: [f64; 3],
@@ -588,25 +575,27 @@ impl Brep {
     /// `p - 2 ((p - point) · n) n` for the unit normal n.
     ///
     /// A reflection is an isometry, so every surface and curve keeps its kind
-    /// and its parameters: planes, cylinders, cones, spheres, tori and
-    /// surfaces of revolution (SMLib's fillets on circular edges), lines,
-    /// circles and ellipses, with their radii. Planes, circles and ellipses
-    /// move as a rigid motion would move them: by the reflection after one
-    /// across their own plane, which is rigid. Everything else is
-    /// [`scale_axes_keeping`](Brep::scale_axes_keeping)'s path with a factor
-    /// of -1 along the normal: each NURBS is reflected exactly, and its
-    /// analytic surface is rebuilt, found again or from its own description,
-    /// only where it lies on the NURBS at the same parameters. So faces keep
-    /// their (u, v) domains and edges their intervals and UV trim curves.
-    /// Each face's (u, v) now runs the other way round, so the faces' sides
-    /// and the order of the faces round each edge flip as SMLib's own
-    /// `SmBrep::Mirror` flips them, and the result is a valid solid with its
-    /// normals facing out and its volume unchanged. Every face and edge keeps
-    /// its index and [`Label`]; tolerances are unchanged. The returned report
-    /// counts what stayed analytic.
+    /// and its parameters: planes, cylinders, cones, spheres, tori, surfaces
+    /// of revolution (SMLib's fillets on circular edges) and of extrusion,
+    /// offset surfaces, lines, circles and ellipses, with their radii.
+    /// Planes, circles and ellipses move as a rigid motion would move them:
+    /// by the reflection after one across their own plane, which is rigid.
+    /// Everything else is [`scale_axes_keeping`](Brep::scale_axes_keeping)'s
+    /// path with a factor of -1 along the normal: each NURBS is reflected
+    /// exactly, and its analytic surface is rebuilt, found again or from its
+    /// own description, an offset surface from its reflected base. SMLib's
+    /// own `SmBrep::Mirror` turns every curve into a NURBS and rebuilds every
+    /// UV trim curve; here faces keep their (u, v) domains and edges their
+    /// intervals and UV trim curves. Each face's (u, v) now runs the other
+    /// way round, so the faces' sides and the order of the faces round each
+    /// edge flip as `SmBrep::Mirror` flips them, and the result is a valid
+    /// solid with its normals facing out and its volume unchanged. Every
+    /// face and edge keeps its index and [`Label`]; tolerances are unchanged.
+    /// The returned report counts what stayed analytic.
     ///
     /// Fails with `SHIM_ERR_BAD_SCALE`, leaving the brep alone, for a brep
-    /// [`scale_axes_keeping`](Brep::scale_axes_keeping) refuses.
+    /// [`scale_axes_keeping`](Brep::scale_axes_keeping) refuses, or one with
+    /// a face that hasn't two sides or an edge used an odd number of times.
     pub fn mirror(&mut self, point: [f64; 3], normal: [f64; 3]) -> Result<ScaleReport, Error> {
         const OP: &str = "sm_brep_mirror";
         check_point(OP, point)?;
@@ -619,21 +608,6 @@ impl Brep {
         };
         Error::check(OP, status)?;
         Ok(scale_report(&report))
-    }
-
-    /// SMLib's own reflection (`SmBrep::Mirror`) across the same plane as
-    /// [`mirror`](Brep::mirror), for comparison. It turns every curve into a
-    /// NURBS, lines and circles included, finds analytic surfaces again with
-    /// `SmBSplineSurface::CopyAndAddAnalytics` (which leaves tori NURBS), and
-    /// rebuilds every UV trim curve its own way.
-    pub fn mirror_stock(&mut self, point: [f64; 3], normal: [f64; 3]) -> Result<(), Error> {
-        const OP: &str = "SmBrep::Mirror";
-        check_point(OP, point)?;
-        check_normal(OP, normal)?;
-        // SAFETY: self is a live brep on the kernel thread.
-        let status =
-            unsafe { sys::sm_brep_mirror_stock(self.raw.as_ptr(), vec3(point), vec3(normal)) };
-        Error::check(OP, status)
     }
 
     /// Writes the brep to an SMLib binary file (`SmApiWriteBrepToFile`),
@@ -1152,13 +1126,51 @@ impl Brep {
         })
     }
 
+    /// How this solid and `other` lie (`SmApiBrepRelationship`): apart,
+    /// touching, overlapping, or one inside the other. Their closest
+    /// approach (`SmTopologySolver::BrepBrepSolve`) says whether their
+    /// surfaces meet, exactly, and then whether either lies inside the other;
+    /// when they meet, whether they overlap is told by sampling either's
+    /// vertices and face points against the other, so an overlap every
+    /// sample misses reads as touching.
+    pub fn relationship(&self, other: &Brep) -> Result<Relationship, Error> {
+        const OP: &str = "SmApiBrepRelationship";
+        let (mut relationship, mut distance) = (0, 0.0);
+        // SAFETY: both are live breps on the kernel thread; the outputs
+        // outlive the call.
+        let status = unsafe {
+            sys::sm_brep_relationship(
+                self.raw.as_ptr(),
+                other.raw.as_ptr(),
+                &mut relationship,
+                &mut distance,
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(match relationship {
+            sys::SM_RELATIONSHIP_APART => Relationship::Apart { gap: distance },
+            sys::SM_RELATIONSHIP_TOUCHING => Relationship::Touching,
+            sys::SM_RELATIONSHIP_OVERLAPPING => Relationship::Overlapping,
+            sys::SM_RELATIONSHIP_CONTAINS => Relationship::Contains { gap: distance },
+            sys::SM_RELATIONSHIP_INSIDE => Relationship::Inside { gap: distance },
+            _ => {
+                return Err(Error::InvalidArgument {
+                    operation: OP,
+                    reason: "the kernel answered with a relationship it doesn't name",
+                });
+            }
+        })
+    }
+
     /// Adds a copy of `other`'s solids to this brep as lumps of their own,
     /// with their labels, without intersecting them with this brep's
     /// (`SmBrep::MergeBrep`): for solids that neither touch nor overlap, such
     /// as a pattern's copies, it's their union without a boolean's work.
-    /// Solids that touch or overlap make a brep that isn't a valid solid, so
-    /// the caller must know they're apart; use [`union`](Brep::union)
-    /// otherwise. Every surface keeps its type.
+    /// Every surface keeps its type. Unless their bounding boxes are apart,
+    /// it asks [`relationship`](Brep::relationship) first, and refuses solids
+    /// that aren't [`Apart`](Relationship::Apart) with `SHIM_ERR_NOT_APART`,
+    /// leaving this brep alone, since merging them would make a brep that
+    /// isn't a valid solid; use [`union`](Brep::union) for those.
     pub fn combine(&mut self, other: &Brep) -> Result<(), Error> {
         // SAFETY: both are live breps on the kernel thread, and distinct,
         // since self is borrowed mutably.

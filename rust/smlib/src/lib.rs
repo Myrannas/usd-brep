@@ -61,8 +61,8 @@ pub use brep::Brep;
 pub use edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 pub use error::{Error, Status};
 pub use faces::{
-    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, ScaleReport,
-    SurfaceKind, Sweep, SweptFace,
+    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Relationship,
+    ScaleReport, SurfaceKind, Sweep, SweptFace,
 };
 pub use fillet::{Continuity, CrossSection, EdgeBlend, FilletOptions};
 pub use imprint::{Imprint, ImprintEdge};
