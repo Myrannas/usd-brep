@@ -25704,15 +25704,17 @@ SmBoolean bDebugMe=FALSE;
         }
 #endif // SM_DEBUG_CODE
 
+      // skip edges on the optional KeepEdges List - before IsTopological(), whose side effect
+      //   would expand a kept Edge's Surface to 'cover' the other Face's, leaving the Faces
+      //   on it with UVDomains and trims that no longer match it
+      if(   pOptKeepEdges
+         && pOptKeepEdges->FindElement(pEdge, lFoundIndex))
+        { continue ; }
+
       // skip NonTopological edges - side effect - one Surface may be expanded to 'cover' the other
       SmExtent2d sMergedFaceDomain;
       if(!pEdge->IsTopological(pSurfToKeep, dDistBetween, 1.0, &sMergedFaceDomain)) // note: ApproxTol3d Gain = 1.0 is different than
         { continue ; }                                          //       Gain 10.0 Tol used in SmMerge::BooleanPostProcess
-
-      // skip edges on the optional KeepEdges List
-      if(   pOptKeepEdges
-         && pOptKeepEdges->FindElement(pEdge, lFoundIndex))
-        { continue ; }
 
    // code moved to SmEdge::IsTopological()
    //    // skip nonManifold edges - these are not "topological"
