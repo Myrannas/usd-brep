@@ -8,8 +8,9 @@
 //!
 //! Fillets and chamfers ([`Brep::fillet`], [`Brep::chamfer`]) pick their
 //! edges with an [`EdgeQuery`]. Solids built at the origin can be placed on a
-//! face's [`Frame`] ([`Brep::place`]), and planar faces swept into prisms
-//! ([`Brep::sweep_face`], with draft [`Brep::sweep_face_tapered`]) or
+//! face's [`Frame`] ([`Brep::place`]), any solid moved, turned and scaled
+//! ([`Brep::transform`], [`Brep::scale_about`]), and planar faces swept into
+//! prisms ([`Brep::sweep_face`], with draft [`Brep::sweep_face_tapered`]) or
 //! revolved ([`Brep::revolve_face`]), whether a solid's or ones built from
 //! lines, arcs and circles in a plane ([`Brep::planar_faces`]), and circles
 //! swept along paths into pipes ([`Brep::pipe`]). [`Brep::shell`] hollows a

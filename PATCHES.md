@@ -685,3 +685,31 @@ moved rather than offset, so it needed no kernel change.
   labels, winds outward and has its volume within 2e-9 of the shape's own
   formula (planes to 1e-15).
 
+## Notes from the transforms (no patch needed)
+
+`Brep::transform`, `translate` and `rotate_about` move a brep rigidly with
+`SmApiTransform`; `Brep::scale_about` and `scale_axes_about` scale it with
+`SmBrep::Transform` and a scale. Nothing in the kernel changed.
+
+- `SmApiScaleByPt` (and `SmApiScale`) pass `bScaleTol = TRUE`, which resets
+  the brep's tolerance to the band its new size falls in
+  (`SizeEstimateToZoneTol3d`: 1e-5 for a 400 mm part, 1e-4 once it's doubled),
+  sets every face's, edge's and vertex's tolerance to that, shrinking any a
+  boolean grew, and moves the context's model size estimate as well. So the
+  shim's `sm_brep_scale` composes the same transform but passes `FALSE`, and
+  then scales every tolerance it read before, the brep's included, by the
+  largest factor. A scale is then a similarity in every respect: a ×2 or ×0.5
+  scale of a rounded box with a chamfered hole integrates to 8 or 1/8 of its
+  volume within 1e-12, where keeping the tolerances gave 3e-9 and the
+  kernel's own tolerance handling 1.6e-8. Parts with spheres, cones and tori
+  agree to 6e-9.
+- Unequal factors (or a negative one, which the shim refuses) make
+  `SmBrep::Transform` call `TurnToNURBS` first: every surface and curve
+  becomes a NURBS, planes included, though planar NURBS still read as planar.
+- Labels ride through every transform: `SmBrep::Transform` notifies faces,
+  edges and vertices with `SM_NO_PRE_EDIT`, and `SM_AB_COPY` attributes stay.
+- A rigid motion moves surface placements, not parameterisations: every
+  face's (u, v) domain is unchanged, and the moved brep tessellates to the
+  same triangles, vertex for vertex within `f32` rounding (2e-5 mm on a
+  400 mm part). The tessellation keys still change, since they hash the
+  moved geometry bit for bit.

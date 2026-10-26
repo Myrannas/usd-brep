@@ -3,9 +3,10 @@
 - `smlib-sys`: builds SMLib (`source/SMLib`) and SM_API (`source/SM_API`) with
   the `cc` crate, plus a C shim (`smlib-sys/shim`), and exposes the shim through
   committed bindgen bindings.
-- `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, booleans,
-  face sweeps, face offsets, rigid face moves, face merging, fillets, chamfers, volume, manifold
-  check, face and edge queries, labels) and `Mesh`, a tessellation that keeps its links to
+- `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, transforms
+  and scales, booleans, face sweeps, face offsets, rigid face moves, face
+  merging, fillets, chamfers, volume, manifold check, face and edge queries,
+  labels) and `Mesh`, a tessellation that keeps its links to
   the B-rep: per-triangle face ids, per-vertex surface (u, v), per-face
   surface parameters, per-edge polylines, and every face's and edge's label.
 
@@ -86,6 +87,27 @@ cargo test -p smlib
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come
   back as single faces either way.
+
+## Moving and scaling
+
+- `Brep::transform(rotation, translation)` moves a brep rigidly
+  (`SmApiTransform`): p goes to R p + t. `Brep::translate` and
+  `Brep::rotate_about` (degrees about a line) are shorthands. R must be a
+  rotation to 1e-9 (`SHIM_ERR_BAD_FRAME` otherwise). Every surface and curve
+  keeps its type and (u, v), every face and edge its index and label, and the
+  volume holds. A moved brep tessellates to the same triangles, its vertices
+  where the motion takes the old ones to within `f32` rounding.
+- `Brep::scale_about(point, factor)` scales uniformly about a point: planes,
+  cylinders, cones, spheres and tori stay what they are, radii scale, angles
+  don't, and the volume scales by the cube to 1e-8. Tolerances scale with the
+  brep (see `PATCHES.md`).
+- `Brep::scale_axes_about(point, factors)` scales each axis on its own; unequal
+  factors turn every surface and curve into a NURBS first
+  (`SmBrep::TurnToNURBS`), planes included.
+- `Brep::tolerance` reads the brep's tolerance.
+
+`tests/transform.rs` checks labels, surfaces, (u, v), volumes, triangles and
+later fillets and booleans through each of them.
 
 ## Labels
 

@@ -51,6 +51,7 @@ static const sm_status SM_SHIM_ERR_DRAFT_CLOSES = 2034;        /* a draft's side
 static const sm_status SM_SHIM_ERR_BAD_PATH = 2035;            /* a pipe's path turns back on itself, or a bend overlaps itself */
 static const sm_status SM_SHIM_ERR_ARC_CORNER = 2036;          /* an arc of a pipe's path meets a curve beside it at an angle */
 static const sm_status SM_SHIM_ERR_BAD_SHELL = 2037;           /* a shell's input isn't a manifold solid, or its result isn't one */
+static const sm_status SM_SHIM_ERR_BAD_SCALE = 2038;           /* a scale factor isn't finite and positive */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -413,6 +414,26 @@ sm_status sm_brep_set_edge_label(sm_brep *brep, size_t edge, const sm_label *lab
  * goes to origin + x * x_axis + y * y_axis + z * (x_axis × y_axis). The axes
  * must be unit length and perpendicular to within 1e-9. */
 sm_status sm_brep_place(sm_brep *brep, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y_axis);
+
+/* Moves the brep rigidly (SmApiTransform): the point p goes to R p + t, with
+ * R given row by row in rotation. R must be a rotation to within 1e-9: unit
+ * columns, perpendicular, the third the cross product of the first two;
+ * SM_SHIM_ERR_BAD_FRAME otherwise. Every surface and curve keeps its type
+ * and parameterisation, and every face and edge its label. */
+sm_status sm_brep_transform(sm_brep *brep, const double rotation[9], sm_vec3 translation);
+
+/* Scales the brep about a point (SmBrep::Transform with a scale): the point p
+ * goes to point + factors * (p - point), axis by axis. The factors must be
+ * finite and positive; SM_SHIM_ERR_BAD_SCALE otherwise. Equal factors keep
+ * every surface and curve's type; unequal ones first turn every surface and
+ * curve into a NURBS (SmBrep::TurnToNURBS). Every face and edge keeps its
+ * label. The brep's tolerance, and every face's, edge's and vertex's, scale
+ * by the largest factor, so every gap stays within the tolerance it was
+ * within; the kernel's context and other breps are untouched. */
+sm_status sm_brep_scale(sm_brep *brep, sm_vec3 point, sm_vec3 factors);
+
+/* The brep's tolerance (SmBrep::GetTolerance), in model units. */
+sm_status sm_brep_tolerance(const sm_brep *brep, double *out);
 
 /* Sweeps the planar face at an index of the brep's face list along its
  * outward normal by distance (negative sweeps into the solid), making a new

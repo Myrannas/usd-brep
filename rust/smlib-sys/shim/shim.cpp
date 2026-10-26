@@ -4336,6 +4336,80 @@ sm_status sm_brep_place(sm_brep* brep, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y
     });
 }
 
+sm_status sm_brep_transform(sm_brep* brep, const double rotation[9], sm_vec3 translation) {
+    if (!brep || !rotation) return SM_SHIM_ERR_NULL_ARGUMENT;
+    // R's columns are where the x, y and z axes go.
+    const sm_vec3 x = {rotation[0], rotation[3], rotation[6]};
+    const sm_vec3 y = {rotation[1], rotation[4], rotation[7]};
+    const sm_vec3 z = {rotation[2], rotation[5], rotation[8]};
+    const double dot = x.x * y.x + x.y * y.y + x.z * y.z;
+    const sm_vec3 cross = {x.y * y.z - x.z * y.y, x.z * y.x - x.x * y.z, x.x * y.y - x.y * y.x};
+    const double off = std::max({std::fabs(cross.x - z.x), std::fabs(cross.y - z.y), std::fabs(cross.z - z.z)});
+    if (!std::isfinite(translation.x) || !std::isfinite(translation.y) || !std::isfinite(translation.z) ||
+        !unit_vector(x) || !unit_vector(y) || std::fabs(dot) > 1e-9 || !(off <= 1e-9)) {
+        return SM_SHIM_ERR_BAD_FRAME;
+    }
+    return guarded([&] {
+        const SmAxis2Placement motion(SmPoint3d(translation.x, translation.y, translation.z),
+                                      SmVector3d(x.x, x.y, x.z), SmVector3d(y.x, y.y, y.z));
+        return static_cast<sm_status>(SmApiTransform(brep_of(brep), motion));
+    });
+}
+
+sm_status sm_brep_scale(sm_brep* brep, sm_vec3 point, sm_vec3 factors) {
+    if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
+    const auto positive = [](double f) { return std::isfinite(f) && f > SM_EFF_ZERO; };
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) || !positive(factors.x) ||
+        !positive(factors.y) || !positive(factors.z)) {
+        return SM_SHIM_ERR_BAD_SCALE;
+    }
+    return guarded([&] {
+        SmBrep& solid = *brep_of(brep);
+        SmTArray<SmVertex*> vertices;
+        SmTArray<SmEdge*> edges;
+        SmTArray<SmFace*> faces;
+        solid.GetVertices(vertices);
+        solid.GetEdges(edges);
+        solid.GetFaces(faces);
+        std::vector<double> vertex_tolerances, edge_tolerances, face_tolerances;
+        for (ULONG i = 0; i < vertices.GetSize(); ++i) vertex_tolerances.push_back(vertices[i]->GetTolerance().val);
+        for (ULONG i = 0; i < edges.GetSize(); ++i) edge_tolerances.push_back(edges[i]->GetTolerance().val);
+        for (ULONG i = 0; i < faces.GetSize(); ++i) face_tolerances.push_back(faces[i]->GetTolerance().val);
+        const double brep_tolerance = solid.GetTolerance().val;
+        // SmApiScaleByPt's composition: scale about the origin, then move the
+        // origin's image so that the point stays put.
+        SmAxis2Placement move;
+        move.Translate(SmVector3d(point.x * (1.0 - factors.x), point.y * (1.0 - factors.y),
+                                  point.z * (1.0 - factors.z)));
+        const SmVector3d scale(factors.x, factors.y, factors.z);
+        // Not the kernel's tolerance scaling, which resets every tolerance to
+        // a band picked from the brep's new size (1e-5 to 1e-4 for a ×2 crate),
+        // shrinking any a boolean grew, and moves the context's model size.
+        const SmStatus status = solid.Transform(move, &scale, FALSE);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        const double by = std::max({factors.x, factors.y, factors.z});
+        for (ULONG i = 0; i < vertices.GetSize(); ++i) {
+            vertices[i]->SetTolerance(SmZoneTol3d(vertex_tolerances[i] * by), FALSE, FALSE);
+        }
+        for (ULONG i = 0; i < edges.GetSize(); ++i) {
+            edges[i]->SetTolerance(SmZoneTol3d(edge_tolerances[i] * by), FALSE, FALSE);
+        }
+        for (ULONG i = 0; i < faces.GetSize(); ++i) {
+            faces[i]->SetTolerance(SmZoneTol3d(face_tolerances[i] * by), FALSE, FALSE);
+        }
+        solid.SetTolerance(SmZoneTol3d(brep_tolerance * by), FALSE, FALSE);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_tolerance(const sm_brep* brep, double* out) {
+    if (!brep || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        *out = brep_of(brep)->GetTolerance().val;
+        return SM_SUCCESS;
+    });
+}
+
 sm_status sm_brep_sweep_face(const sm_brep* brep, size_t face, double distance, sm_brep** out, sm_swept_face** faces,
                              size_t* face_count) {
     if (!brep || !out || !faces || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;

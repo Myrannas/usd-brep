@@ -448,6 +448,101 @@ impl Brep {
         Error::check("SmApiTransform", status)
     }
 
+    /// Moves the brep rigidly (`SmApiTransform`): the point p goes to
+    /// `rotation · p + translation`, with `rotation` given row by row. It
+    /// must be a rotation, orthonormal with determinant +1, to within 1e-9;
+    /// otherwise this fails with `SHIM_ERR_BAD_FRAME` and leaves the brep
+    /// alone.
+    ///
+    /// Every surface and curve keeps its type and parameterisation, so a
+    /// plane stays a plane and a face keeps its (u, v) domain, and every face
+    /// and edge keeps its index and [`Label`].
+    pub fn transform(
+        &mut self,
+        rotation: [[f64; 3]; 3],
+        translation: [f64; 3],
+    ) -> Result<(), Error> {
+        const OP: &str = "SmApiTransform";
+        check_point(OP, translation)?;
+        let rows = rotation.as_flattened();
+        // SAFETY: self is a live brep on the kernel thread; rows holds the
+        // nine doubles the shim reads.
+        let status =
+            unsafe { sys::sm_brep_transform(self.raw.as_ptr(), rows.as_ptr(), vec3(translation)) };
+        Error::check(OP, status)
+    }
+
+    /// Moves the brep by `offset`: [`transform`](Brep::transform) with no
+    /// rotation.
+    pub fn translate(&mut self, offset: [f64; 3]) -> Result<(), Error> {
+        self.transform(IDENTITY, offset)
+    }
+
+    /// Turns the brep by `angle_deg` degrees about the line through `point`
+    /// along `axis`, counter-clockwise seen from the axis's tip:
+    /// [`transform`](Brep::transform) with that rotation.
+    pub fn rotate_about(
+        &mut self,
+        point: [f64; 3],
+        axis: [f64; 3],
+        angle_deg: f64,
+    ) -> Result<(), Error> {
+        const OP: &str = "SmApiTransform";
+        check_point(OP, point)?;
+        let rotation = rotation(axis, angle_deg).ok_or(Error::InvalidArgument {
+            operation: OP,
+            reason: "the axis must be finite and not zero, and the angle finite",
+        })?;
+        let turned = rotate(&rotation, point);
+        self.transform(rotation, [0, 1, 2].map(|i| point[i] - turned[i]))
+    }
+
+    /// Scales the brep by `factor` about `point`, which stays put: the point
+    /// p goes to `point + factor · (p - point)`. The factor must be finite
+    /// and positive.
+    ///
+    /// A uniform scale keeps every surface and curve's type: planes,
+    /// cylinders, cones, spheres and tori stay what they are. The volume
+    /// scales by `factor³`. Every face and edge keeps its index and
+    /// [`Label`]. The brep's tolerance, and every face's, edge's and
+    /// vertex's, scale with it, so every gap stays within the tolerance it
+    /// was within; other breps and the kernel's own tolerance are untouched.
+    pub fn scale_about(&mut self, point: [f64; 3], factor: f64) -> Result<(), Error> {
+        self.scale_axes_about(point, [factor; 3])
+    }
+
+    /// Scales the brep about `point` by a factor along each of x, y and z:
+    /// the point p goes to `point + factors * (p - point)`, axis by axis.
+    /// The factors must be finite and positive.
+    ///
+    /// Unequal factors turn every surface and curve into a NURBS first
+    /// (`SmBrep::TurnToNURBS`), as SMLib does for any scale that would bend
+    /// an analytic surface out of its kind: a cylinder stretched across its
+    /// axis is no longer a cylinder. Equal factors are
+    /// [`scale_about`](Brep::scale_about). Tolerances scale by the largest
+    /// factor.
+    pub fn scale_axes_about(&mut self, point: [f64; 3], factors: [f64; 3]) -> Result<(), Error> {
+        const OP: &str = "SmBrep::Transform";
+        check_point(OP, point)?;
+        for factor in factors {
+            check_positive(OP, factor, "scale factors must be finite and positive")?;
+        }
+        // SAFETY: self is a live brep on the kernel thread.
+        let status = unsafe { sys::sm_brep_scale(self.raw.as_ptr(), vec3(point), vec3(factors)) };
+        Error::check(OP, status)
+    }
+
+    /// The brep's tolerance in model units (`SmBrep::GetTolerance`): how far
+    /// apart the kernel lets a vertex lie from its edges and faces, and an
+    /// edge from its faces.
+    pub fn tolerance(&self) -> Result<f64, Error> {
+        let mut tolerance = 0.0;
+        // SAFETY: self is a live brep on the kernel thread.
+        let status = unsafe { sys::sm_brep_tolerance(self.raw.as_ptr(), &mut tolerance) };
+        Error::check("SmBrep::GetTolerance", status)?;
+        Ok(tolerance)
+    }
+
     /// Sweeps the planar face at `face` in [`faces`](Brep::faces) along its
     /// outward normal by `distance` into a closed prism
     /// (`SmApiCreateCurveSweepFromFaces`). A negative distance sweeps into
@@ -1684,6 +1779,30 @@ fn gap(a: [f64; 2], b: [f64; 2]) -> f64 {
 
 fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
     sys::sm_vec3 { x, y, z }
+}
+
+const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// The rotation by `angle_deg` degrees about `axis`, counter-clockwise seen
+/// from its tip (Rodrigues' formula), row by row. `None` for a zero or
+/// non-finite axis or angle.
+fn rotation(axis: [f64; 3], angle_deg: f64) -> Option<[[f64; 3]; 3]> {
+    let length = axis.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if !length.is_finite() || length == 0.0 || !angle_deg.is_finite() {
+        return None;
+    }
+    let [x, y, z] = axis.map(|c| c / length);
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    let t = 1.0 - cos;
+    Some([
+        [cos + x * x * t, x * y * t - z * sin, x * z * t + y * sin],
+        [y * x * t + z * sin, cos + y * y * t, y * z * t - x * sin],
+        [z * x * t - y * sin, z * y * t + x * sin, cos + z * z * t],
+    ])
+}
+
+fn rotate(rotation: &[[f64; 3]; 3], point: [f64; 3]) -> [f64; 3] {
+    rotation.map(|row| row[0] * point[0] + row[1] * point[1] + row[2] * point[2])
 }
 
 const EMPTY_EDGE: sys::sm_edge_geometry = sys::sm_edge_geometry {
