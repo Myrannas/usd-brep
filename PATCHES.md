@@ -19,17 +19,19 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `a9b66ee` | `SmBrep.cpp` | Found imprinting: `RemoveTopologicalEdgesAndVertices` tests each edge with `SmEdge::IsTopological`, which can expand one face's surface to cover the other's as a side effect, before it looks for the edge in the keep list. An edge kept between two pieces of a curved face (a panel imprinted on a crate's round, merged back off the round at the other end) leaves a piece on the stretched surface: its box grows by 12 mm, its area integral fails and a later union over it fails with `SM_ERR`. | Look for each edge in the keep list before testing it. Without a keep list the merge runs as before. |
 | `cd41f50` | `SmTorus.cpp` | Found revolving: `SmTorus::IsNurbSurfaceTorus` snaps the generator circle's start and end angles to 0 and 360 only within `SM_EFF_ZERO` (1e-12 degrees). A circle revolved a whole turn on a tilted plane came out with both 2.7e-12 degrees off zero, and the torus got an empty (u, v) domain. | Snap within `SM_EFF_ZERO_DEG` and turn an end no further than the start into a whole turn, as `RebuildSTEPFromNURBParameters` in the same file does. Nothing in the kernel calls it (its call in `CopyAndAddAnalytics` is commented out); the shim's revolve does. |
 | `c7639c2` | `SmTorus.cpp` | Found piping and revolving: `SmTorus::IsNurbSurfaceTorus` took the major radius as the distance between the first parallel circle's centre and the generator circle's, too long whenever that circle isn't the equator (a pipe bent round 10 came back a torus of 11.18), and the generator's start and end angles unsigned, so a point below the torus's plane read as one above and the torus ran half a turn round the tube from its surface. | Drop the height between the centres, and sign the angles towards the torus's z axis, the generator circle's y axis. Of 30 circles revolved about axes every way on two planes, 22 were recognised before and 30 after. |
+| `0afdfdb` | `SmOffsetExecutive.cpp` | Found hollowing: `a9a7a28` put a local operation's edges in the brep's order but left solid offsets, which shells are, on the edgeuses' addresses. The same shell came out differently from one process to the next: a box with its top's rim rounded hollowed to 41034, 42223 or 43578 mm³, and a box rounded on every edge failed in one run and not the next. | Mate a solid offset's edges in the original brep's order too (`sm_SortInBrepOrder`). Three runs of each give the same result. |
 
-`source/SM_API` is unmodified. Each offset patch changes only
+`source/SM_API` is unmodified. Each offset patch before `0afdfdb` changes only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
-offset); solid offsets and shells take the code paths they always did. The
+offset), and `0afdfdb` sorts solid offsets' mating the same way. The
 tessellation patches only add methods and a class (`SmMemBlockMgr` gains a
 block copy and block accessors): `SmApiTessellate` and `Phase1SetupBrep`
 take the code paths they always did. The merge patch changes only merges
 given a keep list: `RemoveTopologicalEdgesAndVertices()` without one, as
 every boolean's post-process and `Brep::merge_faces` call it, is as it was.
 The torus patches change only `SmTorus::IsNurbSurfaceTorus`, which only the
-shim calls.
+shim calls. Patch `0afdfdb` changes only solid offsets
+(`SM_OO_SOLID_OFFSET`), which only the shim's shell makes.
 
 ## Notes from the bring-up (no patch needed)
 
@@ -404,7 +406,8 @@ steps are shim and Rust only. What the shim relies on:
 ## Notes from the solids work
 
 Revolve, Draft, Pipe and Hollow, for game-cad's features of those names.
-Shim and Rust only, apart from the torus patches (`cd41f50`, `c7639c2`).
+Shim and Rust only, apart from the torus patches (`cd41f50`, `c7639c2`) and
+the shell's mating order (`0afdfdb`).
 
 ### Revolve
 
@@ -454,7 +457,7 @@ sweep does, and reads its maps: `GetToHigher` gives each edge's side and
 - Results (`rust/smlib/tests/revolve.rs`, on a tilted plane, whole and part
   turns, both ways): tubes, discs, cones, frustums, balls, rings, a tube with
   a ring-shaped hole and a box's face turned about its own edge, all manifold,
-  volumes within 1e-6 of Pappus' (1e-8 in practice), meshes winding outward
+  volumes within 1e-6 of Pappus' (6e-8 at worst), meshes winding outward
   round them. Each side is the edge's: plane, cylinder, cone, sphere or
   torus.
 - Turns from 359.999 degrees to just under 360 fail (`SHIM_ERR_BAD_SWEEP`:
@@ -566,4 +569,50 @@ longer, so its cap clears the plane halfway between them, and cut there
   a block. All manifold, volumes within 1e-6 of the section times the
   path's length (mitres keep it), walls the right cylinders and tori, caps
   where the path ends, meshes winding outward.
+
+### Hollow
+
+`Brep::shell` (`sm_brep_shell`) hollows a solid inward to a wall
+thickness, chosen faces left open, and says what each face of the result
+is (`Shell`, `ShellFace`), by the face it came from: one that stays
+outside, the rim left of an opened face round its opening, an inner face
+offset from a face, or a new face from none.
+
+- `SmApiShellBrepFull` (`SmOffsetExecutive::ShellBrep`, extended corners
+  and self-intersections trimmed) insets the solid, the faces to open left
+  where they are, and cuts the inset from it. Before shelling, the shim
+  copies the solid and labels each face with its index, keeping its real
+  label aside; labels ride through the offset onto both a face and its
+  offset. A face of the result on its source face's own surface stays (or
+  is a rim) and gets the real label back; one `thickness` in is its inner
+  face and has none, nor do its edges; a face with no index is new.
+- The same shell came out differently from one process to the next until
+  patch `0afdfdb`.
+- The result must be a manifold solid whose faces' integrals agree with
+  their edges (`volume_agrees`, as Offset Face checks): a box with its
+  top's rim rounded 4, opened at the top and hollowed 2, came back with a
+  volume of 43578 mm³ against its mesh's 44587, and is refused
+  (`SM_SHIM_ERR_BAD_SHELL`).
+- A face must be open (`SM_ERR_INVALID_INPUT` otherwise): a closed hollow
+  is a sealed cavity, which a game mesh never shows, and SMLib's
+  tessellation wound some of a holed block's cavity walls inward (the mesh
+  enclosed 58570 mm³ for the brep's 70076), as it did a closed hollow
+  pipe's.
+- The wall can't be as thick as a feature it offsets through: a round
+  (radius 8: 7.9 works, 8 fails), a chamfer or a boss shorter than it
+  (`SM_ERR` from the offset). A block rounded on every edge fails at any
+  thickness.
+- The walkthrough's sample crate (main's `Document::sample_crate()` built
+  by `SmlibBackend`, release, opened at its lid): 2, 3 and 4 mm walls in
+  0.50 to 0.54 s, manifold, its mesh enclosing its volume to 2e-4, 66 faces
+  (30 outer, 6 rims round the lid's opening and the bolts and vent, 29
+  inner, 1 new), every face that stays labelled. 5 mm fails: the Vent's
+  3 mm chamfer; without it the crate hollows to 5 and fails at 10, where
+  the 6 mm Bolts are. Opened at the bottom, 2 mm works (0.45 s).
+- Results (`rust/smlib/tests/shell.rs`): a box opened at its top and at
+  both ends, a block with rounds and a hole opened at its top at 2, 5 and
+  7.9, each manifold, its volume within 1e-6 of the inset's, its inner
+  planes `thickness` in and its inner cylinders on their faces' axes, its
+  mesh winding outward; the same shell three times over; the failures and
+  refusals above.
 

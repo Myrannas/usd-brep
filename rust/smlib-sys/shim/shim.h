@@ -50,6 +50,7 @@ static const sm_status SM_SHIM_ERR_BAD_DRAFT = 2033;           /* a draft angle 
 static const sm_status SM_SHIM_ERR_DRAFT_CLOSES = 2034;        /* a draft's sides meet before the end of the sweep */
 static const sm_status SM_SHIM_ERR_BAD_PATH = 2035;            /* a pipe's path turns back on itself, or a bend overlaps itself */
 static const sm_status SM_SHIM_ERR_ARC_CORNER = 2036;          /* an arc of a pipe's path meets a curve beside it at an angle */
+static const sm_status SM_SHIM_ERR_BAD_SHELL = 2037;           /* a shell's input isn't a manifold solid, or its result isn't one */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -508,6 +509,48 @@ sm_status sm_brep_create_pipe(const sm_plane_curve *path, size_t count, sm_vec3 
 
 /* Frees the array sm_brep_create_pipe returns. NULL is ignored. */
 void sm_pipe_faces_free(sm_pipe_face *faces);
+
+/* What a face of a shelled solid is (sm_brep_shell), by the face of the
+ * solid it came from. */
+enum sm_shell_role {
+    /* A face that stays where it was, outside. */
+    SM_SHELL_OUTER = 0,
+    /* What's left of a face opened, round the opening. */
+    SM_SHELL_RIM = 1,
+    /* A face's offset, the wall's inside. */
+    SM_SHELL_INNER = 2,
+    /* A face from no face of the solid. */
+    SM_SHELL_NEW = 3
+};
+
+/* One face of a shelled solid, in the order of its face list: its
+ * sm_shell_role, and the index in the solid's face list of the face it came
+ * from (-1 for SM_SHELL_NEW). */
+typedef struct sm_shell_face {
+    int32_t role;
+    int32_t source_face;
+} sm_shell_face;
+
+/* The manifold solid hollowed to a wall `thickness` thick inward from its
+ * faces, the faces at the given indices of its face list left open
+ * (SmApiShellBrepFull with extended corners and self-intersections trimmed:
+ * SmOffsetExecutive::ShellBrep insets the solid, the open faces left where
+ * they are, and cuts the inset from it). The brep is unchanged. *faces says
+ * what each face of the result is (sm_shell_face): faces that stay keep
+ * their labels, and so do edges only they use; inner faces have none.
+ * SM_ERR_INVALID_INPUT for a thickness that isn't finite and positive, or
+ * for opening no face (a closed hollow is a sealed cavity, which SMLib's
+ * tessellation can wind the wrong way) or every face;
+ * SM_SHIM_ERR_BAD_FACE for an index out of range or repeated;
+ * SM_SHIM_ERR_BAD_SHELL when the brep or the result isn't a manifold solid,
+ * or the result's faces' integrals disagree with their edges; the kernel's
+ * status when it can't offset the faces. Free *faces with
+ * sm_shell_faces_free. */
+sm_status sm_brep_shell(const sm_brep *brep, double thickness, const uint32_t *open, size_t open_count,
+                        sm_brep **out, sm_shell_face **faces, size_t *face_count);
+
+/* Frees the array sm_brep_shell returns. NULL is ignored. */
+void sm_shell_faces_free(sm_shell_face *faces);
 
 /* Merges faces that lie on one surface into one face, removing the edges
  * between them, and edges that lie on one curve into one edge

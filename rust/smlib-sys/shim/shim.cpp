@@ -6137,6 +6137,106 @@ sm_status create_pipe(const sm_plane_curve* path, size_t count, const SmAxis2Pla
     return SM_SUCCESS;
 }
 
+// How far `point` is from the surface `face` lies on.
+bool off_surface(const SmFace* face, const SmPoint3d& point, double& distance) {
+    SmPoint3d closest;
+    SmTArray<SmPoint2d> uvs;
+    return SmApiSurfaceClosestPoint(face->GetSurface(), point, closest, uvs, distance) == SM_SUCCESS;
+}
+
+// The brep hollowed `thickness` in from its faces, the faces at `open` left
+// open (SmApiShellBrepFull: SmOffsetExecutive::ShellBrep insets the solid,
+// those faces left where they are, and cuts the inset from it). Each face is
+// marked with its index first, in place of its label, so each face of the
+// result says which face it came from: one on that face's own surface stays
+// (SM_SHELL_OUTER, or SM_SHELL_RIM for what's left of an opened face, round
+// its opening), one `thickness` in is its offset (SM_SHELL_INNER), and one
+// with no mark is new (SM_SHELL_NEW). Faces that stay get their labels back,
+// as do the edges only they use; inner faces and their edges have none.
+sm_status shell_brep(const SmBrep& brep, const std::vector<bool>& opened, double thickness, SmBrep*& out,
+                     std::vector<sm_shell_face>& roles) {
+    if (!is_manifold_solid(brep)) return SM_SHIM_ERR_BAD_SHELL;
+    const SmContext* context = SmApiGetOrCreateContext();
+    SmTArray<SmFace*> sources;
+    brep.GetFaces(sources);
+    std::unordered_map<const SmTopology*, int32_t> source_index;
+    for (ULONG i = 0; i < sources.GetSize(); ++i) source_index.emplace(sources[i], static_cast<int32_t>(i));
+
+    SmCopyBrepMap to_original;
+    std::unique_ptr<SmBrep> work(new (*context) SmBrep(brep, &to_original, nullptr, TRUE, FALSE));
+    std::vector<sm_label> labels(sources.GetSize());
+    SmTArray<SmFace*> faces;
+    work->GetFaces(faces);
+    SmTArray<const SmFace*> open_faces;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const auto found = source_index.find(to_original.GetAt(faces[i]));
+        if (found == source_index.end()) return SM_ERR;
+        labels[found->second] = read_label(faces[i]);
+        sm_label mark{};
+        mark.present = 1;
+        mark.feature = SWEPT_ROLE;
+        mark.index = static_cast<uint32_t>(found->second);
+        std::memcpy(mark.role, "shell", 6);
+        write_label(*faces[i], mark);
+        if (opened[found->second]) open_faces.Add(faces[i]);
+    }
+    SmBrep* raw = nullptr;
+    const SmApiStatus status = SmApiShellBrepFull(work.get(), -thickness, TRUE, TRUE, FALSE, open_faces, raw);
+    std::unique_ptr<SmBrep> shell(raw);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    if (!shell || !is_manifold_solid(*shell)) return SM_SHIM_ERR_BAD_SHELL;
+    // The offset can come back with faces whose own integrals disagree with
+    // their edges (a box with its top's rim rounded, opened at the top).
+    bool agrees = false;
+    const sm_status checked = volume_agrees(*shell, agrees);
+    if (checked != SM_SUCCESS) return checked;
+    if (!agrees) return SM_SHIM_ERR_BAD_SHELL;
+
+    SmTArray<SmFace*> result;
+    shell->GetFaces(result);
+    roles.assign(result.GetSize(), sm_shell_face{SM_SHELL_NEW, -1});
+    const double tolerance = std::max(1e3 * SM_ZONE_TOL_3D, 1e-6 * thickness);
+    std::vector<bool> stays(result.GetSize(), false);
+    for (ULONG i = 0; i < result.GetSize(); ++i) {
+        const sm_label mark = read_label(result[i]);
+        if (!mark.present || mark.feature != SWEPT_ROLE || std::strcmp(mark.role, "shell") != 0 ||
+            mark.index >= sources.GetSize()) {
+            write_label(*result[i], sm_label{});
+            continue;
+        }
+        const int32_t source = static_cast<int32_t>(mark.index);
+        SmPoint3d inside;
+        double distance = 0.0;
+        if (SmApiFaceInternalPoint(result[i], inside) != SM_SUCCESS ||
+            !off_surface(sources[static_cast<ULONG>(source)], inside, distance)) {
+            return SM_ERR;
+        }
+        roles[i].source_face = source;
+        if (distance <= tolerance) {
+            roles[i].role = opened[source] ? SM_SHELL_RIM : SM_SHELL_OUTER;
+            stays[i] = true;
+            write_label(*result[i], labels[source]);
+        } else {
+            roles[i].role = std::fabs(distance - thickness) <= tolerance ? SM_SHELL_INNER : SM_SHELL_NEW;
+            write_label(*result[i], sm_label{});
+        }
+    }
+    // An edge keeps its label only where faces that stay are all that use it.
+    SmTArray<SmEdge*> edges;
+    shell->GetEdges(edges);
+    std::unordered_map<const SmFace*, bool> face_stays;
+    for (ULONG i = 0; i < result.GetSize(); ++i) face_stays[result[i]] = stays[i];
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        SmTArray<SmFace*> users;
+        edges[i]->GetFaces(users);
+        bool kept = users.GetSize() > 0;
+        for (ULONG j = 0; j < users.GetSize(); ++j) kept = kept && face_stays[users[j]];
+        if (!kept) write_label(*edges[i], sm_label{});
+    }
+    out = shell.release();
+    return SM_SUCCESS;
+}
+
 }  // namespace
 
 extern "C" {
@@ -6226,5 +6326,37 @@ sm_status sm_brep_create_pipe(const sm_plane_curve* path, size_t count, sm_vec3 
 }
 
 void sm_pipe_faces_free(sm_pipe_face* faces) { delete[] faces; }
+
+sm_status sm_brep_shell(const sm_brep* brep, double thickness, const uint32_t* open, size_t open_count,
+                        sm_brep** out, sm_shell_face** faces, size_t* face_count) {
+    if (!brep || !out || !faces || !face_count || (open_count > 0 && !open)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!std::isfinite(thickness) || thickness <= 0.0) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return guarded([&] {
+        const SmBrep& source = *brep_of(brep);
+        size_t count = 0, unused = 0;
+        sm_brep_counts(brep, &count, &unused);
+        std::vector<bool> opened(count, false);
+        for (size_t i = 0; i < open_count; ++i) {
+            if (open[i] >= count || opened[open[i]]) return SM_SHIM_ERR_BAD_FACE;
+            opened[open[i]] = true;
+        }
+        // A closed hollow is a sealed cavity, which SMLib's tessellation can
+        // wind the wrong way.
+        if (open_count == 0 || open_count == count) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+        SmBrep* shell = nullptr;
+        std::vector<sm_shell_face> roles;
+        const sm_status status = shell_brep(source, opened, thickness, shell, roles);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> owned(shell);
+        std::unique_ptr<sm_shell_face[]> array(new sm_shell_face[roles.size()]);
+        std::copy(roles.begin(), roles.end(), array.get());
+        *out = handle_of(owned.release());
+        *faces = array.release();
+        *face_count = roles.size();
+        return SM_SUCCESS;
+    });
+}
+
+void sm_shell_faces_free(sm_shell_face* faces) { delete[] faces; }
 
 }  // extern "C"

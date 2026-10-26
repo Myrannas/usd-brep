@@ -72,6 +72,7 @@ impl Status {
             2034 => "SHIM_ERR_DRAFT_CLOSES",
             2035 => "SHIM_ERR_BAD_PATH",
             2036 => "SHIM_ERR_ARC_CORNER",
+            2037 => "SHIM_ERR_BAD_SHELL",
             _ => return None,
         })
     }

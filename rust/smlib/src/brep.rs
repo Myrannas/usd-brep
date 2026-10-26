@@ -16,6 +16,7 @@ use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams, slice};
 use crate::pipe::{Pipe, PipeFace};
+use crate::shell::{Shell, ShellFace};
 use crate::tessellation::{FaceKey, SurfaceCaches, Tessellation};
 
 /// Relative accuracy of [`Brep::face_centroid`]: placing a feature at a
@@ -843,6 +844,87 @@ impl Brep {
         Ok(Pipe {
             solid: Brep::from_raw(OP, out)?,
             faces: roles,
+        })
+    }
+
+    /// The solid hollowed to a wall `thickness` thick, inward from its faces,
+    /// with the faces at `open` in [`faces`](Brep::faces) left open
+    /// (`SmApiShellBrepFull`: SMLib insets the solid, those faces left where
+    /// they are, and cuts the inset from it). Corners inside meet sharp, as
+    /// their faces extended meet. The brep is unchanged.
+    ///
+    /// [`Shell::faces`] says what each face is, by the face it came from: a
+    /// face that stays outside, what's left of an opened face round its
+    /// opening (the rim), or a face's offset, the inside of its wall. Faces
+    /// that stay keep their labels, and so do the edges only they use;
+    /// inner faces have none, for the caller to label after the faces they
+    /// came from.
+    ///
+    /// At least one face must be open: a closed hollow is a sealed cavity,
+    /// which a game mesh never shows, and SMLib's tessellation can wind its
+    /// curved walls the wrong way.
+    ///
+    /// The kernel's error when it can't offset every face by `thickness`: a
+    /// round, a chamfer or a boss can only be offset in by less than its own
+    /// size. `SHIM_ERR_BAD_SHELL` when the result isn't a closed solid whose
+    /// faces' integrals agree with their edges, as when the opened face is
+    /// rounded into its neighbours.
+    pub fn shell(&self, thickness: f64, open: &[usize]) -> Result<Shell, Error> {
+        const OP: &str = "SmApiShellBrepFull";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
+        };
+        check_positive(OP, thickness, "the thickness must be finite and positive")?;
+        if !self.is_manifold()? {
+            return invalid("only a closed, manifold solid can be hollowed");
+        }
+        let faces = self.face_count();
+        let mut seen = vec![false; faces];
+        for &face in open {
+            if face >= faces || std::mem::replace(&mut seen[face], true) {
+                return invalid("a face to open is out of range or repeated");
+            }
+        }
+        if open.len() == faces {
+            return invalid("opening every face leaves nothing");
+        }
+        if open.is_empty() {
+            return invalid("open at least one face: a closed hollow is a sealed cavity");
+        }
+        let indices: Vec<u32> = open.iter().map(|&f| f as u32).collect();
+        let mut out = ptr::null_mut();
+        let mut roles = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; indices holds
+        // indices.len() elements; the outputs are written only on success.
+        let status = unsafe {
+            sys::sm_brep_shell(
+                self.raw.as_ptr(),
+                thickness,
+                indices.as_ptr(),
+                indices.len(),
+                &mut out,
+                &mut roles,
+                &mut count,
+            )
+        };
+        Error::check(OP, status)?;
+        // SAFETY: on success roles holds count entries, which we copy and then
+        // free once.
+        let faces = unsafe {
+            let faces = slice(roles, count)
+                .iter()
+                .map(ShellFace::from_raw)
+                .collect();
+            sys::sm_shell_faces_free(roles);
+            faces
+        };
+        Ok(Shell {
+            brep: Brep::from_raw(OP, out)?,
+            faces,
         })
     }
 

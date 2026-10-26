@@ -77,6 +77,11 @@ cargo test -p smlib
   walls are cylinders and tori), lines mitred where they meet at an angle,
   all joined. `Pipe::faces` says which face is the outer wall, the inner
   wall or a cap, and which path curve each wall was swept along.
+- `Brep::shell` hollows a solid inward to a wall thickness, chosen faces
+  left open (`SmApiShellBrepFull`). `Shell::faces` says which face stays
+  outside, which is the rim of an opened face, which is the inner face
+  offset from which face, and which is new. Faces that stay keep their
+  labels. This is a part's Hollow.
 - `Brep::merge_faces` merges faces lying on one surface and edges lying on
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come

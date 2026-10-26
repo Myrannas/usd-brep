@@ -12,7 +12,8 @@
 //! ([`Brep::sweep_face`], with draft [`Brep::sweep_face_tapered`]) or
 //! revolved ([`Brep::revolve_face`]), whether a solid's or ones built from
 //! lines, arcs and circles in a plane ([`Brep::planar_faces`]), and circles
-//! swept along paths into pipes ([`Brep::pipe`]). [`Brep::offset_faces`]
+//! swept along paths into pipes ([`Brep::pipe`]). [`Brep::shell`] hollows a
+//! solid, leaving chosen faces open. [`Brep::offset_faces`]
 //! moves faces along their normals, extending or trimming their neighbours,
 //! as Parasolid's face offset does. Faces and edges can carry a [`Label`] that the kernel keeps
 //! through every later operation.
@@ -49,6 +50,7 @@ mod kernel;
 mod label;
 mod mesh;
 mod pipe;
+mod shell;
 mod tessellation;
 
 pub use brep::Brep;
@@ -64,4 +66,5 @@ pub use kernel::Kernel;
 pub use label::{Label, LabelMatch, MAX_ROLE_LEN};
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};
 pub use pipe::{Pipe, PipeFace};
+pub use shell::{Shell, ShellFace};
 pub use tessellation::{FaceKey, SurfaceCaches, Tessellation};
