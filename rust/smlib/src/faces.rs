@@ -115,6 +115,29 @@ impl Frame {
     }
 }
 
+/// What [`Brep::scale_axes_keeping`](crate::Brep::scale_axes_keeping) made
+/// of a brep's faces and edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScaleReport {
+    /// Analytic faces still of the same kind.
+    pub faces_kept: u32,
+    /// Cylinders stretched across their axis, now ellipses swept along a
+    /// line.
+    pub faces_extruded: u32,
+    /// Analytic faces now NURBS.
+    pub faces_nurbs: u32,
+    /// Faces that were NURBS already.
+    pub faces_were_nurbs: u32,
+    /// Lines, and circles and ellipses still of the same kind.
+    pub curves_kept: u32,
+    /// Circles now ellipses.
+    pub curves_stretched: u32,
+    /// Analytic curves now NURBS.
+    pub curves_nurbs: u32,
+    /// Curves that were NURBS already.
+    pub curves_were_nurbs: u32,
+}
+
 /// A closed solid swept from a planar face by
 /// [`Brep::sweep_face`](crate::Brep::sweep_face) (a prism) or
 /// [`Brep::revolve_face`](crate::Brep::revolve_face).

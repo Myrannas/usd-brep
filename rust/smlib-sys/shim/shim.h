@@ -435,6 +435,41 @@ sm_status sm_brep_scale(sm_brep *brep, sm_vec3 point, sm_vec3 factors);
 /* The brep's tolerance (SmBrep::GetTolerance), in model units. */
 sm_status sm_brep_tolerance(const sm_brep *brep, double *out);
 
+/* What sm_brep_scale_keeping made of the brep's faces and edges. */
+typedef struct sm_scale_report {
+    uint32_t faces_kept;        /* analytic, and still of the same kind */
+    uint32_t faces_extruded;    /* cylinders stretched across their axis, now ellipses swept along a line */
+    uint32_t faces_nurbs;       /* analytic, now NURBS */
+    uint32_t faces_were_nurbs;  /* NURBS before, and still */
+    uint32_t curves_kept;       /* lines, and circles or ellipses still of the same kind */
+    uint32_t curves_stretched;  /* circles now ellipses */
+    uint32_t curves_nurbs;      /* analytic, now NURBS */
+    uint32_t curves_were_nurbs; /* NURBS before, and still */
+} sm_scale_report;
+
+/* Scales the brep about a point as sm_brep_scale does, but keeps every
+ * surface and curve analytic that the scale leaves so, rather than turning
+ * them all into NURBS: planes and lines always, a cylinder or cone along a
+ * scale axis whose other two factors are equal, spheres and tori under equal
+ * factors, and circles in a plane the scale keeps round. A circle the scale
+ * stretches becomes an ellipse when the images of its axes stay square; with
+ * extrusions, a cylinder stretched across its axis becomes an ellipse swept
+ * along a line (an SmSurfOfExtrusion). Everything else becomes a NURBS. Each
+ * NURBS is scaled exactly, keeping its parameters, and an analytic
+ * replacement is taken only where it lies on it at the same parameters, so
+ * faces keep their domains and edges their intervals and UV trim curves.
+ * Tolerances scale as in sm_brep_scale. SM_SHIM_ERR_BAD_SCALE as there, and
+ * for a brep with a surface or curve that isn't a B-spline of some kind (an
+ * offset surface, a curve on a surface), before anything changes. report may
+ * be NULL. */
+sm_status sm_brep_scale_keeping(sm_brep *brep, sm_vec3 point, sm_vec3 factors, int32_t extrusions,
+                                sm_scale_report *report);
+
+/* Writes the brep to an SMLib binary file (SmApiWriteBrepToFile), and reads
+ * one back (SmApiReadBrepFromFile, keeping the UV trim curves it holds). */
+sm_status sm_brep_write_file(const sm_brep *brep, const char *path);
+sm_status sm_brep_read_file(const char *path, sm_brep **out);
+
 /* Sweeps the planar face at an index of the brep's face list along its
  * outward normal by distance (negative sweeps into the solid), making a new
  * closed prism (SmApiCreateCurveSweepFromFaces, translational, capped). The

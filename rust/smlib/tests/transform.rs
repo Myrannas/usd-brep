@@ -493,3 +493,212 @@ fn scales_that_arent_positive_are_refused() {
         assert_box("left alone", &block, [[0.0; 3], [40.0, 20.0, 10.0]]);
     });
 }
+
+/// The tangent of a cone face's half-angle, or `None` for another face.
+fn cone_slope(face: &FaceGeometry) -> Option<f64> {
+    match face.surface {
+        Surface::Cone { half_angle, .. } => Some(half_angle.tan()),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_stretch_along_the_cylinders_keeps_them_analytic() {
+    on_kernel(|k| {
+        let before = part(k);
+        let faces = before.faces().unwrap();
+        let volume = before.volume(1e-9).unwrap();
+        let mut stretched = part(k);
+        let report = stretched
+            .scale_axes_keeping([0.0; 3], [1.0, 1.0, 2.0], false)
+            .unwrap();
+        let after = stretched.faces().unwrap();
+        assert!(stretched.is_manifold().unwrap());
+        // Every plane, cylinder and the cone stays; the ball doesn't, and the
+        // chamfer was a NURBS already.
+        assert_eq!(
+            (report.faces_nurbs, report.faces_were_nurbs),
+            (1, 1),
+            "{report:?}"
+        );
+        assert_eq!(report.faces_kept as usize, faces.len() - 2);
+        let expected: Vec<&str> = kinds(&faces)
+            .into_iter()
+            .map(|kind| if kind == "sphere" { "nurbs" } else { kind })
+            .collect();
+        assert_eq!(kinds(&after), expected);
+        assert_eq!(face_labels(&after), face_labels(&faces));
+        assert_eq!(edge_labels(&stretched), edge_labels(&before));
+        assert!(relative(stretched.volume(1e-9).unwrap(), 2.0 * volume) < 1e-8);
+        for (was, is) in faces.iter().zip(&after) {
+            if let (Surface::Cylinder { radius, .. }, Surface::Cylinder { radius: r, .. }) =
+                (&was.surface, &is.surface)
+            {
+                assert!((r - radius).abs() < 1e-9, "radius {radius} became {r}");
+            }
+            // Twice as tall, as wide: half as steep.
+            if let (Some(slope), Some(now)) = (cone_slope(was), cone_slope(is)) {
+                assert!(
+                    (now.abs() - slope.abs() / 2.0).abs() < 1e-9,
+                    "{slope} became {now}"
+                );
+            }
+        }
+        // The bore's bottom rim, now 250 below the origin, still rounds.
+        let rim = EdgeQuery::OnCircle {
+            center: [-80.0, 40.0, -250.0],
+            axis: [0.0, 0.0, 1.0],
+            radius: 15.0,
+        };
+        let rounded = stretched
+            .try_clone()
+            .unwrap()
+            .fillet(&[EdgeBlend::round(rim, 2.0)], &FilletOptions::default())
+            .unwrap();
+        assert!(rounded.is_manifold().unwrap());
+    });
+}
+
+#[test]
+fn a_stretch_across_the_cylinders_keeps_the_planes() {
+    on_kernel(|k| {
+        let before = part(k);
+        let faces = before.faces().unwrap();
+        let volume = before.volume(1e-9).unwrap();
+        let planes = kinds(&faces)
+            .iter()
+            .filter(|&&kind| kind == "plane")
+            .count();
+        let cylinders = kinds(&faces)
+            .iter()
+            .filter(|&&kind| kind == "cylinder")
+            .count();
+        for extrusions in [false, true] {
+            let mut stretched = part(k);
+            let report = stretched
+                .scale_axes_keeping([0.0; 3], [2.0, 1.0, 1.0], extrusions)
+                .unwrap();
+            let after = stretched.faces().unwrap();
+            let now = kinds(&after);
+            assert!(stretched.is_manifold().unwrap());
+            assert_eq!(now.iter().filter(|&&kind| kind == "plane").count(), planes);
+            // Stretched cylinders are exact ellipses swept along a line, or
+            // NURBS; the cone and the ball are NURBS.
+            let swept = now.iter().filter(|&&kind| kind == "other").count();
+            assert_eq!(swept, if extrusions { cylinders } else { 0 }, "{report:?}");
+            assert_eq!(report.faces_extruded as usize, swept);
+            assert_eq!(report.faces_kept as usize, planes);
+            assert!(report.curves_stretched > 0, "{report:?}");
+            assert_eq!(face_labels(&after), face_labels(&faces));
+            assert_eq!(edge_labels(&stretched), edge_labels(&before));
+            let error = relative(stretched.volume(1e-9).unwrap(), 2.0 * volume);
+            assert!(error < 1e-8, "{error:e}");
+
+            // Later operations take it: a hole down through a stretched
+            // corner round, and a fillet on the bore's rim, now an ellipse.
+            let hole = Brep::cylinder(k, [370.0, 135.0, -200.0], 10.0, 400.0).unwrap();
+            let cut = stretched.try_clone().unwrap().difference(hole).unwrap();
+            assert!(cut.is_manifold().unwrap());
+            let rim = EdgeQuery::MidpointOnPlane {
+                point: [0.0, 0.0, -125.0],
+                normal: [0.0, 0.0, 1.0],
+            }
+            .and(EdgeQuery::Not(Box::new(EdgeQuery::ParallelTo {
+                direction: [1.0, 0.0, 0.0],
+            })))
+            .and(EdgeQuery::Not(Box::new(EdgeQuery::ParallelTo {
+                direction: [0.0, 1.0, 0.0],
+            })));
+            let ellipse = stretched
+                .edges()
+                .unwrap()
+                .into_iter()
+                .filter(|e| rim.matches(e, &Tolerance::default()))
+                .find(|e| {
+                    let x = e.samples.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+                    (x - (-190.0)).abs() < 1e-6
+                })
+                .expect("the bore's bottom rim")
+                .index;
+            let rounded = stretched
+                .try_clone()
+                .unwrap()
+                .fillet(
+                    &[EdgeBlend::round(EdgeQuery::Indices(vec![ellipse]), 2.0)],
+                    &FilletOptions::default(),
+                )
+                .unwrap();
+            assert!(rounded.is_manifold().unwrap());
+        }
+    });
+}
+
+#[test]
+fn keeping_analytics_is_repeatable_where_the_stock_scale_isnt() {
+    on_kernel(|k| {
+        let params = TessellationParams::default();
+        let stock = |solid: &mut Brep| solid.scale_axes_about([0.0; 3], [2.0, 1.0, 1.0]).unwrap();
+        let keeping = |solid: &mut Brep| {
+            solid
+                .scale_axes_keeping([0.0; 3], [2.0, 1.0, 1.0], true)
+                .unwrap();
+        };
+        let mesh_after = |scale: &dyn Fn(&mut Brep), volume_first: bool| {
+            let mut solid = part(k);
+            scale(&mut solid);
+            if volume_first {
+                solid.volume(1e-9).unwrap();
+            }
+            solid.tessellate(&params).unwrap()
+        };
+        // The stock scale drops the UV trim curves, and the first call that
+        // needs them rebuilds them its own way.
+        assert_ne!(mesh_after(&stock, true), mesh_after(&stock, false));
+        assert_eq!(mesh_after(&keeping, true), mesh_after(&keeping, false));
+    });
+}
+
+#[test]
+fn keeping_analytics_under_equal_factors_keeps_every_surface() {
+    on_kernel(|k| {
+        for make in [part as fn(&Kernel) -> Brep, ring] {
+            let before = make(k);
+            let mut scaled = make(k);
+            let report = scaled
+                .scale_axes_keeping([12.0, -7.0, 30.0], [2.0; 3], false)
+                .unwrap();
+            assert_eq!(report.faces_nurbs, 0, "{report:?}");
+            assert_eq!(
+                kinds(&scaled.faces().unwrap()),
+                kinds(&before.faces().unwrap())
+            );
+            let error = relative(
+                scaled.volume(1e-9).unwrap(),
+                8.0 * before.volume(1e-9).unwrap(),
+            );
+            assert!(error < 1e-8, "{error:e}");
+        }
+    });
+}
+
+#[test]
+fn ellipses_swept_along_a_line_read_back_from_a_file() {
+    on_kernel(|k| {
+        let mut stretched = part(k);
+        stretched
+            .scale_axes_keeping([0.0; 3], [2.0, 1.0, 1.0], true)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("smlib-transform-{}.smb", std::process::id()));
+        stretched.write_file(&path).unwrap();
+        let back = Brep::read_file(k, &path);
+        let _ = std::fs::remove_file(&path);
+        let back = back.unwrap();
+        assert!(back.is_manifold().unwrap());
+        assert_eq!(
+            kinds(&back.faces().unwrap()),
+            kinds(&stretched.faces().unwrap())
+        );
+        let error = relative(back.volume(1e-9).unwrap(), stretched.volume(1e-9).unwrap());
+        assert!(error < 1e-9, "{error:e}");
+    });
+}

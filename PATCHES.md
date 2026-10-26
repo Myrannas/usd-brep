@@ -713,3 +713,40 @@ moved rather than offset, so it needed no kernel change.
   same triangles, vertex for vertex within `f32` rounding (2e-5 mm on a
   400 mm part). The tessellation keys still change, since they hash the
   moved geometry bit for bit.
+
+`Brep::scale_axes_keeping` (`sm_brep_scale_keeping`) is the non-uniform scale
+that keeps what it can analytic, without touching the kernel either:
+
+- SMLib's analytic surfaces and curves are B-splines with an analytic
+  description on top. Their own `Transform` scales the NURBS and derives the
+  description from it again (`SmPlane::Transform` calls
+  `IsNurbSurfacePlane`), and refuses only a scale that isn't uniform. So the
+  shim scales each face's and edge's NURBS exactly (knots and weights stay,
+  so parameters do) and rebuilds the analytic surface or curve where the
+  scaled NURBS still is one: `SmPlane::IsNurbSurfacePlane`,
+  `SmCone::IsNurbSurfaceCone`, `SmSphere::IsNurbSurfaceSphere`,
+  `SmCircle::IsNurbCurveCircle`. An ellipse is an `SmEllipse` through the
+  images of the circle's axes, made over the scaled NURBS (its constructor
+  takes one, as `IsNurbCurveCircle` hands its NURBS to `SmCircle`), when the
+  NURBS runs on it between its start and end angles. A stretched cylinder is
+  an `SmSurfOfExtrusion` of such an ellipse, made as
+  `SmSurfOfExtrusion::IsNurbSurfaceSurfOfExtrusion` makes one, except that
+  recogniser's profile is a NURBS of the iso curve. Every candidate must have
+  the scaled NURBS's domain and lie on it at 25 (u, v) or 9 parameters to a
+  thousandth of the tolerance, or the NURBS stays.
+- Fitting an `SmEllipse` to another interval with
+  `SmBSplineCurve::ScaleKnotVector` killed the process; making it over the
+  scaled NURBS sidesteps that (arcs of fillets run by arc length).
+- `SmTorus::IsNurbSurfaceTorus` doesn't recognise a scaled torus, which is
+  why `CopyAndAddAnalytics` leaves it out; under equal factors every surface
+  and curve scales itself in place instead.
+- `TurnToNURBS` replaces each edge's curve with `SmEdge::SetCurve`, which
+  drops the edge's UV trim curves; the first call that needs them rebuilds
+  them its own way. So after `scale_axes_about` the tessellation depends on
+  what ran first: on a crate stretched ×2 in X, computing the volume before
+  tessellating moved 466 vertices. `scale_axes_keeping` copies every trim
+  first and puts it back, and tessellates the same either way.
+- `SmApiWriteBrepToFile` and `SmApiReadBrepFromFile` (`Brep::write_file`,
+  `read_file`) bring back every surface, ellipse extrusions included, but no
+  labels, scaled or not. Reading recognises analytic surfaces again: a crate
+  stretched by `scale_axes_about` comes back with planes.

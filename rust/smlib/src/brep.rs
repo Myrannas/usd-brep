@@ -1,6 +1,8 @@
+use std::ffi::CString;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::path::Path;
 use std::ptr::{self, NonNull};
 
 use smlib_sys as sys;
@@ -8,7 +10,7 @@ use smlib_sys as sys;
 use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
 use crate::faces::{
-    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Sweep,
+    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, ScaleReport, Sweep,
 };
 use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::imprint::{Imprint, ImprintEdge};
@@ -530,6 +532,97 @@ impl Brep {
         // SAFETY: self is a live brep on the kernel thread.
         let status = unsafe { sys::sm_brep_scale(self.raw.as_ptr(), vec3(point), vec3(factors)) };
         Error::check(OP, status)
+    }
+
+    /// Scales the brep about `point` by a factor along each of x, y and z,
+    /// as [`scale_axes_about`](Brep::scale_axes_about) does, but keeps every
+    /// surface and curve analytic that the scale leaves so, rather than
+    /// turning them all into NURBS: planes and lines always, a cylinder or
+    /// cone along a scale axis whose other two factors are equal (its radius
+    /// and height scaled), spheres and tori under equal factors, and circles
+    /// in a plane the scale keeps round. A circle the scale stretches becomes
+    /// an ellipse where the images of its axes stay square. With
+    /// `extrusions`, a cylinder stretched across its axis becomes an ellipse
+    /// swept along a line (`SmSurfOfExtrusion`, which
+    /// [`Surface`](crate::Surface) reports as `Other`); without, a NURBS, as
+    /// is everything else the scale distorts.
+    ///
+    /// Each face's and edge's NURBS is scaled exactly, so it keeps its
+    /// parameters, and the analytic surface or curve that replaces it is
+    /// taken only where it lies on it at the same parameters: faces keep
+    /// their (u, v) domains and edges their intervals and UV trim curves.
+    /// Every face and edge keeps its index and [`Label`]; tolerances scale as
+    /// in [`scale_axes_about`](Brep::scale_axes_about). Fails with
+    /// `SHIM_ERR_BAD_SCALE`, leaving the brep alone, for a brep with a surface
+    /// or curve that isn't a B-spline of some kind (an offset surface, or a
+    /// curve on a surface).
+    pub fn scale_axes_keeping(
+        &mut self,
+        point: [f64; 3],
+        factors: [f64; 3],
+        extrusions: bool,
+    ) -> Result<ScaleReport, Error> {
+        const OP: &str = "sm_brep_scale_keeping";
+        check_point(OP, point)?;
+        for factor in factors {
+            check_positive(OP, factor, "scale factors must be finite and positive")?;
+        }
+        let mut report = sys::sm_scale_report {
+            faces_kept: 0,
+            faces_extruded: 0,
+            faces_nurbs: 0,
+            faces_were_nurbs: 0,
+            curves_kept: 0,
+            curves_stretched: 0,
+            curves_nurbs: 0,
+            curves_were_nurbs: 0,
+        };
+        // SAFETY: self is a live brep on the kernel thread; report outlives
+        // the call.
+        let status = unsafe {
+            sys::sm_brep_scale_keeping(
+                self.raw.as_ptr(),
+                vec3(point),
+                vec3(factors),
+                i32::from(extrusions),
+                &mut report,
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(ScaleReport {
+            faces_kept: report.faces_kept,
+            faces_extruded: report.faces_extruded,
+            faces_nurbs: report.faces_nurbs,
+            faces_were_nurbs: report.faces_were_nurbs,
+            curves_kept: report.curves_kept,
+            curves_stretched: report.curves_stretched,
+            curves_nurbs: report.curves_nurbs,
+            curves_were_nurbs: report.curves_were_nurbs,
+        })
+    }
+
+    /// Writes the brep to an SMLib binary file (`SmApiWriteBrepToFile`),
+    /// labels and all.
+    pub fn write_file(&self, path: &Path) -> Result<(), Error> {
+        const OP: &str = "SmApiWriteBrepToFile";
+        let path = c_path(OP, path)?;
+        // SAFETY: self is a live brep on the kernel thread; path outlives
+        // the call.
+        let status = unsafe { sys::sm_brep_write_file(self.raw.as_ptr(), path.as_ptr()) };
+        Error::check(OP, status)
+    }
+
+    /// Reads a brep back from a file [`write_file`](Brep::write_file) wrote
+    /// (`SmApiReadBrepFromFile`).
+    pub fn read_file(_kernel: &Kernel, path: &Path) -> Result<Brep, Error> {
+        const OP: &str = "SmApiReadBrepFromFile";
+        let path = c_path(OP, path)?;
+        let mut out = ptr::null_mut();
+        // SAFETY: path outlives the call; a fresh brep out, on the kernel
+        // thread.
+        let status = unsafe { sys::sm_brep_read_file(path.as_ptr(), &mut out) };
+        Error::check(OP, status)?;
+        Brep::from_raw(OP, out)
     }
 
     /// The brep's tolerance in model units (`SmBrep::GetTolerance`): how far
@@ -1775,6 +1868,15 @@ impl fmt::Debug for Brep {
 
 fn gap(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+fn c_path(operation: &'static str, path: &Path) -> Result<CString, Error> {
+    path.to_str()
+        .and_then(|path| CString::new(path).ok())
+        .ok_or(Error::InvalidArgument {
+            operation,
+            reason: "the path must be UTF-8 without NUL bytes",
+        })
 }
 
 fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {

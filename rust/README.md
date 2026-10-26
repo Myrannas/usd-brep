@@ -104,7 +104,20 @@ cargo test -p smlib
 - `Brep::scale_axes_about(point, factors)` scales each axis on its own; unequal
   factors turn every surface and curve into a NURBS first
   (`SmBrep::TurnToNURBS`), planes included.
-- `Brep::tolerance` reads the brep's tolerance.
+- `Brep::scale_axes_keeping(point, factors, extrusions)` scales each axis on
+  its own but keeps analytic whatever the scale leaves so: planes and lines
+  always, a cylinder or cone along a scale axis whose other two factors are
+  equal, spheres and tori under equal factors, circles in a plane the scale
+  keeps round. Circles it stretches become ellipses. With `extrusions`, a
+  cylinder stretched across its axis becomes an ellipse swept along a line
+  (`SmSurfOfExtrusion`, reported as `Surface::Other`); otherwise it, like
+  everything else the scale distorts, becomes a NURBS. A `ScaleReport` counts
+  what became what. Faces keep their (u, v) domains, edges their intervals
+  and UV trim curves, so it tessellates the same whatever ran first, which
+  `scale_axes_about` doesn't.
+- `Brep::tolerance` reads the brep's tolerance; `Brep::write_file` and
+  `Brep::read_file` write and read SMLib's binary format (labels don't come
+  back).
 
 `tests/transform.rs` checks labels, surfaces, (u, v), volumes, triangles and
 later fillets and booleans through each of them.

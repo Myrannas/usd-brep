@@ -21,6 +21,7 @@
 #include <SmApiBrep.h>
 #include <SmApiCurves.h>
 #include <SmApiGeneral.h>
+#include <SmApiImportExport.h>
 #include <SmApiPrimitives.h>
 #include <SmApiQueries.h>
 #include <SmApiSurfaces.h>
@@ -31,6 +32,7 @@
 #include <SmBSplineCurve.h>
 #include <SmBSplineSurface.h>
 #include <SmBrep.h>
+#include <SmCircle.h>
 #include <SmCone.h>
 #include <SmCopyBrepMap.h>
 #include <SmCurveClass.h>
@@ -38,6 +40,7 @@
 #include <SmDatabaseIO.h>
 #include <SmEdge.h>
 #include <SmEdgeuse.h>
+#include <SmEllipse.h>
 #include <SmFace.h>
 #include <SmFaceuse.h>
 #include <SmFilletCorner.h>
@@ -57,6 +60,7 @@
 #include <SmRotationalSweepGeometry.h>
 #include <SmShell.h>
 #include <SmSphere.h>
+#include <SmSurfOfExtrusion.h>
 #include <SmSurfOfRevolution.h>
 #include <SmSurfTypes.h>
 #include <SmTess.h>
@@ -4710,6 +4714,426 @@ void sm_mesh_view_get(const sm_mesh* mesh, sm_mesh_view* out) {
 }
 
 void sm_mesh_free(sm_mesh* mesh) { delete mesh; }
+
+}  // extern "C"
+
+// Non-uniform scales that keep surfaces and curves analytic where the scale
+// leaves them so (sm_brep_scale_keeping).
+//
+// SmBrep::Transform turns every surface and curve into a NURBS before a
+// non-uniform scale (TurnToNURBS), since SMLib's analytic surfaces and curves
+// refuse one. They are B-splines too, though: each keeps a NURBS of itself,
+// and its own Transform scales that NURBS and derives its analytic description
+// from it again (SmPlane::Transform), refusing only a scale that isn't
+// uniform. So this scales each face's and edge's NURBS exactly, which keeps
+// its knots and weights and so its parameters, and makes it analytic again
+// where the scaled NURBS still is: a plane always, a cylinder or cone along a
+// scale axis whose other two factors are equal, a circle in a plane the scale
+// keeps round. A circle the scale stretches becomes an ellipse, and with
+// extrusions a cylinder stretched across its axis becomes an ellipse swept
+// along a line (SmSurfOfExtrusion). A candidate is taken only when it has the
+// scaled NURBS's domain and lies on it at the same parameters, so every edge
+// keeps its interval and every UV trim curve stays right. Replacing a face's
+// surface or an edge's curve drops the trims, so they are put back after.
+
+namespace {
+
+struct Scaling {
+    SmVector3d factors;
+    SmAxis2Placement move;
+
+    SmPoint3d point(const SmPoint3d& p) const {
+        SmPoint3d out;
+        move.TransformPoint(p.Multiply(factors), out);
+        return out;
+    }
+    SmVector3d vector(const SmVector3d& v) const { return v.Multiply(factors); }
+};
+
+// The largest distance between two surfaces at the same (u, v), over a grid
+// on the domain.
+double surface_gap(const SmSurface& a, const SmSurface& b, const SmExtent2d& domain) {
+    double gap = 0.0;
+    for (int i = 0; i <= 4; ++i) {
+        for (int j = 0; j <= 4; ++j) {
+            const SmPoint2d uv = domain.Evaluate(i / 4.0, j / 4.0);
+            SmPoint3d p, q;
+            if (a.EvaluatePoint(uv, p) != SM_SUCCESS || b.EvaluatePoint(uv, q) != SM_SUCCESS) return HUGE_VAL;
+            gap = std::max(gap, (p - q).Length());
+        }
+    }
+    return gap;
+}
+
+// The largest distance between two curves at the same parameter.
+double curve_gap(const SmCurve& a, const SmCurve& b, const SmExtent1d& interval) {
+    double gap = 0.0;
+    for (int i = 0; i <= 8; ++i) {
+        const double t = interval.Evaluate(i / 8.0);
+        SmPoint3d p, q;
+        if (a.EvaluatePoint(t, p) != SM_SUCCESS || b.EvaluatePoint(t, q) != SM_SUCCESS) return HUGE_VAL;
+        gap = std::max(gap, (p - q).Length());
+    }
+    return gap;
+}
+
+// Takes the candidate if it stands in for the scaled NURBS exactly; deletes it
+// otherwise.
+template <typename T>
+T* if_same_surface(T* candidate, const SmBSplineSurface& scaled, double tolerance) {
+    const SmExtent2d domain = scaled.GetNaturalUVDomain();
+    if (candidate && candidate->GetNaturalUVDomain() == domain &&
+        surface_gap(*candidate, scaled, domain) <= tolerance) {
+        return candidate;
+    }
+    delete candidate;
+    return nullptr;
+}
+
+template <typename T>
+T* if_same_curve(T* candidate, const SmBSplineCurve& scaled, double tolerance) {
+    const SmExtent1d interval = scaled.GetNaturalInterval();
+    if (candidate && candidate->GetNaturalInterval() == interval &&
+        curve_gap(*candidate, scaled, interval) <= tolerance) {
+        return candidate;
+    }
+    delete candidate;
+    return nullptr;
+}
+
+// Whether a curve runs along the ellipse centred on `centre` with unit axes
+// x and y and radii rx and ry, from the angle step.min to step.max in
+// degrees, as SmEllipse describes one.
+bool runs_on_ellipse(const SmBSplineCurve& curve, const SmPoint3d& centre, const SmVector3d& x, const SmVector3d& y,
+                     double rx, double ry, const SmExtent1d& step, double tolerance) {
+    const auto at = [&](double degrees) {
+        const double angle = degrees * SM_PI / 180.0;
+        return centre + x * (rx * std::cos(angle)) + y * (ry * std::sin(angle));
+    };
+    const SmExtent1d interval = curve.GetNaturalInterval();
+    SmPoint3d start, end;
+    if (curve.EvaluatePoint(interval.GetMin(), start) != SM_SUCCESS ||
+        curve.EvaluatePoint(interval.GetMax(), end) != SM_SUCCESS || (start - at(step.GetMin())).Length() > tolerance ||
+        (end - at(step.GetMax())).Length() > tolerance) {
+        return false;
+    }
+    const SmVector3d z = x * y;
+    for (int i = 1; i < 8; ++i) {
+        SmPoint3d p;
+        if (curve.EvaluatePoint(interval.Evaluate(i / 8.0), p) != SM_SUCCESS) return false;
+        const SmVector3d d = p - centre;
+        const double u = d.Dot(x) / rx;
+        const double v = d.Dot(y) / ry;
+        if (std::fabs(std::sqrt(u * u + v * v) - 1.0) * std::max(rx, ry) > tolerance ||
+            std::fabs(d.Dot(z)) > tolerance) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The ellipse the scale takes an ellipse or circle to, over the scaled NURBS
+// of it, which it keeps as its own, as SmCircle::IsNurbCurveCircle keeps the
+// NURBS it recognises: when the images of its axes stay square to each other
+// and the NURBS runs along it. NULL otherwise.
+SmEllipse* scaled_ellipse(const SmContext& context, const SmEllipse& ellipse, const SmBSplineCurve& scaled,
+                          const Scaling& scaling, double tolerance) {
+    if (ellipse.GetInsideOut()) return nullptr;
+    const SmAxis2Placement& position = ellipse.GetPosition();
+    const SmVector3d x = scaling.vector(position.GetXAxisRef() * ellipse.GetXRadius());
+    const SmVector3d y = scaling.vector(position.GetYAxisRef() * ellipse.GetYRadius());
+    const double rx = x.Length();
+    const double ry = y.Length();
+    if (rx <= 0.0 || ry <= 0.0 || std::fabs(x.Dot(y)) > 1e-12 * rx * ry) return nullptr;
+    const SmPoint3d centre = scaling.point(position.GetOriginRef());
+    const SmExtent1d step = ellipse.GetSTEPInterval();
+    if (!runs_on_ellipse(scaled, centre, x / rx, y / ry, rx, ry, step, tolerance)) return nullptr;
+    return new (context) SmEllipse(centre, x / rx, y / ry, step, rx, ry, 3, &context, &scaled);
+}
+
+// A cylinder stretched across its axis as an ellipse swept along a line, with
+// the scaled NURBS's parameters (as SmSurfOfExtrusion::IsNurbSurfaceSurfOfExtrusion
+// builds one, but from the ellipse the cylinder's circles scale to rather than
+// from a NURBS of it); NULL when it isn't one.
+SmSurfOfExtrusion* ellipse_extrusion(const SmContext& context, const SmCone& cylinder, const SmBSplineSurface& scaled,
+                                     const Scaling& scaling, double tolerance) {
+    if (!cylinder.IsCylinder()) return nullptr;
+    const ULONG degree_u = scaled.GetDegree(SM_SP_U);
+    const ULONG degree_v = scaled.GetDegree(SM_SP_V);
+    if ((degree_u == 1) == (degree_v == 1)) return nullptr;
+    const SmExtent2d domain = scaled.GetNaturalUVDomain();
+    // The generator is the iso curve at the start of the linear direction.
+    const bool linear_u = degree_u == 1;
+    const SmSurfParamType across = linear_u ? SM_SP_U : SM_SP_V;
+    const double start = linear_u ? domain.GetMin().x : domain.GetMin().y;
+    const double end = linear_u ? domain.GetMax().x : domain.GetMax().y;
+    SmPoint3d origin, line_end;
+    scaled.EvaluatePoint(domain.GetMin(), origin);
+    scaled.EvaluatePoint(domain.Evaluate(linear_u ? 1.0 : 0.0, linear_u ? 0.0 : 1.0), line_end);
+    SmVector3d sweep = (line_end - origin) / (end - start);
+
+    // The cylinder's circle there, exactly, and the ellipse it scales to.
+    SmBSplineCurve* raw = nullptr;
+    if (cylinder.CreateIsoParametricCurve(context, across, start, 0.0, raw) != SM_SUCCESS || !raw) return nullptr;
+    const std::unique_ptr<SmBSplineCurve> iso(raw);
+    SmCircle* circle_raw = nullptr;
+    if (!SmCircle::IsNurbCurveCircle(context, iso.get(), circle_raw)) return nullptr;
+    const std::unique_ptr<SmCircle> circle(if_same_curve(circle_raw, *iso, tolerance));
+    if (!circle) return nullptr;
+    raw = nullptr;
+    if (scaled.CreateIsoParametricCurve(context, across, start, 0.0, raw) != SM_SUCCESS || !raw) return nullptr;
+    const std::unique_ptr<SmBSplineCurve> scaled_iso(raw);
+    std::unique_ptr<SmEllipse> ellipse(scaled_ellipse(context, *circle, *scaled_iso, scaling, tolerance));
+    if (!ellipse) return nullptr;
+
+    // As the recogniser does, so that the analytic and NURBS domains agree.
+    if (!SM_IS_ZERO(start)) {
+        SmAxis2Placement shift;
+        shift.Translate(-start * sweep);
+        ellipse->Transform(shift);
+        origin -= start * sweep;
+    }
+    const SmExtent1d profile = ellipse->GetSTEPInterval();
+    const SmExtent2d analytic(SmPoint2d(profile.GetMin(), start), SmPoint2d(profile.GetMax(), end));
+    SmSurfOfExtrusion* extrusion =
+        new (context) SmSurfOfExtrusion(ellipse.release(), origin, sweep, analytic, linear_u ? TRUE : FALSE);
+    if (extrusion->Reparameterize(domain) != SM_SUCCESS) {
+        delete extrusion;
+        return nullptr;
+    }
+    return if_same_surface(extrusion, scaled, tolerance);
+}
+
+// The analytic surface the scaled NURBS of `original` still is, of
+// `original`'s own kind, or with extrusions an ellipse swept along a line;
+// NULL when it is neither.
+SmSurface* analytic_surface(const SmContext& context, const SmSurface& original, const SmBSplineSurface& scaled,
+                            const Scaling& scaling, bool extrusions, double tolerance, bool& extruded) {
+    extruded = false;
+    const SM_TYPE type = original.GetType();
+    if (type == SmPlane_TYPE) {
+        // SmPlane::Transform's ladder of tolerances.
+        for (double scale : {1.0, 10.0, 100.0, 1000.0}) {
+            SmPlane* plane = nullptr;
+            if (SmPlane::IsNurbSurfacePlane(context, &scaled, plane, scale)) {
+                return if_same_surface(plane, scaled, tolerance);
+            }
+        }
+        return nullptr;
+    }
+    if (type == SmCone_TYPE || type == SmCylinder_TYPE) {
+        SmCone* cone = nullptr;
+        if (SmCone::IsNurbSurfaceCone(context, &scaled, cone)) {
+            if (SmCone* same = if_same_surface(cone, scaled, tolerance)) return same;
+        }
+        if (!extrusions) return nullptr;
+        SmSurfOfExtrusion* extrusion =
+            ellipse_extrusion(context, static_cast<const SmCone&>(original), scaled, scaling, tolerance);
+        extruded = extrusion != nullptr;
+        return extrusion;
+    }
+    if (type == SmSphere_TYPE) {
+        SmSphere* sphere = nullptr;
+        if (SmSphere::IsNurbSurfaceSphere(context, &scaled, sphere)) return if_same_surface(sphere, scaled, tolerance);
+        return nullptr;
+    }
+    if (type == SmTorus_TYPE) {
+        SmTorus* torus = nullptr;
+        if (SmTorus::IsNurbSurfaceTorus(context, &scaled, torus)) return if_same_surface(torus, scaled, tolerance);
+    }
+    return nullptr;
+}
+
+// The analytic curve the scaled NURBS of an ellipse or circle still is: a
+// circle, or the ellipse its axes scale to. NULL when it is neither.
+SmCurve* analytic_curve(const SmContext& context, const SmEllipse& original, const SmBSplineCurve& scaled,
+                        const Scaling& scaling, double tolerance, bool& stretched) {
+    stretched = false;
+    SmCircle* circle = nullptr;
+    if (SmCircle::IsNurbCurveCircle(context, &scaled, circle)) {
+        if (SmCircle* same = if_same_curve(circle, scaled, tolerance)) return same;
+    }
+    SmEllipse* ellipse =
+        if_same_curve(scaled_ellipse(context, original, scaled, scaling, tolerance), scaled, tolerance);
+    stretched = ellipse != nullptr;
+    return ellipse;
+}
+
+sm_status scale_keeping(SmBrep& brep, const Scaling& scaling, bool extrusions, sm_scale_report& report) {
+    const SmContext& context = *brep.GetContext();
+    // Analytic candidates must lie on the scaled NURBS far inside the
+    // tolerance the scale leaves the brep, so they change nothing.
+    const double by = std::max({scaling.factors.x, scaling.factors.y, scaling.factors.z});
+    const double tolerance = 1e-3 * brep.GetTolerance().val * by;
+    // Every analytic surface and curve scales itself uniformly, and keeps
+    // its kind; SMLib can't recognise a torus in a NURBS.
+    const bool uniform = SM_ARE_SAME(scaling.factors.x, scaling.factors.y) &&
+                         SM_ARE_SAME(scaling.factors.x, scaling.factors.z);
+    SmTArray<SmVertex*> vertices;
+    SmTArray<SmEdge*> edges;
+    SmTArray<SmFace*> faces;
+    brep.GetVertices(vertices);
+    brep.GetEdges(edges);
+    brep.GetFaces(faces);
+    // Only what this knows how to scale exactly.
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        const SmCurve* curve = edges[i]->GetCurve();
+        if (!curve || !curve->IsKindOf(SmBSplineCurve_TYPE)) return SM_SHIM_ERR_BAD_SCALE;
+    }
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const SmSurface* surface = faces[i]->GetSurface();
+        if (!surface || !surface->IsKindOf(SmBSplineSurface_TYPE)) return SM_SHIM_ERR_BAD_SCALE;
+    }
+    std::vector<double> vertex_tolerances, edge_tolerances, face_tolerances;
+    for (ULONG i = 0; i < vertices.GetSize(); ++i) vertex_tolerances.push_back(vertices[i]->GetTolerance().val);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) edge_tolerances.push_back(edges[i]->GetTolerance().val);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) face_tolerances.push_back(faces[i]->GetTolerance().val);
+    const double brep_tolerance = brep.GetTolerance().val;
+    std::vector<SmBoolean> rectangular;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) rectangular.push_back(faces[i]->GetRectangularTrim());
+
+    // Every edgeuse pair's UV trim curve, held by one of the two.
+    std::vector<std::pair<SmEdgeuse*, std::unique_ptr<SmBSplineCurve>>> trims;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmTArray<SmEdgeuse*> uses;
+        faces[i]->GetUpwardEdgeuses(uses);
+        for (ULONG j = 0; j < uses.GetSize(); ++j) {
+            SmEdgeuse* owner = nullptr;
+            const SmBSplineCurve* trim = uses[j]->GetUVTrimCurve(&owner);
+            const bool kept = std::any_of(trims.begin(), trims.end(), [&](const auto& t) { return t.first == owner; });
+            if (!trim || !owner || kept) continue;
+            SmCurve* copy = nullptr;
+            if (trim->Copy(context, copy) != SM_SUCCESS || !copy) {
+                delete copy;
+                return SM_ERR;
+            }
+            trims.emplace_back(owner, static_cast<SmBSplineCurve*>(copy));
+        }
+    }
+
+    brep.Notify(SM_NO_PRE_EDIT, &brep, NULL, NULL);
+    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
+    for (ULONG i = 0; i < vertices.GetSize(); ++i) {
+        vertices[i]->Notify(SM_NO_PRE_EDIT, vertices[i], &brep, NULL);
+        vertices[i]->SetPoint(scaling.point(vertices[i]->GetPoint()));
+    }
+
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        SmEdge* edge = edges[i];
+        SmCurve* curve = edge->GetCurve();
+        edge->Notify(SM_NO_PRE_EDIT, edge, &brep, NULL);
+        const SM_TYPE type = curve->GetType();
+        // Lines and NURBS scale as they are; SmLine::Transform keeps it a line.
+        if (uniform || type == SmLine_TYPE || type == SmBSplineCurve_TYPE) {
+            SER(curve->Transform(scaling.move, &scaling.factors));
+            ++(type == SmBSplineCurve_TYPE ? report.curves_were_nurbs : report.curves_kept);
+            continue;
+        }
+        std::unique_ptr<SmBSplineCurve> scaled(new (context) SmBSplineCurve(*static_cast<SmBSplineCurve*>(curve)));
+        SER(scaled->Transform(scaling.move, &scaling.factors));
+        SmCurve* replacement = nullptr;
+        if (curve->IsKindOf(SmEllipse_TYPE)) {
+            bool stretched = false;
+            replacement =
+                analytic_curve(context, *static_cast<SmEllipse*>(curve), *scaled, scaling, tolerance, stretched);
+            if (replacement) ++(stretched ? report.curves_stretched : report.curves_kept);
+        }
+        if (!replacement) {
+            replacement = scaled.release();
+            ++report.curves_nurbs;
+        }
+        // As TurnToNURBS replaces an edge's curve.
+        edge->SetCurve(NULL, TRUE);
+        replacement->SetOwner(NULL);
+        edge->SetCurve(replacement, FALSE);
+        replacement->SetOwner(edge);
+    }
+
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        SmFace* face = faces[i];
+        SmSurface* surface = face->GetSurface();
+        face->Notify(SM_NO_PRE_EDIT, face, &brep, NULL);
+        if (uniform || surface->GetType() == SmBSplineSurface_TYPE) {
+            SER(surface->Transform(scaling.move, &scaling.factors));
+            ++(surface->GetType() == SmBSplineSurface_TYPE ? report.faces_were_nurbs : report.faces_kept);
+            continue;
+        }
+        std::unique_ptr<SmBSplineSurface> scaled(
+            new (context) SmBSplineSurface(*static_cast<SmBSplineSurface*>(surface)));
+        SER(scaled->Transform(scaling.move, &scaling.factors));
+        bool extruded = false;
+        SmSurface* replacement = analytic_surface(context, *surface, *scaled, scaling, extrusions, tolerance, extruded);
+        if (replacement) {
+            ++(extruded ? report.faces_extruded : report.faces_kept);
+        } else {
+            replacement = scaled.release();
+            ++report.faces_nurbs;
+        }
+        const SmExtent2d domain = face->GetUVDomain();
+        face->SetSurface(replacement, TRUE);
+        face->SetUVDomain(domain);
+    }
+    for (auto& [owner, trim] : trims) owner->SetUVTrimCurve(trim.release(), 0.0, TRUE);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (rectangular[i] == TRUE) faces[i]->SetIsRectangularTrim(TRUE);
+    }
+
+    for (ULONG i = 0; i < vertices.GetSize(); ++i) {
+        vertices[i]->SetTolerance(SmZoneTol3d(vertex_tolerances[i] * by), FALSE, FALSE);
+    }
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        edges[i]->SetTolerance(SmZoneTol3d(edge_tolerances[i] * by), FALSE, FALSE);
+    }
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        faces[i]->SetTolerance(SmZoneTol3d(face_tolerances[i] * by), FALSE, FALSE);
+    }
+    brep.SetTolerance(SmZoneTol3d(brep_tolerance * by), FALSE, FALSE);
+    return SM_SUCCESS;
+}
+
+}  // namespace
+
+extern "C" {
+
+sm_status sm_brep_scale_keeping(sm_brep* brep, sm_vec3 point, sm_vec3 factors, int32_t extrusions,
+                                sm_scale_report* report) {
+    if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
+    const auto positive = [](double f) { return std::isfinite(f) && f > SM_EFF_ZERO; };
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) || !positive(factors.x) ||
+        !positive(factors.y) || !positive(factors.z)) {
+        return SM_SHIM_ERR_BAD_SCALE;
+    }
+    return guarded([&] {
+        Scaling scaling;
+        scaling.factors = SmVector3d(factors.x, factors.y, factors.z);
+        scaling.move.Translate(SmVector3d(point.x * (1.0 - factors.x), point.y * (1.0 - factors.y),
+                                          point.z * (1.0 - factors.z)));
+        sm_scale_report counts;
+        std::memset(&counts, 0, sizeof counts);
+        const sm_status status = scale_keeping(*brep_of(brep), scaling, extrusions != 0, counts);
+        if (report) *report = counts;
+        return status;
+    });
+}
+
+sm_status sm_brep_write_file(const sm_brep* brep, const char* path) {
+    if (!brep || !path) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] { return static_cast<sm_status>(SmApiWriteBrepToFile(brep_of(brep), path, FALSE)); });
+}
+
+sm_status sm_brep_read_file(const char* path, sm_brep** out) {
+    if (!path || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmBrep* brep = nullptr;
+        const SmApiStatus status = SmApiReadBrepFromFile(path, FALSE, FALSE, brep);
+        if (status != SM_SUCCESS) {
+            delete brep;
+            return static_cast<sm_status>(status);
+        }
+        *out = handle_of(brep);
+        return SM_SUCCESS;
+    });
+}
 
 }  // extern "C"
 
