@@ -331,3 +331,47 @@ are. The shim's `make_sides_analytic` does it after the sweep:
   and face gaps (5e-15 for a rectangle with a round hole); booleans and face
   merges with the new sides work as before (`tests/planar_faces.rs`,
   `tests/labels.rs`).
+
+## Notes from the imprint work (no patch needed)
+
+`Brep::imprint` and `Brep::imprint_classified` (`sm_brep_imprint`),
+`Brep::merge_faces_keeping` (`sm_brep_merge_faces_keeping`) and Offset Face's
+steps are shim and Rust only. What the shim relies on:
+
+- `SmMerge::ManifoldBoolean` with `SM_BO_IMPRINT` (or `bImprinting`) returns
+  as soon as the intersection is inserted and the loops are checked, before
+  any face is deleted and before the post-process that merges faces on one
+  surface, so `bBooleanPostProcess` makes no difference: the imprint
+  survives with it on or off. `bImprintAndClassifyFaces` returns before the
+  post-process too, after sorting the faces into keep and delete lists,
+  which it marks with `SM_AI_BOOLEAN_SAVE` and `SM_AI_BOOLEAN_DELETE`
+  (reference attributes) instead of deleting any. The shim reads and removes
+  the marks.
+- No public call fits. `SmApiBooleanWithOptions` keeps or deletes the tool
+  but doesn't say which tool face each new edge lies on, and
+  `SmApiBooleanWithCurves` returns the intersection edges with the default
+  options, under which `SM_BO_IMPRINT` deletes the tool. So the shim builds
+  the `SmMerge` itself with `bKeepOtherBrep`, reads each common edge's mate on
+  the tool (`SmTopologyIntersector::GetCommonEdges`) and the labels of the
+  mate's faces, and then deletes the tool.
+- Split faces keep their label on every piece, and the pieces' UV domains
+  are recomputed to fit them, so they and their neighbours key differently
+  for tessellation. Where the tool only touches a face, as a cylinder tangent
+  to a plane does, the imprint still splits the face along the touching
+  line.
+- `RemoveTopologicalEdgesAndVertices` without a keep list removes every
+  imprinted edge between two pieces of one surface. That includes
+  `Brep::merge_faces` and the shim's own merges in Offset Face's
+  push-through.
+- `SmBrep::LocalOperation` can't move a face away from another piece of its
+  own surface, as a panel an imprint leaves on a lid: the offset executive
+  only stretches and trims neighbours, and a neighbour on the face's own
+  surface never meets its new place. It reports a broken solid, and the
+  push-through took the wrong region (a 3 mm sink of an imprinted panel on
+  the sample crate took 357165 mm³ for 36000). So the shim's Offset Face
+  recognises such moves first and builds them from the faces swept into
+  prisms, joined or cut, with a wall where the face leaves its own surface
+  (see `sm_brep_offset_faces`): planar faces only, every other neighbour
+  standing along the move, and the prisms adding or taking exactly their
+  own volume, or it refuses (`SM_SHIM_ERR_UNSUPPORTED_STEP`,
+  `SM_SHIM_ERR_OBSTRUCTED`). Steps never reach the push-through.

@@ -47,6 +47,7 @@
 #include <SmLine.h>
 #include <SmLoop.h>
 #include <SmLoopuse.h>
+#include <SmMerge.h>
 #include <SmOffsetExecutive.h>
 #include <SmOffsetGeometryCreation.h>
 #include <SmPlane.h>
@@ -2934,6 +2935,18 @@ sm_status boolean_into(Op op, std::unique_ptr<SmBrep>& a, std::unique_ptr<SmBrep
     return SM_SUCCESS;
 }
 
+// Replaces the brep's faces with work's, in place, so the caller's handle
+// stays good. MergeBrep rather than CopyFaces, which classifies regions again
+// and can turn the solid inside out (a vent cut along a moved face).
+sm_status take_faces(SmBrep& brep, SmBrep& work) {
+    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
+    SmTArray<SmFace*> old_faces;
+    brep.GetFaces(old_faces);
+    const sm_status status = static_cast<sm_status>(brep.RemoveFaces(old_faces));
+    if (status != SM_SUCCESS) return status;
+    return static_cast<sm_status>(brep.MergeBrep(work, NULL, NULL, FALSE));
+}
+
 // Marks a picked face through the booleans that set obstacles aside.
 const ULONG PICK_ATTRIBUTE_ID = 0x534d504b;  // "SMPK"
 
@@ -3591,18 +3604,167 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     // with the pushed face) would come back on its own.
     if (shell_count(*work) != shell_count(brep)) return SM_SHIM_ERR_OBSTRUCTED;
 
-    // MergeBrep rather than CopyFaces, which classifies regions again and
-    // can turn the solid inside out (a vent cut along a moved face).
-    SmTemporaryChangeValue<SmBoolean> editing(brep.m_bEditingEnabled, TRUE);
-    SmTArray<SmFace*> old_faces;
-    brep.GetFaces(old_faces);
-    if ((status = static_cast<sm_status>(brep.RemoveFaces(old_faces))) != SM_SUCCESS) return status;
-    return static_cast<sm_status>(brep.MergeBrep(*work, NULL, NULL, FALSE));
+    return take_faces(brep, *work);
+}
+
+// Steps. A picked face beside an unpicked face on its own surface, as the two
+// pieces of a face an imprint splits are, can't stretch that neighbour to
+// meet it: the neighbour's surface runs alongside the face's new place and
+// never reaches it. The move needs a new face there, a step wall swept along
+// the edge between them, and the offset executive never makes faces.
+//
+// For planar faces all moving one way, the step is what sweeping the faces
+// along the move into prisms and joining them (pulled out) or cutting them
+// (pushed in) makes, as long as every other neighbour stands along the move:
+// then each prism side beside one lies on its surface and merges into it,
+// stretched or trimmed as the offset would. The prisms must add or take
+// exactly their own volume; anything else means the move runs into
+// something, and it's refused rather than cut through.
+
+// How much of the prisms' own volume a step may add or take beyond them:
+// well past the 1e-8 volumes are found to, and far short of any
+// obstruction worth the name.
+const double STEP_VOLUME_TOLERANCE = 1e-6;
+
+// Whether two faces lie on one surface: the same surface, the same plane, or
+// the same cylinder, sphere or torus.
+bool same_surface(const SmFace* a, const SmFace* b, double tolerance) {
+    const SmSurface* first = a->GetSurface();
+    const SmSurface* second = b->GetSurface();
+    if (!first || !second) return false;
+    if (first == second) return true;
+    SmPoint3d point_a, point_b;
+    SmVector3d normal_a, normal_b;
+    const bool planar_a = plane_of(first, point_a, normal_a);
+    const bool planar_b = plane_of(second, point_b, normal_b);
+    if (planar_a || planar_b) {
+        return planar_a && planar_b && 1.0 - std::fabs(normal_a.Dot(normal_b)) < 1e-12 &&
+               std::fabs((point_b - point_a).Dot(normal_a)) <= tolerance;
+    }
+    const sm_face_info info_a = describe_face(a);
+    const sm_face_info info_b = describe_face(b);
+    if (info_a.kind != info_b.kind || std::fabs(info_a.radius - info_b.radius) > tolerance ||
+        std::fabs(info_a.minor_radius - info_b.minor_radius) > tolerance) {
+        return false;
+    }
+    const SmVector3d axis(info_a.axis[0], info_a.axis[1], info_a.axis[2]);
+    const SmVector3d other_axis(info_b.axis[0], info_b.axis[1], info_b.axis[2]);
+    const SmVector3d apart(info_b.origin[0] - info_a.origin[0], info_b.origin[1] - info_a.origin[1],
+                           info_b.origin[2] - info_a.origin[2]);
+    switch (info_a.kind) {
+        case SM_SURFACE_CYLINDER:
+            return 1.0 - std::fabs(axis.Dot(other_axis)) < 1e-12 &&
+                   (apart - axis * apart.Dot(axis)).Length() <= tolerance;
+        case SM_SURFACE_SPHERE:
+            return apart.Length() <= tolerance;
+        case SM_SURFACE_TORUS:
+            return 1.0 - std::fabs(axis.Dot(other_axis)) < 1e-12 && apart.Length() <= tolerance;
+        default:
+            return false;
+    }
+}
+
+// Whether a picked face meets an unpicked face on its own surface.
+bool needs_steps(const SmTArray<SmFace*>& picked, double tolerance) {
+    std::unordered_set<const SmFace*> moving;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) moving.insert(picked[i]);
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        for (const SmFace* other : neighbours_of(picked[i])) {
+            if (!moving.count(other) && same_surface(picked[i], other, tolerance)) return true;
+        }
+    }
+    return false;
+}
+
+sm_status brep_volume(SmBrep& brep, double& volume) {
+    return static_cast<sm_status>(SmApiBrepComputeVolume(&brep, 1e-8, volume));
+}
+
+// How much of the prisms a step would add or take that isn't theirs: what of
+// them lies inside the part when pulled out, or outside it when pushed in.
+// Booleans with the small prisms first, so only what's left, usually nothing,
+// is measured, not the whole part.
+sm_status step_overlap(const SmBrep& brep, const SmBrep& tool, bool pulled, double& overlap) {
+    overlap = 0.0;
+    std::unique_ptr<SmBrep> part;
+    std::unique_ptr<SmBrep> prisms;
+    sm_status status = SM_SUCCESS;
+    if ((status = copy_of(brep, part)) != SM_SUCCESS || (status = copy_of(tool, prisms)) != SM_SUCCESS) return status;
+    status = pulled ? boolean_into(SmApiBooleanIntersection, prisms, std::move(part))
+                    : boolean_into(SmApiBooleanDifference, prisms, std::move(part));
+    if (status != SM_SUCCESS || prisms->GetNumFaces() == 0) return status;
+    return brep_volume(*prisms, overlap);
+}
+
+// The move with step walls (see above). SM_SHIM_ERR_UNSUPPORTED_STEP when a
+// picked face isn't planar, they don't all face one way, or a neighbour that
+// isn't on a picked face's own surface doesn't stand along the move;
+// SM_SHIM_ERR_OBSTRUCTED when the prisms reach into the part pulled out, or
+// out of it pushed in, so wouldn't add or take exactly their own volume.
+// The moved faces keep their labels; the walls have none.
+sm_status offset_with_steps(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance) {
+    const double tolerance = brep.GetTolerance();
+    std::unordered_set<const SmFace*> moving;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) moving.insert(picked[i]);
+    SmVector3d move;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        double outward[3];
+        if (!outward_plane(picked[i], outward)) return SM_SHIM_ERR_UNSUPPORTED_STEP;
+        const SmVector3d normal(outward[0], outward[1], outward[2]);
+        if (i == 0) {
+            move = normal;
+        } else if (normal.Dot(move) < 1.0 - 1e-12) {
+            return SM_SHIM_ERR_UNSUPPORTED_STEP;
+        }
+        for (const SmFace* other : neighbours_of(picked[i])) {
+            if (moving.count(other) || same_surface(picked[i], other, tolerance)) continue;
+            if (!other->GetSurface() || !invariant_under(other->GetSurface(), move)) {
+                return SM_SHIM_ERR_UNSUPPORTED_STEP;
+            }
+        }
+    }
+
+    std::unique_ptr<SmBrep> tool;
+    sm_status status = SM_SUCCESS;
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        SmBrep* swept = nullptr;
+        std::vector<sm_swept_face> roles;
+        if ((status = sweep_face(brep, picked[i], distance, swept, roles)) != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> prism(swept);
+        // The prism's far end is the face where it moved to.
+        SmTArray<SmFace*> faces;
+        prism->GetFaces(faces);
+        for (ULONG f = 0; f < faces.GetSize(); ++f) {
+            if (roles[f].role == SM_SWEPT_END) write_label(*faces[f], read_label(picked[i]));
+        }
+        if (!tool) {
+            tool = std::move(prism);
+        } else if ((status = boolean_into(SmApiBooleanUnion, tool, std::move(prism))) != SM_SUCCESS) {
+            return status;
+        }
+    }
+    double swept = 0.0;
+    double overlap = 0.0;
+    if ((status = brep_volume(*tool, swept)) != SM_SUCCESS ||
+        (status = step_overlap(brep, *tool, distance > 0.0, overlap)) != SM_SUCCESS) {
+        return status;
+    }
+    if (std::fabs(overlap) > STEP_VOLUME_TOLERANCE * swept) return SM_SHIM_ERR_OBSTRUCTED;
+    std::unique_ptr<SmBrep> work;
+    if ((status = copy_of(brep, work)) != SM_SUCCESS) return status;
+    status = distance > 0.0 ? boolean_into(SmApiBooleanUnion, work, std::move(tool))
+                            : boolean_into(SmApiBooleanDifference, work, std::move(tool));
+    if (status != SM_SUCCESS) return status;
+    if ((status = check_solid(*work)) != SM_SUCCESS) return status;
+    if (shell_count(*work) != shell_count(brep)) return SM_SHIM_ERR_OBSTRUCTED;
+    return take_faces(brep, *work);
 }
 
 // The offset with whatever it runs into cut through, or as before when
-// nothing is in its way.
+// nothing is in its way; with step walls where a face moves away from
+// another piece of its own surface.
 sm_status offset_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance) {
+    if (needs_steps(picked, brep.GetTolerance())) return offset_with_steps(brep, picked, distance);
     Motions motions;
     std::vector<Obstacle> obstacles;
     std::vector<Plug> plugs;
@@ -4873,5 +5035,163 @@ sm_surface_caches* sm_surface_caches_new(void) { return new (std::nothrow) sm_su
 size_t sm_surface_caches_count(const sm_surface_caches* caches) { return caches ? caches->count() : 0; }
 
 void sm_surface_caches_free(sm_surface_caches* caches) { delete caches; }
+
+}  // extern "C"
+
+// Imprinting. SmApiBooleanWithOptions can imprint, but it deletes the tool
+// or keeps it without saying which of its faces each new edge lies on, and
+// it can't classify faces and imprint without the rest of the boolean. So
+// this drives SmMerge as it does, keeping the tool until the edges' mates on
+// it have been read.
+
+namespace {
+
+// The labels of the faces an edge of the tool lies on, at most two, each
+// once, in the order the edge lists its faces.
+void tool_face_labels(const SmEdge* edge, sm_label out[2]) {
+    std::memset(out, 0, 2 * sizeof(sm_label));
+    SmTArray<SmFace*> faces;
+    edge->GetFaces(faces);
+    size_t written = 0;
+    for (ULONG i = 0; i < faces.GetSize() && written < 2; ++i) {
+        const sm_label label = read_label(faces[i]);
+        if (!label.present) continue;
+        if (written == 1 && std::memcmp(&out[0], &label, sizeof label) == 0) continue;
+        out[written++] = label;
+    }
+}
+
+// Takes the classifying merge's marks off a brep: SM_AI_BOOLEAN_SAVE and
+// SM_AI_BOOLEAN_DELETE on faces, SM_AI_BOOLEAN_INTERSECT on edges and
+// vertices.
+void unmark_merge(SmBrep& brep) {
+    const auto unmark = [](SmAObject* object, ULONG id) {
+        while (SmAttribute* mark = object->FindAttribute(id)) object->RemoveAttribute(mark);
+    };
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        unmark(faces[i], SM_AI_BOOLEAN_SAVE);
+        unmark(faces[i], SM_AI_BOOLEAN_DELETE);
+    }
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) unmark(edges[i], SM_AI_BOOLEAN_INTERSECT);
+    SmTArray<SmVertex*> vertices;
+    brep.GetVertices(vertices);
+    for (ULONG i = 0; i < vertices.GetSize(); ++i) unmark(vertices[i], SM_AI_BOOLEAN_INTERSECT);
+}
+
+// Marks every edge of a brep before an imprint, so the edges it adds are
+// the ones without the mark; split edges pass it to both pieces.
+const ULONG OLD_EDGE_ATTRIBUTE_ID = 0x534d4f45;  // "SMOE"
+
+void mark_edges(SmBrep& brep) {
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        edges[i]->AddAttribute(new (*edges[i]->GetContext()) SmGenericAttribute(
+            OLD_EDGE_ATTRIBUTE_ID, SM_AB_COPY, SmTArray<long>(), SmTArray<double>(), SmTArray<char>()));
+    }
+}
+
+void unmark_edges(SmBrep& brep) {
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        while (SmAttribute* mark = edges[i]->FindAttribute(OLD_EDGE_ATTRIBUTE_ID)) edges[i]->RemoveAttribute(mark);
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+sm_status sm_brep_imprint(sm_brep* brep, sm_brep* tool, int32_t classify, sm_brep** out, sm_imprint_edge** edges,
+                          size_t* edge_count, uint8_t** inside, size_t* face_count) {
+    if (!brep || !tool || !out || !edges || !edge_count || !inside || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (brep == tool) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmBrep* other = brep_of(tool);
+        std::vector<sm_imprint_edge> along;
+        std::vector<uint8_t> in;
+        mark_edges(*target);
+        {
+            // Imprinting stops before the boolean deletes any face or merges
+            // faces on one surface; classifying goes on to sort the faces as
+            // an intersection would keep them, marking them instead.
+            SmMergeOptions options(FALSE, classify ? FALSE : TRUE, FALSE, classify ? TRUE : FALSE, TRUE);
+            SmMerge merge(*SmApiGetOrCreateContext(), target, other, 0, 0, &options);
+            const SmBooleanOperationType operation = classify ? SM_BO_INTERSECTION : SM_BO_IMPRINT;
+            SmBrep* result = nullptr;
+            const SmStatus status = target->IsManifoldSolid() && other->IsManifoldSolid()
+                                        ? merge.ManifoldBoolean(operation, result)
+                                        : merge.NonManifoldBoolean(operation, result);
+            if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+            if (result != target) return static_cast<sm_status>(SM_ERR);
+
+            SmTArray<SmEdge*> common;
+            SmTArray<SmEdge*> mates;
+            merge.GetTopologyIntersector().GetCommonEdges(common, mates);
+            SmTArray<SmEdge*> all;
+            target->GetEdges(all);
+            std::unordered_map<const SmEdge*, size_t> index;
+            for (ULONG i = 0; i < all.GetSize(); ++i) index.emplace(all[i], i);
+            SmTArray<SmEdge*> tool_edges;
+            other->GetEdges(tool_edges);
+            std::unordered_set<const SmEdge*> on_tool;
+            for (ULONG i = 0; i < tool_edges.GetSize(); ++i) on_tool.insert(tool_edges[i]);
+            for (ULONG i = 0; i < common.GetSize(); ++i) {
+                const auto found = index.find(common[i]);
+                if (found == index.end() || !on_tool.count(mates[i])) continue;
+                sm_imprint_edge edge;
+                std::memset(&edge, 0, sizeof edge);
+                edge.edge = found->second;
+                edge.is_new = common[i]->FindAttribute(OLD_EDGE_ATTRIBUTE_ID) == NULL ? 1 : 0;
+                tool_face_labels(mates[i], edge.tool_faces);
+                along.push_back(edge);
+            }
+            std::sort(along.begin(), along.end(),
+                      [](const sm_imprint_edge& a, const sm_imprint_edge& b) { return a.edge < b.edge; });
+
+            if (classify) {
+                SmTArray<SmFace*> faces;
+                target->GetFaces(faces);
+                for (ULONG i = 0; i < faces.GetSize(); ++i) {
+                    in.push_back(faces[i]->FindAttribute(SM_AI_BOOLEAN_SAVE) != NULL ? 1 : 0);
+                }
+                unmark_merge(*target);
+            }
+            unmark_edges(*target);
+        }
+        std::unique_ptr<sm_imprint_edge[]> edge_array(new sm_imprint_edge[along.size()]);
+        std::copy(along.begin(), along.end(), edge_array.get());
+        std::unique_ptr<uint8_t[]> inside_array(in.empty() ? nullptr : new uint8_t[in.size()]);
+        std::copy(in.begin(), in.end(), inside_array.get());
+        delete other;
+        *out = brep;
+        *edges = edge_array.release();
+        *edge_count = along.size();
+        *inside = inside_array.release();
+        *face_count = in.size();
+        return SM_SUCCESS;
+    });
+}
+
+void sm_imprint_free(sm_imprint_edge* edges, uint8_t* inside) {
+    delete[] edges;
+    delete[] inside;
+}
+
+sm_status sm_brep_merge_faces_keeping(sm_brep* brep, const uint32_t* keep, size_t count) {
+    if (!brep || (count > 0 && !keep)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmTArray<SmEdge*> kept;
+        if (edges_at(*target, keep, count, kept) != SM_SUCCESS) return SM_SHIM_ERR_BAD_EDGE;
+        return static_cast<sm_status>(target->RemoveTopologicalEdgesAndVertices(&kept));
+    });
+}
 
 }  // extern "C"
