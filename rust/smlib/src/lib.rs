@@ -15,7 +15,8 @@
 //! swept along paths into pipes ([`Brep::pipe`]). [`Brep::shell`] hollows a
 //! solid, leaving chosen faces open. [`Brep::offset_faces`]
 //! moves faces along their normals, extending or trimming their neighbours,
-//! as Parasolid's face offset does. Faces and edges can carry a [`Label`] that the kernel keeps
+//! as Parasolid's face offset does, and [`Brep::move_faces`] moves or turns
+//! them rigidly the same way. Faces and edges can carry a [`Label`] that the kernel keeps
 //! through every later operation.
 //!
 //! The kernel is unit-agnostic; lengths are in whatever unit the model uses.
@@ -49,6 +50,7 @@ mod imprint;
 mod kernel;
 mod label;
 mod mesh;
+mod motion;
 mod pipe;
 mod shell;
 mod tessellation;
@@ -65,6 +67,7 @@ pub use imprint::{Imprint, ImprintEdge};
 pub use kernel::Kernel;
 pub use label::{Label, LabelMatch, MAX_ROLE_LEN};
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};
+pub use motion::{Moved, MovedFace, RigidMotion, Turn};
 pub use pipe::{Pipe, PipeFace};
 pub use shell::{Shell, ShellFace};
 pub use tessellation::{FaceKey, SurfaceCaches, Tessellation};

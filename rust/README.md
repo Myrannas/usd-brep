@@ -4,7 +4,7 @@
   the `cc` crate, plus a C shim (`smlib-sys/shim`), and exposes the shim through
   committed bindgen bindings.
 - `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, booleans,
-  face sweeps, face offsets, face merging, fillets, chamfers, volume, manifold
+  face sweeps, face offsets, rigid face moves, face merging, fillets, chamfers, volume, manifold
   check, face and edge queries, labels) and `Mesh`, a tessellation that keeps its links to
   the B-rep: per-triangle face ids, per-vertex surface (u, v), per-face
   surface parameters, per-edge polylines, and every face's and edge's label.
@@ -155,6 +155,30 @@ frustums and rings.
 ```sh
 cargo run --release -p smlib --example offset_face   # timings
 ```
+
+## Moving faces
+
+`Brep::move_faces(faces, motion)` moves the faces at the given indices by a
+`RigidMotion`: an optional `Turn` about an axis through a point (degrees,
+anticlockwise looking down the axis from its tip), then a translation. Every
+other neighbour is extended or trimmed along its own surface to meet them,
+on the same local operation as `offset_faces`, so a face can lean at any
+angle (tilted panels, angled facets, a draft one wall at a time) and a
+feature's faces moved together slide it across the face it stands on. A
+planar face moved within its own plane stays where it is.
+
+A translation carries the blends on the moved faces as an offset does,
+each sliding the shortest way that keeps it tangent to its neighbours; a
+turn can't, and a round on a turned face is refused. Faces and edges keep
+their order and labels, and `Moved::faces` says what happened to each:
+`Moved`, `Carried` (a blend slid with them), `Followed` (extended or
+trimmed to meet them) or `Kept`. The result is checked as an offset's is.
+When the faces round the moved ones can't reach them (one would vanish or
+cross another, the solid wouldn't close, a round can't follow, or the
+kernel finds no way to meet them) the move is refused with
+`Error::InvalidArgument`, its reason starting "the faces round them can't
+reach them". A turned cylinder comes back open and is refused; turned
+planes are exact. Nothing in the way is pushed through.
 
 ## Face-by-face tessellation
 

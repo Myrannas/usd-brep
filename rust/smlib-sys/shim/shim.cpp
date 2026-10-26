@@ -1335,6 +1335,10 @@ struct Motion {
     };
     Kind kind = kKept;
     SmVector3d shift = SmVector3d(0.0, 0.0, 0.0);
+    // A rigid move's turn, for the faces sm_brep_move_faces turns: a kShift
+    // face's points then go to turn * p + shift. Offsets never turn.
+    bool turned = false;
+    double turn[3][3] = {{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}};
 };
 
 using Motions = std::unordered_map<const SmFace*, Motion>;
@@ -1342,6 +1346,46 @@ using Motions = std::unordered_map<const SmFace*, Motion>;
 Motion motion_of(const Motions& motions, const SmFace* face) {
     const auto found = motions.find(face);
     return found == motions.end() ? Motion() : found->second;
+}
+
+// A direction after the motion's turn.
+SmVector3d turned_vector(const Motion& motion, const SmVector3d& v) {
+    if (!motion.turned) return v;
+    const double(&r)[3][3] = motion.turn;
+    return SmVector3d(r[0][0] * v.x + r[0][1] * v.y + r[0][2] * v.z, r[1][0] * v.x + r[1][1] * v.y + r[1][2] * v.z,
+                      r[2][0] * v.x + r[2][1] * v.y + r[2][2] * v.z);
+}
+
+// Where the motion takes a point.
+SmPoint3d moved_point(const Motion& motion, const SmPoint3d& p) {
+    if (!motion.turned) return p + motion.shift;
+    const SmVector3d turned = turned_vector(motion, SmVector3d(p.x, p.y, p.z));
+    return SmPoint3d(turned.x, turned.y, turned.z) + motion.shift;
+}
+
+// The motion as a placement for SmSurface::Transform and SmCurve::Transform,
+// which take a point p to origin + p.x X + p.y Y + p.z Z.
+SmAxis2Placement placement_of(const Motion& motion) {
+    SmAxis2Placement placement;
+    if (!motion.turned) {
+        placement.Translate(motion.shift);
+        return placement;
+    }
+    const SmVector3d x = turned_vector(motion, SmVector3d(1.0, 0.0, 0.0));
+    const SmVector3d y = turned_vector(motion, SmVector3d(0.0, 1.0, 0.0));
+    return SmAxis2Placement(SmPoint3d(motion.shift.x, motion.shift.y, motion.shift.z), x, y);
+}
+
+// Whether two rigid motions are the same, to 1e-12.
+bool same_motion(const Motion& a, const Motion& b) {
+    if (a.kind == Motion::kOffset || b.kind == Motion::kOffset) return false;
+    if ((a.shift - b.shift).Length() > 1e-12) return false;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            if (std::fabs(a.turn[r][c] - b.turn[r][c]) > 1e-12) return false;
+        }
+    }
+    return true;
 }
 
 // One linear condition on a blend's translation v: normal . v == value.
@@ -1409,6 +1453,8 @@ sm_status outward_normal_inside(const SmFace* face, SmPoint3d& inside, SmVector3
     return SM_SUCCESS;
 }
 
+sm_status carry_blends(const SmTArray<SmFace*>& picked, double tolerance, double slack, Motions& motions);
+
 // Works out how every face changes when the picked faces move `distance`
 // along their outward normals:
 //
@@ -1452,8 +1498,14 @@ sm_status plan_offset(const SmTArray<SmFace*>& picked, double distance, double t
         }
         motions[picked[i]] = motion;
     }
+    return carry_blends(picked, tolerance, tolerance * (1.0 + std::fabs(distance)), motions);
+}
 
-    const double slack = tolerance * (1.0 + std::fabs(distance));
+// The blends joined to the picked faces through smooth edges, placed as
+// plan_offset says, given the picked faces' motions; `slack` is how far a
+// blend may miss a neighbour. A blend on a turned face can't follow it by
+// sliding, and is refused, as on a picked curved face.
+sm_status carry_blends(const SmTArray<SmFace*>& picked, double tolerance, double slack, Motions& motions) {
     std::vector<SmFace*> blends;
     std::vector<SmFace*> layer;
     for (ULONG i = 0; i < picked.GetSize(); ++i) layer.push_back(picked[i]);
@@ -1465,11 +1517,11 @@ sm_status plan_offset(const SmTArray<SmFace*>& picked, double distance, double t
             const Motion moving = motion_of(motions, face);
             for (SmFace* other : smooth_neighbours(face)) {
                 if (seen[other] || !is_blend(other, tolerance)) continue;
-                if (moving.kind == Motion::kShift && moving.shift.Length() > 0.0 &&
+                if (moving.kind == Motion::kShift && !moving.turned && moving.shift.Length() > 0.0 &&
                     invariant_under(other->GetSurface(), moving.shift / moving.shift.Length())) {
                     continue;
                 }
-                if (moving.kind == Motion::kOffset) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+                if (moving.kind == Motion::kOffset || moving.turned) return SM_SHIM_ERR_UNSUPPORTED_FACE;
                 seen[other] = true;
                 next.push_back(other);
             }
@@ -1484,7 +1536,7 @@ sm_status plan_offset(const SmTArray<SmFace*>& picked, double distance, double t
                                      (is_blend(other, tolerance) && !seen[other] && motions.count(other) == 0);
                 if (pending) continue;
                 const Motion motion = motion_of(motions, other);
-                if (motion.kind == Motion::kOffset) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+                if (motion.kind == Motion::kOffset || motion.turned) return SM_SHIM_ERR_UNSUPPORTED_FACE;
                 tangency_rows(other->GetSurface(), motion.shift, rows);
             }
             Motion motion;
@@ -1502,7 +1554,7 @@ sm_status plan_offset(const SmTArray<SmFace*>& picked, double distance, double t
         const SmVector3d v = motions[blend].shift;
         for (SmFace* other : smooth_neighbours(blend)) {
             const Motion motion = motion_of(motions, other);
-            if (motion.kind == Motion::kOffset) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+            if (motion.kind == Motion::kOffset || motion.turned) return SM_SHIM_ERR_UNSUPPORTED_FACE;
             std::vector<Row> rows;
             tangency_rows(other->GetSurface(), motion.shift, rows);
             for (const Row& row : rows) {
@@ -1536,6 +1588,41 @@ sm_status translated_surface(const SmFace* face, const SmVector3d& shift, SmSurf
         double low = band.GetVMin() - 2.0 * slide;
         double high = band.GetVMax() + 2.0 * slide;
         // Never past the apex.
+        SmBoolean cylinder = FALSE;
+        SmPoint3d apex;
+        double apex_height = 0.0;
+        if (cone->GetApex(cylinder, apex, apex_height) == SM_SUCCESS) {
+            if (apex_height <= band.GetVMin()) low = std::max(low, apex_height);
+            if (apex_height >= band.GetVMax()) high = std::min(high, apex_height);
+        }
+        band.SetMinMax(band.GetUMin(), low, band.GetUMax(), high);
+        status = cone->AdjustSTEPUVDomain(band);
+    }
+    if (status != SM_SUCCESS) {
+        delete moved;
+        return status;
+    }
+    out = moved;
+    return SM_SUCCESS;
+}
+
+// A copy of the face's surface moved rigidly: translated_surface for a
+// translation, and for a turn the surface turned and moved, a cone's band
+// widened by `reach` on both sides (as a slid cone's is), never past its
+// apex.
+sm_status moved_surface(const SmFace* face, const Motion& motion, double reach, SmSurface*& out) {
+    if (!motion.turned) return translated_surface(face, motion.shift, out);
+    const SmSurface* surface = face->GetSurface();
+    if (!surface) return SM_SHIM_ERR_UNSUPPORTED_FACE;
+    SmSurface* moved = nullptr;
+    SmStatus status = surface->Copy(*SmApiGetOrCreateContext(), moved);
+    if (status != SM_SUCCESS) return status;
+    status = moved->Transform(placement_of(motion));
+    if (status == SM_SUCCESS && moved->GetType() == SmCone_TYPE && !static_cast<SmCone*>(moved)->IsCylinder()) {
+        SmCone* cone = static_cast<SmCone*>(moved);
+        SmExtent2d band = moved->GetSTEPUVDomain();
+        double low = band.GetVMin() - 2.0 * reach;
+        double high = band.GetVMax() + 2.0 * reach;
         SmBoolean cylinder = FALSE;
         SmPoint3d apex;
         double apex_height = 0.0;
@@ -1595,10 +1682,18 @@ sm_status offset_surface(const SmFace* face, double distance, double tolerance, 
 // would put it: the motion is `shift`, or the difference moves the surface
 // within itself.
 bool lands_like(const SmFace* face, const Motion& motion, const SmVector3d& shift) {
-    if (motion.kind == Motion::kOffset) return false;
+    if (motion.kind == Motion::kOffset || motion.turned) return false;
     const SmVector3d difference = shift - motion.shift;
     const double length = difference.Length();
     return length <= 1e-12 || invariant_under(face->GetSurface(), difference / length);
+}
+
+// The same for a rigid motion that may turn: a turned one lands alike only
+// as the same motion.
+bool lands_like(const SmFace* face, const Motion& motion, const Motion& candidate) {
+    if (motion.kind == Motion::kOffset || candidate.kind == Motion::kOffset) return false;
+    if (!motion.turned && !candidate.turned) return lands_like(face, motion, candidate.shift);
+    return same_motion(motion, candidate);
 }
 
 // SmBrep::LocalOperation's geometry, except for edges that move rigidly.
@@ -1645,8 +1740,9 @@ public:
     }
 
 private:
-    // The v the edge moves rigidly by, tried as each of its faces' shifts.
-    bool rigid_shift(const SmEdge* edge, SmVector3d& out) const {
+    // The motion the edge moves rigidly by, tried as each of its faces'
+    // motions.
+    bool rigid_motion(const SmEdge* edge, Motion& out) const {
         std::vector<const SmFace*> around;
         const SmVertex* ends[2] = {edge->GetStartVertex(), edge->GetOtherVertex(edge->GetStartVertex())};
         for (const SmVertex* end : ends) {
@@ -1662,10 +1758,10 @@ private:
             if (candidate.kind == Motion::kOffset) return false;
             bool rigid = true;
             for (const SmFace* face : around) {
-                rigid = rigid && lands_like(face, motion_of(m_motions, face), candidate.shift);
+                rigid = rigid && lands_like(face, motion_of(m_motions, face), candidate);
             }
             if (rigid) {
-                out = candidate.shift;
+                out = candidate;
                 return true;
             }
         }
@@ -1809,14 +1905,17 @@ private:
         return ready;
     }
 
-    // Puts the original edge moved by `shift` on every copy of `edge` whose
-    // face didn't itself move by `shift`.
-    bool move_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge, const SmVector3d& shift) {
-        SmAxis2Placement placement;
-        placement.Translate(shift);
+    // Puts the original edge moved by `motion` on every copy of `edge` whose
+    // face didn't itself move by `motion`.
+    bool move_copies(const SmContext& context, SmOffsetExecutive* executive, SmEdge* edge, const Motion& motion) {
+        const SmAxis2Placement placement = placement_of(motion);
         return replace_copies(
             context, executive, edge,
-            [&](const SmFace* face) { return (motion_of(m_motions, face).shift - shift).Length() > 1e-12; },
+            [&](const SmFace* face) {
+                const Motion own = motion_of(m_motions, face);
+                if (!own.turned && !motion.turned) return (own.shift - motion.shift).Length() > 1e-12;
+                return !same_motion(own, motion);
+            },
             [&](const SmEdgeuse* original) {
                 SmBSplineCurve* moved = original->GetEdge()->CreateTrimmedNURBSCurve(context);
                 if (moved && moved->Transform(placement) != SM_SUCCESS) {
@@ -1905,9 +2004,9 @@ private:
         SmTArray<SmEdge*> edges;
         brep->GetEdges(edges);
         for (ULONG i = 0; i < edges.GetSize(); ++i) {
-            SmVector3d shift;
-            const bool rigid = rigid_shift(edges[i], shift);
-            if (rigid ? !move_copies(context, executive, edges[i], shift) : !stretch_copies(context, executive, edges[i])) {
+            Motion motion;
+            const bool rigid = rigid_motion(edges[i], motion);
+            if (rigid ? !move_copies(context, executive, edges[i], motion) : !stretch_copies(context, executive, edges[i])) {
                 continue;
             }
             m_moved.insert(edges[i]);
@@ -1954,10 +2053,10 @@ private:
             const Motion candidate = motion_of(m_motions, around[j]);
             bool lands = true;
             for (ULONG k = 0; k < around.GetSize() && lands; ++k) {
-                lands = lands_like(around[k], motion_of(m_motions, around[k]), candidate.shift);
+                lands = lands_like(around[k], motion_of(m_motions, around[k]), candidate);
             }
             if (lands) {
-                out = old + candidate.shift;
+                out = moved_point(candidate, old);
                 return true;
             }
         }
@@ -1966,8 +2065,13 @@ private:
             SmPoint3d point;
             SmVector3d normal;
             if (!plane_of(around[j]->GetSurface(), point, normal)) continue;
-            const SmVector3d shift = motion_of(m_motions, around[j]).shift;
-            rows.push_back({normal, normal.Dot(point + shift)});
+            const Motion motion = motion_of(m_motions, around[j]);
+            if (!motion.turned) {
+                rows.push_back({normal, normal.Dot(point + motion.shift)});
+                continue;
+            }
+            const SmVector3d turned = turned_vector(motion, normal);
+            rows.push_back({turned, turned.Dot(moved_point(motion, point))});
         }
         SmTArray<SmEdge*> edges;
         vertex->GetEdges(edges);
@@ -1978,15 +2082,16 @@ private:
             if (!sides.faces[0] || !sides.faces[1]) continue;
             for (const SmFace* side : sides.faces) {
                 const Motion candidate = motion_of(m_motions, side);
-                if (!lands_like(sides.faces[0], motion_of(m_motions, sides.faces[0]), candidate.shift) ||
-                    !lands_like(sides.faces[1], motion_of(m_motions, sides.faces[1]), candidate.shift)) {
+                if (!lands_like(sides.faces[0], motion_of(m_motions, sides.faces[0]), candidate) ||
+                    !lands_like(sides.faces[1], motion_of(m_motions, sides.faces[1]), candidate)) {
                     continue;
                 }
-                SmVector3d across = std::fabs(direction.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
-                across = across - direction * across.Dot(direction);
+                const SmVector3d along = turned_vector(candidate, direction);
+                SmVector3d across = std::fabs(along.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
+                across = across - along * across.Dot(along);
                 across = across / across.Length();
-                const SmVector3d other = direction * across;  // cross product
-                const SmPoint3d through = old + candidate.shift;
+                const SmVector3d other = along * across;  // cross product
+                const SmPoint3d through = moved_point(candidate, old);
                 rows.push_back({across, across.Dot(through)});
                 rows.push_back({other, other.Dot(through)});
                 break;
@@ -2282,6 +2387,100 @@ sm_status offset_faces(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
         surfaces.Add(surface);
     }
     return rigid_local_operation(brep, changed, surfaces, motions, reach);
+}
+
+// Moving faces rigidly (sm_brep_move_faces).
+//
+// The picked faces all take one rigid motion: their surfaces are moved, and
+// turned when it turns, and every other neighbour is extended or trimmed
+// along its own surface to meet them, as an offset's are, through the same
+// local operation. A translation carries the blends on them as an offset
+// does (carry_blends): a round between a moved face and a kept one slides to
+// stay tangent to both, and one the move leaves in place stretches. A blend
+// on a turned face can't follow it by sliding and is refused.
+
+// The motion every face takes when the picked ones take `rigid`: `rigid`
+// for them, and for the blends carry_blends places their slides.
+sm_status plan_move(const SmTArray<SmFace*>& picked, const Motion& rigid, double tolerance, Motions& motions) {
+    for (ULONG i = 0; i < picked.GetSize(); ++i) motions[picked[i]] = rigid;
+    return carry_blends(picked, tolerance, tolerance * (1.0 + rigid.shift.Length()), motions);
+}
+
+// How far the motion takes any point of the face: the most it takes a corner
+// of the face's bounding box, which bounds it (the distance moved is convex
+// in the point).
+double displacement(const SmFace* face, const Motion& motion) {
+    if (!motion.turned) return motion.shift.Length();
+    SmExtent3d box;
+    if (face->CalculateBoundingBox(box) != SM_SUCCESS) return motion.shift.Length();
+    const SmPoint3d low = box.GetMin();
+    const SmPoint3d high = box.GetMax();
+    double most = 0.0;
+    for (int corner = 0; corner < 8; ++corner) {
+        const SmPoint3d p((corner & 1) ? high.x : low.x, (corner & 2) ? high.y : low.y, (corner & 4) ? high.z : low.z);
+        most = std::max(most, (moved_point(motion, p) - p).Length());
+    }
+    return most;
+}
+
+// Moves every face plan_move moved, re-intersecting every other neighbour
+// along its own surface.
+sm_status move_planned(SmBrep& brep, const Motions& motions) {
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    double reach = 0.0;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const Motion motion = motion_of(motions, faces[i]);
+        if (motion.kind == Motion::kShift) reach = std::max(reach, displacement(faces[i], motion));
+    }
+    SmTArray<SmFace*> changed;
+    SmTArray<SmSurface*> surfaces;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const Motion motion = motion_of(motions, faces[i]);
+        if (motion.kind != Motion::kShift) continue;
+        SmSurface* surface = nullptr;
+        const sm_status result = moved_surface(faces[i], motion, reach, surface);
+        if (result != SM_SUCCESS) {
+            for (ULONG j = 0; j < surfaces.GetSize(); ++j) delete surfaces[j];
+            return result;
+        }
+        changed.Add(faces[i]);
+        surfaces.Add(surface);
+    }
+    return rigid_local_operation(brep, changed, surfaces, motions, reach);
+}
+
+// What each face of the brep is to a move planned as `motions`
+// (sm_move_role): moved, carried (a blend that slides with them), followed
+// (sharing a vertex with a face that moves, so its boundary changes) or kept.
+std::vector<uint8_t> move_roles(const SmBrep& brep, const SmTArray<SmFace*>& picked, const Motions& motions) {
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    std::unordered_set<const SmFace*> moving;
+    std::unordered_set<const SmFace*> touched;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (motion_of(motions, faces[i]).kind == Motion::kKept) continue;
+        moving.insert(faces[i]);
+        SmTArray<SmVertex*> vertices;
+        faces[i]->GetVertices(vertices);
+        for (ULONG v = 0; v < vertices.GetSize(); ++v) {
+            SmTArray<SmFace*> around;
+            vertices[v]->GetFaces(around);
+            for (ULONG a = 0; a < around.GetSize(); ++a) touched.insert(around[a]);
+        }
+    }
+    std::vector<uint8_t> roles(faces.GetSize(), SM_MOVE_KEPT);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        ULONG index = 0;
+        if (picked.FindElement(faces[i], index)) {
+            roles[i] = SM_MOVE_MOVED;
+        } else if (moving.count(faces[i])) {
+            roles[i] = SM_MOVE_CARRIED;
+        } else if (touched.count(faces[i])) {
+            roles[i] = SM_MOVE_FOLLOWED;
+        }
+    }
+    return roles;
 }
 
 // Moving a face through what stands in its way.
@@ -4289,6 +4488,70 @@ sm_status sm_brep_offset_obstacles(const sm_brep* brep, const uint32_t* faces, s
             }
         }
         *out_count = written;
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_move_faces(sm_brep* brep, const uint32_t* faces, size_t count, sm_vec3 translation,
+                             sm_vec3 axis_point, sm_vec3 axis_direction, double angle_deg, uint8_t* out_roles,
+                             size_t role_count) {
+    if (!brep || !out_roles || (count > 0 && !faces)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    const auto finite = [](sm_vec3 v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); };
+    if (count == 0 || !finite(translation) || !std::isfinite(angle_deg)) {
+        return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    }
+    const SmVector3d axis(axis_direction.x, axis_direction.y, axis_direction.z);
+    if (angle_deg != 0.0 && (!finite(axis_point) || !finite(axis_direction) || !(axis.Length() > 0.0))) {
+        return SM_SHIM_ERR_BAD_AXIS;
+    }
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmTArray<SmFace*> picked;
+        if (!picked_faces(*target, faces, count, picked)) return SM_SHIM_ERR_BAD_FACE;
+        if (role_count != target->GetNumFaces()) return SM_SHIM_ERR_BAD_FACE;
+        Motion rigid;
+        rigid.kind = Motion::kShift;
+        rigid.shift = SmVector3d(translation.x, translation.y, translation.z);
+        if (angle_deg != 0.0) {
+            // Rodrigues: a turn by the angle about the axis through the point,
+            // anticlockwise looking down the axis from its tip, then the
+            // translation: p goes to R (p - c) + c + t.
+            const SmVector3d k = axis / axis.Length();
+            const double theta = angle_deg * SM_PI / 180.0;
+            const double c = std::cos(theta);
+            const double s = std::sin(theta);
+            const double v = 1.0 - c;
+            const double r[3][3] = {{c + k.x * k.x * v, k.x * k.y * v - k.z * s, k.x * k.z * v + k.y * s},
+                                    {k.y * k.x * v + k.z * s, c + k.y * k.y * v, k.y * k.z * v - k.x * s},
+                                    {k.z * k.x * v - k.y * s, k.z * k.y * v + k.x * s, c + k.z * k.z * v}};
+            for (int row = 0; row < 3; ++row) {
+                for (int col = 0; col < 3; ++col) rigid.turn[row][col] = r[row][col];
+            }
+            rigid.turned = true;
+            const SmPoint3d centre(axis_point.x, axis_point.y, axis_point.z);
+            const SmVector3d turned = turned_vector(rigid, SmVector3d(centre.x, centre.y, centre.z));
+            rigid.shift = rigid.shift + SmVector3d(centre.x - turned.x, centre.y - turned.y, centre.z - turned.z);
+        }
+        if (!rigid.turned && rigid.shift.Length() == 0.0) {
+            // Nothing moves, and nothing changes.
+            SmTArray<SmFace*> all;
+            target->GetFaces(all);
+            for (ULONG i = 0; i < all.GetSize(); ++i) {
+                ULONG index = 0;
+                out_roles[i] = picked.FindElement(all[i], index) ? SM_MOVE_MOVED : SM_MOVE_KEPT;
+            }
+            return SM_SUCCESS;
+        }
+        // A face beside another piece of its own surface (an imprinted
+        // panel) can't stretch that piece to meet it.
+        if (needs_steps(picked, target->GetTolerance())) return SM_SHIM_ERR_UNSUPPORTED_STEP;
+        Motions motions;
+        sm_status status = plan_move(picked, rigid, target->GetTolerance(), motions);
+        if (status != SM_SUCCESS) return status;
+        const std::vector<uint8_t> roles = move_roles(*target, picked, motions);
+        status = keeping_topology(*target, [&] { return move_planned(*target, motions); });
+        if (status != SM_SUCCESS) return status;
+        std::copy(roles.begin(), roles.end(), out_roles);
         return SM_SUCCESS;
     });
 }

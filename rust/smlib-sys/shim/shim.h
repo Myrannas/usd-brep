@@ -625,6 +625,44 @@ sm_status sm_brep_offset_obstacles(const sm_brep *brep, const uint32_t *faces, s
                                    uint32_t *out_faces, uint32_t *out_obstacles, size_t capacity,
                                    size_t *out_count);
 
+/* What a face is to sm_brep_move_faces. */
+enum sm_move_role {
+    SM_MOVE_KEPT = 0,     /* untouched */
+    SM_MOVE_MOVED = 1,    /* picked: moved rigidly */
+    SM_MOVE_CARRIED = 2,  /* a blend on a picked face, slid to stay tangent to its neighbours */
+    SM_MOVE_FOLLOWED = 3, /* a neighbour extended or trimmed along its own surface to meet them */
+};
+
+/* Moves the faces at the given indices of the brep's face list rigidly, in
+ * place: turned by `angle_deg` about the axis through `axis_point` along
+ * `axis_direction` (anticlockwise looking down the axis from its tip; no turn
+ * when the angle is 0, and the axis is then ignored), then translated by
+ * `translation`. Every other neighbour is extended or trimmed along its own
+ * surface to meet them, as sm_brep_offset_faces does, on the same local
+ * operation. A translation carries the blends on the picked faces
+ * (fillets, corner blends), each by the shortest slide that keeps it tangent
+ * to all its neighbours; a blend the move leaves in place stretches. A turn
+ * can't carry a blend: SM_SHIM_ERR_UNSUPPORTED_FACE when one is on a turned
+ * face (and when no slide keeps a blend tangent).
+ *
+ * The brep keeps its faces and edges, and their order and labels, so a move
+ * that would make a face vanish or appear fails, with
+ * SM_SHIM_ERR_CHANGED_TOPOLOGY or SM_SHIM_ERR_BROKE_SOLID, and so does a
+ * result that isn't a manifold solid, has gaps or a volume that can't be
+ * trusted (see sm_brep_offset_faces): its neighbours can't reach the moved
+ * faces. Nothing is pushed through features in the way.
+ * SM_SHIM_ERR_UNSUPPORTED_STEP when a picked face is beside an unpicked
+ * piece of its own surface (an imprint's), which can't stretch to meet it.
+ * SM_SHIM_ERR_BAD_AXIS for a turn about an axis that isn't finite or has no
+ * direction; SM_SHIM_ERR_BAD_FACE for an index out of range or repeated, or
+ * a role count that isn't the face count. On success writes each face's
+ * sm_move_role, in face order, to out_roles. The brep is unchanged when the
+ * kernel itself fails; after a check fails it may be modified, so the
+ * caller should discard it. */
+sm_status sm_brep_move_faces(sm_brep *brep, const uint32_t *faces, size_t count, sm_vec3 translation,
+                             sm_vec3 axis_point, sm_vec3 axis_direction, double angle_deg, uint8_t *out_roles,
+                             size_t role_count);
+
 /* SmApiTessellate plus SmApiTessellateBoundaries, copied into an sm_mesh
  * with every triangle and vertex linked back to its B-rep face. */
 sm_status sm_brep_tessellate(sm_brep *brep, const sm_tessellation_params *params, sm_mesh **out);

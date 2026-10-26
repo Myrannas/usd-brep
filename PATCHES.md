@@ -616,3 +616,64 @@ offset from a face, or a new face from none.
   mesh winding outward; the same shell three times over; the failures and
   refusals above.
 
+## Notes from moving faces (no patch needed)
+
+`Brep::move_faces` (`sm_brep_move_faces`) moves chosen faces by a rigid
+motion, a turn about an axis through a point and then a translation, and
+extends or trims every other neighbour along its own surface to meet them.
+It is the face offset's local operation (`SmBrep::LocalOperation` on the
+offset executive, `rigid_local_operation`) with the picked faces' surfaces
+moved rather than offset, so it needed no kernel change.
+
+- **Motions.** An offset's `Motion` was a translation; it now carries an
+  optional turn (`turned`, a rotation matrix), and a face's new surface is
+  its old one copied and transformed by the whole motion (`moved_surface`,
+  an `SmAxis2Placement` built from the matrix). Where the offset code asked
+  whether a face lands where a translation would put it (`lands_like`,
+  `rigid_motion`, `move_copies`, `predict_vertex`), it now asks the same of
+  a rigid motion: a turned face lands alike only under the same motion, and
+  a vertex's predicted point takes each turned plane's turned normal. An
+  offset never turns, and takes exactly the code paths it did.
+- **Blends.** A translation carries the blends on the moved faces as an
+  offset does (`carry_blends`, split out of `plan_offset`): a round between
+  a moved wall and a kept one slides the shortest way that keeps it tangent
+  to both, and a round the move leaves in place (a vertical round under a
+  raised top) stretches. A turn can't carry a blend: a round on a turned
+  face would need to slide and change its angle at once, and is refused
+  (`SM_SHIM_ERR_UNSUPPORTED_FACE`).
+- **Planes within themselves.** A planar face moved within its own plane
+  doesn't move: its boundary is its neighbours'. Moving a feature's faces
+  together slides the feature (a boss's side and top moved across the lid).
+- **Checks.** The result is held to what an offset's is (`keeping_topology`:
+  the same faces and edges, manifold, loops apart, no gaps, a trusted
+  volume), and nothing in the way is pushed through. A face beside an
+  unpicked piece of its own surface is refused
+  (`SM_SHIM_ERR_UNSUPPORTED_STEP`) rather than stepped.
+- **Turned cylinders.** As the solids work found tilting a prism's sides,
+  a turned cylinder comes back an open solid: a boss's side and top turned
+  8° about a line across its foot is refused (`SM_SHIM_ERR_BROKE_SOLID`,
+  "the faces round them can't reach them and still close the solid").
+  Turned planes are exact.
+- **Faces' roles.** `Moved::faces` says, face by face, what the move did:
+  moved (picked), carried (a blend slid with them), followed (a face
+  sharing a vertex with a moving one, extended or trimmed) or kept. Faces
+  and edges keep their order and labels.
+- **Refusals in words** (`Error::InvalidArgument`): the shim's
+  `SM_SHIM_ERR_CHANGED_TOPOLOGY`, `BROKE_SOLID`, `UNSUPPORTED_FACE` and
+  `UNSUPPORTED_STEP`, and the kernel's own failures in the local operation,
+  each as "the faces round them can't reach them" and why; "no faces to
+  move", "the translation must be finite", "the angle must be finite",
+  "the axis direction must be finite and not zero" and "a face to move is
+  out of range or repeated" before the kernel.
+- Results (`rust/smlib/tests/move_faces.rs`): a box's top moved up 12 and
+  down 15, and across its normal; its right face moved within its plane
+  (nothing changes); a boss slid 17 mm across the lid, and lifted; the
+  right face turned 15°, -15° and 30° about its bottom edge (a trapezoid's
+  prism); every wall turned 10° in, one after another (a square frustum,
+  a draft's volume); a box with rounded vertical edges with its right face
+  moved out (the rounds slide) and its top raised (the rounds stretch), and
+  its right face turned (refused); a turn and a move together keeping
+  every label; refusals. Each is manifold, keeps its faces, edges and
+  labels, winds outward and has its volume within 2e-9 of the shape's own
+  formula (planes to 1e-15).
+

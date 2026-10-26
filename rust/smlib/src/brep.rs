@@ -15,6 +15,7 @@ use crate::imprint::{Imprint, ImprintEdge};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams, slice};
+use crate::motion::{Moved, MovedFace, RigidMotion};
 use crate::pipe::{Pipe, PipeFace};
 use crate::shell::{Shell, ShellFace};
 use crate::tessellation::{FaceKey, SurfaceCaches, Tessellation};
@@ -1224,6 +1225,131 @@ impl Brep {
             obstacles[obstacle].push(face as usize);
         }
         Ok(obstacles)
+    }
+
+    /// Moves the faces at `faces` (indices in [`faces`](Brep::faces)) by a
+    /// rigid `motion`: turned about an axis, if it turns, then translated.
+    /// Every other neighbour is extended or trimmed along its own surface to
+    /// meet them, as in [`offset_faces`](Brep::offset_faces), on the same
+    /// local operation (`SmBrep::LocalOperation`), so a moved plane can lean
+    /// at any angle and a hole or a boss can move sideways.
+    ///
+    /// A planar face moved within its own plane stays where it is (its
+    /// boundary is its neighbours'), so only the move along its normal shows;
+    /// move a feature's faces together to slide the feature. A translation
+    /// carries the blends on the moved faces (fillets, the corners between
+    /// them): each slides the shortest way that keeps it tangent to every
+    /// neighbour, as an offset's do, and one the move leaves in place
+    /// stretches. A turn can't carry a blend: a round on a turned face is
+    /// refused.
+    ///
+    /// The faces and edges stay the same, in the same order, each with its
+    /// [`Label`]. [`Moved::faces`](crate::Moved::faces) says what happened
+    /// to each face: moved, carried, followed (extended or trimmed) or kept.
+    ///
+    /// Refused, in plain words ([`Error::InvalidArgument`]), when the faces
+    /// round the moved ones can't reach them: one would shrink to nothing or
+    /// cross another, the result wouldn't be a closed solid, a round can't
+    /// follow, a face beside them on their own surface (as an
+    /// [`imprint`](Brep::imprint) leaves) would have to stretch, or the
+    /// kernel can't intersect a neighbour with them. The result is checked
+    /// as an offset's is: manifold, no gaps, every planar face's loops
+    /// apart, and a volume that can be trusted. Nothing in the way is cut
+    /// through. Consumed and dropped on failure, as
+    /// [`offset_faces`](Brep::offset_faces). A motion that moves nothing
+    /// gives the brep back as it was.
+    pub fn move_faces(self, faces: &[usize], motion: &RigidMotion) -> Result<Moved, Error> {
+        const OP: &str = "SmBrep::LocalOperation (move)";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
+        };
+        if faces.is_empty() {
+            return invalid("no faces to move");
+        }
+        if !motion.translation.iter().all(|c| c.is_finite()) {
+            return invalid("the translation must be finite");
+        }
+        let (point, axis, degrees) = match motion.turn {
+            Some(turn) => {
+                check_point(OP, turn.point)?;
+                if !turn.degrees.is_finite() {
+                    return invalid("the angle must be finite");
+                }
+                if turn.degrees != 0.0
+                    && (!turn.axis.iter().all(|c| c.is_finite()) || turn.axis == [0.0; 3])
+                {
+                    return invalid("the axis direction must be finite and not zero");
+                }
+                (turn.point, turn.axis, turn.degrees)
+            }
+            None => ([0.0; 3], [0.0, 0.0, 1.0], 0.0),
+        };
+        let indices: Vec<u32> = faces
+            .iter()
+            .map(|&face| u32::try_from(face).unwrap_or(u32::MAX))
+            .collect();
+        let mut roles = vec![0u8; self.face_count()];
+        // SAFETY: self is a live brep on the kernel thread; indices holds
+        // indices.len() values and roles roles.len().
+        let status = unsafe {
+            sys::sm_brep_move_faces(
+                self.raw.as_ptr(),
+                indices.as_ptr(),
+                indices.len(),
+                vec3(motion.translation),
+                vec3(point),
+                vec3(axis),
+                degrees,
+                roles.as_mut_ptr(),
+                roles.len(),
+            )
+        };
+        match status {
+            sys::SM_STATUS_SUCCESS => {}
+            sys::SM_SHIM_ERR_BAD_FACE => {
+                return invalid("a face to move is out of range or repeated");
+            }
+            sys::SM_SHIM_ERR_BAD_AXIS => {
+                return invalid("the axis direction must be finite and not zero");
+            }
+            sys::SM_SHIM_ERR_CHANGED_TOPOLOGY => {
+                return invalid(
+                    "the faces round them can't reach them: one would shrink to nothing or cross another",
+                );
+            }
+            sys::SM_SHIM_ERR_BROKE_SOLID => {
+                return invalid("the faces round them can't reach them and still close the solid");
+            }
+            sys::SM_SHIM_ERR_UNSUPPORTED_FACE if degrees != 0.0 => {
+                return invalid(
+                    "the faces round them can't reach them: a round on a turned face can't turn with it",
+                );
+            }
+            sys::SM_SHIM_ERR_UNSUPPORTED_FACE => {
+                return invalid(
+                    "the faces round them can't reach them: no slide keeps a round on them tangent",
+                );
+            }
+            sys::SM_SHIM_ERR_UNSUPPORTED_STEP => {
+                return invalid(
+                    "the faces round them can't reach them: a face beside them on their own surface can't stretch",
+                );
+            }
+            // The kernel's own failures: the local operation found no way to
+            // meet a neighbour with the moved faces.
+            #[allow(clippy::useless_conversion)] // sm_status is a C long, i32 on Windows
+            status if (1001..2000).contains(&i64::from(status)) => {
+                return invalid("the faces round them can't reach them");
+            }
+            status => Error::check(OP, status)?,
+        }
+        Ok(Moved {
+            brep: self,
+            faces: roles.into_iter().map(MovedFace::from_raw).collect(),
+        })
     }
 
     /// How many edges `query` picks.
