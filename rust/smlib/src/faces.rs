@@ -115,14 +115,48 @@ impl Frame {
     }
 }
 
-/// A closed prism swept from a planar face by
-/// [`Brep::sweep_face`](crate::Brep::sweep_face).
+/// A closed solid swept from a planar face by
+/// [`Brep::sweep_face`](crate::Brep::sweep_face) (a prism) or
+/// [`Brep::revolve_face`](crate::Brep::revolve_face).
 #[derive(Debug)]
 pub struct Sweep {
-    /// The prism, a new solid apart from the brep it was swept from.
+    /// The solid, apart from the brep it was swept from.
     pub prism: Brep,
-    /// What each of the prism's faces came from, in the prism's face order.
+    /// What each of the solid's faces came from, in its face order.
     pub faces: Vec<SweptFace>,
+}
+
+impl Sweep {
+    /// Takes over a solid and the roles of its faces from the shim.
+    ///
+    /// # Safety
+    ///
+    /// `faces` holds `count` entries, or is null, and is freed here.
+    pub(crate) unsafe fn from_raw(
+        operation: &'static str,
+        prism: *mut sys::sm_brep,
+        faces: *mut sys::sm_swept_face,
+        count: usize,
+    ) -> Result<Sweep, Error> {
+        // SAFETY: as the caller promises; we copy the entries, then free them
+        // once.
+        let roles = unsafe {
+            let roles = if faces.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(faces, count)
+                    .iter()
+                    .map(SweptFace::from_raw)
+                    .collect()
+            };
+            sys::sm_swept_faces_free(faces);
+            roles
+        };
+        Ok(Sweep {
+            prism: Brep::from_raw(operation, prism)?,
+            faces: roles,
+        })
+    }
 }
 
 /// What one face of a [`Sweep`] came from.
@@ -130,7 +164,7 @@ pub struct Sweep {
 pub enum SweptFace {
     /// The copy of the swept face where the sweep starts, on the face itself.
     Start,
-    /// The copy of the swept face the sweep distance away.
+    /// The copy of the swept face the sweep distance (or angle) away.
     End,
     /// The face swept from one edge of the swept face.
     Side {

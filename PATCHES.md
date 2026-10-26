@@ -17,6 +17,7 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `7efc9ef` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: a face's surface cache, often the largest part of setting it up, is built again every tessellation though it depends only on the surface and the parameters. | `Phase1SetupFaces` takes an optional `SmTessSrfCacheStore`: faces take its caches for identical surfaces, and faces set up only to split shared edges leave theirs there. `SmTessSrfCache::SetFace` moves a cache to another face and tessellation. |
 | `76a3dbc` | `SmMemBlockMgr.h`, `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: Phase 2 subdivides and labels a face's surface cache, so a kept cache serves one face once, and faces whose surfaces stay while their boundaries move (beside a dragged fillet) build theirs in every tessellation. | Add `SmTessSrfCache::Copy`, a deep copy of a cache as `BuildTree` leaves it: the tree's node and node-data blocks byte for byte with their pointers mapped (`SmMemBlockMgr::CopyFrom`), B-spline subdivision surfaces with their exact knots; NULL for a cache holding anything else. `Phase1SetupFaces` gives the faces it tessellates copies and leaves originals in the store, which also gets copies of caches it builds when `SmTessSrfCacheStore::WantsCopy` says to. `SetFace` repoints nodes from the old face's surface to the new one's. |
 | `a9b66ee` | `SmBrep.cpp` | Found imprinting: `RemoveTopologicalEdgesAndVertices` tests each edge with `SmEdge::IsTopological`, which can expand one face's surface to cover the other's as a side effect, before it looks for the edge in the keep list. An edge kept between two pieces of a curved face (a panel imprinted on a crate's round, merged back off the round at the other end) leaves a piece on the stretched surface: its box grows by 12 mm, its area integral fails and a later union over it fails with `SM_ERR`. | Look for each edge in the keep list before testing it. Without a keep list the merge runs as before. |
+| `cd41f50` | `SmTorus.cpp` | Found revolving: `SmTorus::IsNurbSurfaceTorus` snaps the generator circle's start and end angles to 0 and 360 only within `SM_EFF_ZERO` (1e-12 degrees). A circle revolved a whole turn on a tilted plane came out with both 2.7e-12 degrees off zero, and the torus got an empty (u, v) domain. | Snap within `SM_EFF_ZERO_DEG` and turn an end no further than the start into a whole turn, as `RebuildSTEPFromNURBParameters` in the same file does. Nothing in the kernel calls it (its call in `CopyAndAddAnalytics` is commented out); the shim's revolve does. |
 
 `source/SM_API` is unmodified. Each offset patch changes only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
@@ -26,6 +27,8 @@ block copy and block accessors): `SmApiTessellate` and `Phase1SetupBrep`
 take the code paths they always did. The merge patch changes only merges
 given a keep list: `RemoveTopologicalEdgesAndVertices()` without one, as
 every boolean's post-process and `Brep::merge_faces` call it, is as it was.
+The torus patch changes only `SmTorus::IsNurbSurfaceTorus`, which only the
+shim calls.
 
 ## Notes from the bring-up (no patch needed)
 
@@ -396,3 +399,60 @@ steps are shim and Rust only. What the shim relies on:
 - A label's role holds up to 255 bytes (`SM_LABEL_ROLE_CAPACITY` 256, was
   64), so a role can carry a sketch region's name: an imprinted panel's
   piece is named by every shape it lies inside and outside of.
+
+## Notes from the solids work
+
+Revolve, Draft, Pipe and Hollow, for game-cad's features of those names.
+Shim and Rust only, apart from the torus patch (`cd41f50`).
+
+### Revolve
+
+`Brep::revolve_face` (`sm_brep_revolve_face`) turns a planar face about an
+axis in its plane, part of a turn or a whole one, into a closed solid, and
+says what each face came from as `sweep_face` does (`Sweep`).
+`SmApiCreateRotationalSweep` takes curves, not a face, and doesn't say which
+side came from which curve, so the shim runs `SmTopologySweep` with
+`SmRotationalSweepGeometry` itself, as `SmPrimitiveCreation`'s rotational
+sweep does, and reads its maps: `GetToHigher` gives each edge's side and
+`GetToSame` the face's turned copy.
+
+- The face is copied alone into a new brep (`SmBrep::CopyFaces` without
+  merging); deleting a solid's other faces from a copy of it left a face
+  the sweep failed on (`SM_ERR`). The copy's edges are new curves, traced
+  back to the face's edges by where their midpoints lie.
+- The face is moved into a frame with the axis along z and itself in the xz
+  plane, swept there, and the solid moved back, so the sweep and the
+  recognisers below see the same arithmetic whatever plane the face is in.
+- The axis must lie in the face's plane (direction to 1e-9, point to the
+  brep's tolerance) and may not run through the face's inside, which
+  `SmFace::CurveOnClassify` decides as `SmPrimitiveCreation` does (where it
+  returns `SM_ERR_AXIS_INSIDE_FACE`). Along the boundary or through a vertex
+  is fine. An edge on the axis sweeps nothing and has no side; a face
+  touching the axis at a point turns into cones meeting at their apex, which
+  SMLib counts as a manifold solid.
+- Part of a turn sweeps the face: the face is the start, its copy the end.
+- A whole turn can't: the face would meet its own copy, and the result isn't
+  a manifold solid. Each loop's edges are swept into closed sides instead,
+  the face deleted and the sides stitched (`SmBrep::StitchAndOrient`), as
+  `SmPrimitiveCreation`'s whole turns do. `StitchAndOrient` makes every
+  closed shell a solid region, so a hole's ring came out solid: the volume
+  was the face's without its hole. Each loop is now turned in a brep of its
+  own and the holes' rings cut from the outer loop's solid
+  (`SmApiBooleanDifference`), which leaves closed voids as a box minus an
+  enclosed ball does. The sides are traced through the booleans by a
+  temporary label.
+- The sweep makes planes, cylinders, cones and spheres analytic itself
+  (`CopyAndAddAnalytics`), but a torus stays a surface of revolution:
+  `CopyAndAddAnalytics` has its torus test commented out. The shim calls
+  `SmTorus::IsNurbSurfaceTorus` and keeps the torus when it has the
+  surface's domain and points (patch `cd41f50`).
+- Results (`rust/smlib/tests/revolve.rs`, on a tilted plane, whole and part
+  turns, both ways): tubes, discs, cones, frustums, balls, rings, a tube with
+  a ring-shaped hole and a box's face turned about its own edge, all manifold,
+  volumes within 1e-6 of Pappus' (1e-8 in practice), meshes winding outward
+  round them. Each side is the edge's: plane, cylinder, cone, sphere or
+  torus.
+- Turns from 359.999 degrees to just under 360 fail (`SHIM_ERR_BAD_SWEEP`:
+  the start and end nearly meet); 359.99 works. A 0.01 degree turn leaves
+  its cylinders as surfaces of extrusion (0.001 and 0.1 degrees don't).
+

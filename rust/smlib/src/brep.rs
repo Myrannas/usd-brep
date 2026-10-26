@@ -8,7 +8,7 @@ use smlib_sys as sys;
 use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
 use crate::faces::{
-    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Sweep, SweptFace,
+    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Sweep,
 };
 use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::imprint::{Imprint, ImprintEdge};
@@ -44,7 +44,7 @@ type BooleanFn = unsafe extern "C" fn(
 
 impl Brep {
     /// Wraps a brep the shim just handed over.
-    fn from_raw(operation: &'static str, raw: *mut sys::sm_brep) -> Result<Brep, Error> {
+    pub(crate) fn from_raw(operation: &'static str, raw: *mut sys::sm_brep) -> Result<Brep, Error> {
         match NonNull::new(raw) {
             Some(raw) => Ok(Brep {
                 raw,
@@ -480,24 +480,80 @@ impl Brep {
             )
         };
         Error::check(OP, status)?;
-        // SAFETY: on success faces holds count entries, which we copy and then
-        // free once.
-        let roles = unsafe {
-            let roles = if faces.is_null() {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(faces, count)
-                    .iter()
-                    .map(SweptFace::from_raw)
-                    .collect()
-            };
-            sys::sm_swept_faces_free(faces);
-            roles
+        // SAFETY: on success faces holds count entries.
+        unsafe { Sweep::from_raw(OP, out, faces, count) }
+    }
+
+    /// Revolves the planar face at `face` in [`faces`](Brep::faces) about the
+    /// axis through `axis_point` along `axis_direction` by `angle_deg`, into
+    /// a closed solid (`SmTopologySweep` with `SmRotationalSweepGeometry`).
+    /// It turns anticlockwise looking down the axis from its tip when the
+    /// angle is positive, clockwise when negative, and at most a whole turn
+    /// either way. The brep is unchanged; combine the solid with it by
+    /// [`union`](Brep::union) or [`difference`](Brep::difference).
+    ///
+    /// The axis must lie in the face's plane. It may run along the face's
+    /// boundary or touch it at a point, but not through its inside: such a
+    /// solid would pass through itself. An edge lying on the axis sweeps
+    /// nothing, so it has no side.
+    ///
+    /// A side turned from a straight edge is a plane (an edge square to the
+    /// axis), a cylinder (along it) or a cone (at a slant), and one turned
+    /// from an arc a sphere when the arc is centred on the axis and a torus
+    /// otherwise.
+    ///
+    /// The solid's faces carry no labels. [`Sweep::faces`] says which is the
+    /// start (the face itself), which the end (the face turned by the
+    /// angle), and which edge of `face` each side was turned from. A whole
+    /// turn has no start or end.
+    pub fn revolve_face(
+        &self,
+        face: usize,
+        axis_point: [f64; 3],
+        axis_direction: [f64; 3],
+        angle_deg: f64,
+    ) -> Result<Sweep, Error> {
+        const OP: &str = "SmTopologySweep (revolve)";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
         };
-        Ok(Sweep {
-            prism: Brep::from_raw(OP, out)?,
-            faces: roles,
-        })
+        check_point(OP, axis_point)?;
+        if !axis_direction.iter().all(|c| c.is_finite()) || axis_direction == [0.0; 3] {
+            return invalid("the axis direction must be finite and not zero");
+        }
+        if !(angle_deg.is_finite() && angle_deg != 0.0 && angle_deg.abs() <= 360.0) {
+            return invalid("the angle must be finite, not zero, and at most a whole turn");
+        }
+        let mut out = ptr::null_mut();
+        let mut faces = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; the outputs are
+        // written only on success.
+        let status = unsafe {
+            sys::sm_brep_revolve_face(
+                self.raw.as_ptr(),
+                face,
+                vec3(axis_point),
+                vec3(axis_direction),
+                angle_deg,
+                &mut out,
+                &mut faces,
+                &mut count,
+            )
+        };
+        match status {
+            sys::SM_SHIM_ERR_BAD_AXIS => return invalid("the axis must lie in the face's plane"),
+            sys::SM_SHIM_ERR_AXIS_CROSSES_FACE => {
+                return invalid("the axis runs through the face, which can't revolve across it");
+            }
+            sys::SM_SHIM_ERR_NOT_PLANAR => return invalid("only a planar face can be revolved"),
+            _ => Error::check(OP, status)?,
+        }
+        // SAFETY: on success faces holds count entries.
+        unsafe { Sweep::from_raw(OP, out, faces, count) }
     }
 
     /// Planar faces bounded by closed loops of lines, arcs and circles in
@@ -513,8 +569,8 @@ impl Brep {
     /// its loops run, so a positive sweep runs along z. Each curve's edge
     /// carries the curve's label, so each side of a prism swept from a face
     /// can be traced back to the curve it came from: through
-    /// [`SweptFace::Side`]'s `source_edge` to the edge in this sheet's
-    /// [`edges`](Brep::edges).
+    /// [`SweptFace::Side`](crate::SweptFace::Side)'s `source_edge` to the edge
+    /// in this sheet's [`edges`](Brep::edges).
     ///
     /// The kernel's own error when the loops don't bound faces. It doesn't
     /// catch every bad arrangement: two squares that cross still make a face,

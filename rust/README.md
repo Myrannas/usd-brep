@@ -60,6 +60,13 @@ cargo test -p smlib
   holes. Every face faces the frame's z, and each curve's edge carries the
   `BoundaryCurve`'s label, so the sides of a prism swept from a face trace
   back to their curves through `Sweep::faces`. This is a sketch's extrude.
+- `Brep::revolve_face` turns a planar face about an axis in its plane, by
+  any angle up to a whole turn either way, into a closed solid
+  (`SmTopologySweep` with `SmRotationalSweepGeometry`). `Sweep::faces` says
+  which face is the start, which the end (a whole turn has neither) and
+  which edge each side was turned from; an edge on the axis has none. Sides
+  are planes, cylinders, cones, spheres and tori. This is a sketch's
+  revolve.
 - `Brep::merge_faces` merges faces lying on one surface and edges lying on
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come

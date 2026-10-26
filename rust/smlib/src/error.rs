@@ -65,6 +65,9 @@ impl Status {
             2026 => "SHIM_ERR_CHANGED_TOPOLOGY",
             2027 => "SHIM_ERR_OBSTRUCTED",
             2028 => "SHIM_ERR_UNSUPPORTED_STEP",
+            2030 => "SHIM_ERR_SPENT_TESSELLATION",
+            2031 => "SHIM_ERR_BAD_AXIS",
+            2032 => "SHIM_ERR_AXIS_CROSSES_FACE",
             _ => return None,
         })
     }

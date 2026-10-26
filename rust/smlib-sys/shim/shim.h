@@ -44,6 +44,8 @@ static const sm_status SM_SHIM_ERR_CHANGED_TOPOLOGY = 2026;    /* the move would
 static const sm_status SM_SHIM_ERR_OBSTRUCTED = 2027;          /* the move runs into features it can't cut through */
 static const sm_status SM_SHIM_ERR_UNSUPPORTED_STEP = 2028;    /* a moved face needs a step wall that can't be built */
 static const sm_status SM_SHIM_ERR_SPENT_TESSELLATION = 2030; /* the tessellation's mesh was already made */
+static const sm_status SM_SHIM_ERR_BAD_AXIS = 2031;            /* an axis isn't finite, has no direction or leaves the face's plane */
+static const sm_status SM_SHIM_ERR_AXIS_CROSSES_FACE = 2032;   /* a revolve's axis runs through the inside of its face */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -416,8 +418,25 @@ sm_status sm_brep_place(sm_brep *brep, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y
 sm_status sm_brep_sweep_face(const sm_brep *brep, size_t face, double distance, sm_brep **out,
                              sm_swept_face **faces, size_t *face_count);
 
-/* Frees the array sm_brep_sweep_face returns. NULL is ignored. */
+/* Frees the array sm_brep_sweep_face or sm_brep_revolve_face returns. NULL
+ * is ignored. */
 void sm_swept_faces_free(sm_swept_face *faces);
+
+/* Revolves the planar face at an index of the brep's face list about the
+ * axis through axis_point along axis_direction (any length but zero), by
+ * angle_deg: anticlockwise about the axis when positive, up to a whole turn
+ * either way. The axis must lie in the face's plane (SM_SHIM_ERR_BAD_AXIS)
+ * and may run along the face's boundary or touch it, but not through its
+ * inside (SM_SHIM_ERR_AXIS_CROSSES_FACE). The face is swept on a copy of it
+ * alone (SmTopologySweep with SmRotationalSweepGeometry); the brep is
+ * unchanged. *out is the closed solid, without labels, and *faces says what
+ * each of its faces came from, as for sm_brep_sweep_face: the face where the
+ * turn starts (SM_SWEPT_START, the face itself) and ends (SM_SWEPT_END),
+ * which a whole turn has neither of, and a side for each edge of the face,
+ * which the sweep's own maps tie to it. Free *faces with
+ * sm_swept_faces_free. */
+sm_status sm_brep_revolve_face(const sm_brep *brep, size_t face, sm_vec3 axis_point, sm_vec3 axis_direction,
+                               double angle_deg, sm_brep **out, sm_swept_face **faces, size_t *face_count);
 
 /* Merges faces that lie on one surface into one face, removing the edges
  * between them, and edges that lie on one curve into one edge
