@@ -2399,10 +2399,28 @@ sm_status offset_faces(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
 // stay tangent to both, and one the move leaves in place stretches. A blend
 // on a turned face can't follow it by sliding and is refused.
 
-// The motion every face takes when the picked ones take `rigid`: `rigid`
-// for them, and for the blends carry_blends places their slides.
-sm_status plan_move(const SmTArray<SmFace*>& picked, const Motion& rigid, double tolerance, Motions& motions) {
-    for (ULONG i = 0; i < picked.GetSize(); ++i) motions[picked[i]] = rigid;
+// The motion every face takes when the picked ones take `rigid`, whose
+// translation is `translation`: `rigid` for them, and for the blends
+// carry_blends places their slides. A picked plane takes only the part of
+// the translation along its normal, after the turn: moved within itself a
+// plane is where it was, and its parametrisation shifting under the face's
+// trims would carry them off its edges (a lid moved up and sideways
+// measured 7e-5 more than moved up). A curved face keeps the whole
+// translation: a cylinder held back along its axis would have to be
+// extended, which the executive does with a NURBS surface (a boss lifted
+// with its top came out 6e-6 over).
+sm_status plan_move(const SmTArray<SmFace*>& picked, const Motion& rigid, const SmVector3d& translation, double tolerance,
+                    Motions& motions) {
+    for (ULONG i = 0; i < picked.GetSize(); ++i) {
+        Motion motion = rigid;
+        SmPoint3d point;
+        SmVector3d normal;
+        if (plane_of(picked[i]->GetSurface(), point, normal) && normal.Length() > 0.0) {
+            const SmVector3d n = turned_vector(rigid, normal / normal.Length());
+            motion.shift = motion.shift - (translation - n * translation.Dot(n));
+        }
+        motions[picked[i]] = motion;
+    }
     return carry_blends(picked, tolerance, tolerance * (1.0 + rigid.shift.Length()), motions);
 }
 
@@ -4546,7 +4564,8 @@ sm_status sm_brep_move_faces(sm_brep* brep, const uint32_t* faces, size_t count,
         // panel) can't stretch that piece to meet it.
         if (needs_steps(picked, target->GetTolerance())) return SM_SHIM_ERR_UNSUPPORTED_STEP;
         Motions motions;
-        sm_status status = plan_move(picked, rigid, target->GetTolerance(), motions);
+        const SmVector3d moved_by(translation.x, translation.y, translation.z);
+        sm_status status = plan_move(picked, rigid, moved_by, target->GetTolerance(), motions);
         if (status != SM_SUCCESS) return status;
         const std::vector<uint8_t> roles = move_roles(*target, picked, motions);
         status = keeping_topology(*target, [&] { return move_planned(*target, motions); });

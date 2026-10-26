@@ -268,6 +268,25 @@ fn a_face_moved_across_its_normal() {
     let case = moved(block, right, RigidMotion::translation([0.0, 9.0, -3.0]));
     assert_sound("right moved within its plane", &case);
     assert_close("right moved within its plane", case.after.volume, L * W * H);
+    // A top with a boss standing on it, moved up and sideways, is moved up:
+    // the boss 3 shorter. Its plane's own sideways shift once carried the
+    // trims round the boss's foot off it.
+    let boss = std::f64::consts::PI * 100.0;
+    let lid = |brep: &Brep| {
+        find(
+            brep,
+            &FaceQuery::OnPlane {
+                point: [0.0, 0.0, H / 2.0],
+                normal: [0.0, 0.0, 1.0],
+            },
+        )
+    };
+    for translation in [[0.0, 0.0, 3.0], [7.0, -4.0, 3.0]] {
+        let case = moved(bossed, lid, RigidMotion::translation(translation));
+        let name = format!("bossed top moved {translation:?}");
+        assert_sound(&name, &case);
+        assert_close(&name, case.after.volume, L * W * (H + 3.0) + boss * 12.0);
+    }
 }
 
 /// The box with a boss 10 mm in radius and 15 tall standing on its top at

@@ -644,6 +644,13 @@ moved rather than offset, so it needed no kernel change.
 - **Planes within themselves.** A planar face moved within its own plane
   doesn't move: its boundary is its neighbours'. Moving a feature's faces
   together slides the feature (a boss's side and top moved across the lid).
+  So a picked plane takes only the part of the translation along its
+  normal (after the turn, if it turns). Translated whole, its own (u, v)
+  shifted under its trims: the sample crate's lid moved up 4 and sideways
+  came out 2288 mm³ (7e-5) over the lid moved up 4, though its mesh was
+  the same. Curved faces keep the whole translation: a boss's side held
+  back along its axis while its top rose had to be extended, which the
+  executive does with a NURBS surface, 6e-6 over.
 - **Checks.** The result is held to what an offset's is (`keeping_topology`:
   the same faces and edges, manifold, loops apart, no gaps, a trusted
   volume), and nothing in the way is pushed through. A face beside an
@@ -666,7 +673,8 @@ moved rather than offset, so it needed no kernel change.
   "the axis direction must be finite and not zero" and "a face to move is
   out of range or repeated" before the kernel.
 - Results (`rust/smlib/tests/move_faces.rs`): a box's top moved up 12 and
-  down 15, and across its normal; its right face moved within its plane
+  down 15, and across its normal, with and without a boss on it; its right
+  face moved within its plane
   (nothing changes); a boss slid 17 mm across the lid, and lifted; the
   right face turned 15°, -15° and 30° about its bottom edge (a trapezoid's
   prism); every wall turned 10° in, one after another (a square frustum,
