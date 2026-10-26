@@ -1115,10 +1115,14 @@ static ULONG lDebugCount = 0 ;
 
   // get torus orientation and size
   SmVector3d       sMajorVec          = pOtherFrame->GetOriginRef() - pRefFrame->GetOriginRef() ;
-  double           dMajRad            = sMajorVec.Length() ;
   const SmPoint3d &crTorusXAxis       = pRefFrame->GetXAxisRef() ; // the frame where all circles are parallel
   const SmPoint3d &crTorusYAxis       = pRefFrame->GetYAxisRef() ;
   SmVector3d       sTorusZAxis        = pRefFrame->GetZAxis() ;
+
+  // the parallel circle need not be the torus's equator: measure the
+  // major radius in the torus's plane
+  sMajorVec -= sTorusZAxis.Dot(sMajorVec) * sTorusZAxis ;
+  double           dMajRad            = sMajorVec.Length() ;
 
   // torus must have positive radii
   if(   dMinRad <= SM_EFF_ZERO
@@ -1157,12 +1161,13 @@ static ULONG lDebugCount = 0 ;
   SmVector3d sVecMin = sNurbMinPoint - sMinOrigin ;
   SmVector3d sVecMax = sNurbMaxPoint - sMaxOrigin ; 
 
-  // get GenCurve min and max angles measured from each GenCurve's origin and start vector
-  double dGenAngleMin, dGenAngleMax;
-  SE(sStartForMinAngle.AngleBetween(sVecMin,dGenAngleMin));
-  SE(sStartForMaxAngle.AngleBetween(sVecMax,dGenAngleMax));
-  dGenAngleMin = 180.0 * dGenAngleMin / SM_PI;
-  dGenAngleMax = 180.0 * dGenAngleMax / SM_PI;
+  // get GenCurve min and max angles measured from each GenCurve's origin and start vector,
+  // signed: the GenCurve below runs from its start vector towards the torus z axis, its
+  // y axis, and an unsigned angle can't tell a point above the torus's plane from one below
+  double dGenAngleMin = SM_RAD2DEG( atan2( sVecMin.Dot(sTorusZAxis), sVecMin.Dot(sStartForMinAngle) ) );
+  double dGenAngleMax = SM_RAD2DEG( atan2( sVecMax.Dot(sTorusZAxis), sVecMax.Dot(sStartForMaxAngle) ) );
+  if ( dGenAngleMin < 0.0 ) { dGenAngleMin += 360.0; }
+  if ( dGenAngleMax < 0.0 ) { dGenAngleMax += 360.0; }
 
   // snap to ends for small tolerances, as RebuildSTEPFromNURBParameters does:
   // a whole generator circle's start and end angles both come out a few
