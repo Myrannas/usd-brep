@@ -375,3 +375,19 @@ steps are shim and Rust only. What the shim relies on:
   standing along the move, and the prisms adding or taking exactly their
   own volume, or it refuses (`SM_SHIM_ERR_UNSUPPORTED_STEP`,
   `SM_SHIM_ERR_OBSTRUCTED`). Steps never reach the push-through.
+- The push-through's merges (`RemoveTopologicalEdgesAndVertices` after the
+  boxes that set obstacles aside, and in the plugs) merged every pair of
+  faces on one surface, so an imprint anywhere on the part was gone after
+  a face was pushed past a boss. Before pushing through, the shim now marks
+  every edge that joins two faces on one surface (`same_surface`) with a
+  copy attribute, which split edges pass to both pieces, and each of those
+  merges keeps the marked edges (`merge_unmarked`): only the faces its own
+  cuts split merge back. With no such edge it is the plain merge, as before.
+- Each step wall takes the label of the edge it stands on, if that has one,
+  as the moved face takes its own: a caller that labelled its imprinted
+  edges can tell the walls apart. The sides beside every other neighbour
+  stay unlabelled, since they merge into it and a label of their own could
+  outrank its.
+- A label's role holds up to 255 bytes (`SM_LABEL_ROLE_CAPACITY` 256, was
+  64), so a role can carry a sketch region's name: an imprinted panel's
+  piece is named by every shape it lies inside and outside of.

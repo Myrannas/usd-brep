@@ -739,7 +739,10 @@ impl Brep {
     /// it grew. [`offset_obstacles`](Brep::offset_obstacles) lists them.
     /// Where a cut boss's new face doesn't merge into the moved face it is
     /// unlabelled; everything else keeps its [`Label`], though a cut face
-    /// can come back in two pieces along its surface's seam.
+    /// can come back in two pieces along its surface's seam. Only the faces
+    /// the push-through's own cuts split merge back: an edge that already
+    /// joined two faces on one surface, as an [`imprint`](Brep::imprint)
+    /// leaves them, stays.
     /// `SHIM_ERR_OBSTRUCTED` when one can't be set aside: it doesn't stand
     /// entirely on one side of a planar face, or something else stands in
     /// its way; or when it would come back on its own or sealed inside.
@@ -758,7 +761,9 @@ impl Brep {
     /// out and cut when pushed in, which stands a wall along each edge to
     /// such a face while every other neighbour stretches or is trimmed along
     /// its surface as before. A panel imprinted on a lid rises or sinks. The
-    /// moved faces keep their [`Label`]s, and the walls have none. That needs
+    /// moved faces keep their [`Label`]s, and each wall takes the label of
+    /// the edge it stands on, if that has one, so an imprinted edge's label
+    /// tells which wall stands on it. That needs
     /// every picked face planar, all facing one way, and every other
     /// neighbour standing along the move (a plane containing it, or a
     /// cylinder along it); otherwise `SHIM_ERR_UNSUPPORTED_STEP`. A step never

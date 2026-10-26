@@ -3394,6 +3394,60 @@ const Plug* plug_under(const SmFace* face, const std::vector<Plug>& plugs, doubl
     return nullptr;
 }
 
+bool same_surface(const SmFace* a, const SmFace* b, double tolerance);
+
+// Edges that already join two faces on one surface when an offset starts,
+// as an imprint leaves them: the push-through's merges keep them, merging
+// only the faces its own boxes and cuts split. Split edges pass the mark to
+// both pieces, and copies keep it.
+const ULONG KEPT_EDGE_ATTRIBUTE_ID = 0x534d4b45;  // "SMKE"
+
+void mark_kept_edges(SmBrep& brep) {
+    const double tolerance = brep.GetTolerance();
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        const EdgeFaces sides = faces_of(edges[i]);
+        if (sides.use_count != 2 || !sides.faces[0] || !sides.faces[1] || sides.faces[0] == sides.faces[1] ||
+            !same_surface(sides.faces[0], sides.faces[1], tolerance)) {
+            continue;
+        }
+        edges[i]->AddAttribute(new (*edges[i]->GetContext()) SmGenericAttribute(
+            KEPT_EDGE_ATTRIBUTE_ID, SM_AB_COPY, SmTArray<long>(), SmTArray<double>(), SmTArray<char>()));
+    }
+}
+
+void unmark_kept_edges(SmBrep& brep) {
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        while (SmAttribute* mark = edges[i]->FindAttribute(KEPT_EDGE_ATTRIBUTE_ID)) edges[i]->RemoveAttribute(mark);
+    }
+}
+
+// RemoveTopologicalEdgesAndVertices, keeping the marked edges (see
+// mark_kept_edges). With none marked it's the plain merge, as before.
+sm_status merge_unmarked(SmBrep& brep) {
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    SmTArray<SmEdge*> kept;
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        if (edges[i]->FindAttribute(KEPT_EDGE_ATTRIBUTE_ID)) kept.Add(edges[i]);
+    }
+    if (kept.GetSize() == 0) return static_cast<sm_status>(brep.RemoveTopologicalEdgesAndVertices());
+    return static_cast<sm_status>(brep.RemoveTopologicalEdgesAndVertices(&kept));
+}
+
+// Unmarks a brep's kept edges when it goes out of scope, whatever the
+// push-through returns.
+struct KeptEdges {
+    SmBrep& brep;
+    explicit KeptEdges(SmBrep& marked) : brep(marked) { mark_kept_edges(brep); }
+    ~KeptEdges() { unmark_kept_edges(brep); }
+    KeptEdges(const KeptEdges&) = delete;
+    KeptEdges& operator=(const KeptEdges&) = delete;
+};
+
 // Fills `work` with the plugs (see Plug). A plug over a blind hole's mouth
 // seals the hole in, a void, whose faces nothing here orients right; so each
 // inner face over a void is then bored through, along the plug's normal,
@@ -3409,7 +3463,7 @@ sm_status fill_plugs(std::unique_ptr<SmBrep>& work, ULONG picked_count, const st
             return status;
         }
     }
-    if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
+    if ((status = merge_unmarked(*work)) != SM_SUCCESS) return status;
     if (shell_count(*work) == shells) return SM_SUCCESS;
     SmTArray<SmFace*> inner;
     if ((status = inner_faces(*work, picked_count, plugs, inner)) != SM_SUCCESS) return status;
@@ -3443,7 +3497,7 @@ sm_status fill_plugs(std::unique_ptr<SmBrep>& work, ULONG picked_count, const st
     for (auto& bore : bores) {
         if ((status = boolean_into(SmApiBooleanDifference, work, std::move(bore))) != SM_SUCCESS) return status;
     }
-    if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
+    if ((status = merge_unmarked(*work)) != SM_SUCCESS) return status;
     return shell_count(*work) == shells ? SM_SUCCESS : SM_SHIM_ERR_OBSTRUCTED;
 }
 
@@ -3468,6 +3522,7 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     const std::vector<Push> pushes = pushes_of(picked, distance);
     const bool pushed = distance < 0.0;
     const bool curved = !shells_of(picked, distance).empty();
+    const KeptEdges kept(brep);
     for (ULONG i = 0; i < picked.GetSize(); ++i) mark_picked(picked[i], static_cast<long>(i));
     std::unique_ptr<SmBrep> work;
     sm_status status = copy_of(brep, work);
@@ -3511,7 +3566,7 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
             return status;
         }
     }
-    if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
+    if ((status = merge_unmarked(*work)) != SM_SUCCESS) return status;
     if (!plugs.empty() && (status = fill_plugs(work, picked.GetSize(), plugs)) != SM_SUCCESS) return status;
     // What the offset sweeps through, from the filled part before and after:
     // what it takes, pushed in, or adds, pulled out. Holes come back by it,
@@ -3597,7 +3652,7 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
         if (gone) continue;
         if ((status = boolean_into(SmApiBooleanUnion, work, std::move(boss))) != SM_SUCCESS) return status;
     }
-    if ((status = static_cast<sm_status>(work->RemoveTopologicalEdgesAndVertices())) != SM_SUCCESS) return status;
+    if ((status = merge_unmarked(*work)) != SM_SUCCESS) return status;
     unmark_all(*work);
     if ((status = check_solid(*work)) != SM_SUCCESS) return status;
     // A boss whose face pulled back from under it (behind a round that moved
@@ -3701,7 +3756,8 @@ sm_status step_overlap(const SmBrep& brep, const SmBrep& tool, bool pulled, doub
 // isn't on a picked face's own surface doesn't stand along the move;
 // SM_SHIM_ERR_OBSTRUCTED when the prisms reach into the part pulled out, or
 // out of it pushed in, so wouldn't add or take exactly their own volume.
-// The moved faces keep their labels; the walls have none.
+// The moved faces keep their labels, and each wall takes the label of the
+// edge it stands on, if that has one, so callers can tell which it is.
 sm_status offset_with_steps(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance) {
     const double tolerance = brep.GetTolerance();
     std::unordered_set<const SmFace*> moving;
@@ -3726,16 +3782,28 @@ sm_status offset_with_steps(SmBrep& brep, const SmTArray<SmFace*>& picked, doubl
 
     std::unique_ptr<SmBrep> tool;
     sm_status status = SM_SUCCESS;
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
     for (ULONG i = 0; i < picked.GetSize(); ++i) {
         SmBrep* swept = nullptr;
         std::vector<sm_swept_face> roles;
         if ((status = sweep_face(brep, picked[i], distance, swept, roles)) != SM_SUCCESS) return status;
         std::unique_ptr<SmBrep> prism(swept);
-        // The prism's far end is the face where it moved to.
+        // The prism's far end is the face where it moved to, and a side
+        // swept from an edge the face shares with another piece of its own
+        // surface is a wall.
         SmTArray<SmFace*> faces;
         prism->GetFaces(faces);
         for (ULONG f = 0; f < faces.GetSize(); ++f) {
             if (roles[f].role == SM_SWEPT_END) write_label(*faces[f], read_label(picked[i]));
+            const int32_t source = roles[f].source_edge;
+            if (roles[f].role != SM_SWEPT_SIDE || source < 0 || static_cast<ULONG>(source) >= edges.GetSize()) continue;
+            const EdgeFaces sides = faces_of(edges[static_cast<ULONG>(source)]);
+            const SmFace* other = sides.faces[0] == picked[i] ? sides.faces[1] : sides.faces[0];
+            if (other && !moving.count(other) && same_surface(picked[i], other, tolerance)) {
+                const sm_label label = read_label(edges[static_cast<ULONG>(source)]);
+                if (label.present) write_label(*faces[f], label);
+            }
         }
         if (!tool) {
             tool = std::move(prism);

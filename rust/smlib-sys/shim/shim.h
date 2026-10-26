@@ -87,7 +87,7 @@ enum sm_surface_kind {
 };
 
 /* Room for a label's role, including its terminating NUL. */
-#define SM_LABEL_ROLE_CAPACITY 64
+#define SM_LABEL_ROLE_CAPACITY 256
 
 /* A caller's label on a face or edge: the feature that made it, the role it
  * plays in that feature, and an index telling apart entities one feature
@@ -447,12 +447,15 @@ sm_status sm_brep_merge_faces(sm_brep *brep);
  * thinned past the chamfer on its rim) swallows the chamfer and meets the
  * plane beyond directly, as if the edge had never been chamfered, where it
  * runs along that plane's normal and nothing else stands near the chamfer.
+ * Pushing through merges back only the faces its own cuts split: an edge
+ * that already joined two faces on one surface (an imprint's) stays.
  * A picked face beside an unpicked face on its own surface (two pieces of
  * one face, as an imprint splits it) steps away from it instead: the picked
  * faces are swept along the move into prisms, which are joined (pulled out)
  * or cut (pushed in), so a wall stands along each edge to such a face and
  * every other neighbour stretches or is trimmed along its surface as
- * before. The moved faces keep their labels; the walls have none. That
+ * before. The moved faces keep their labels, and each wall takes the label
+ * of the edge it stands on, if that has one. That
  * needs every picked face planar, all facing one way, and every other
  * neighbour standing along the move (a plane containing it, or a cylinder
  * along it): SM_SHIM_ERR_UNSUPPORTED_STEP otherwise. SM_SHIM_ERR_OBSTRUCTED
