@@ -1164,11 +1164,13 @@ static ULONG lDebugCount = 0 ;
   dGenAngleMin = 180.0 * dGenAngleMin / SM_PI;
   dGenAngleMax = 180.0 * dGenAngleMax / SM_PI;
 
-  // snap to ends for small tolerances
-  if(   smos_Fabs(dGenAngleMin) < SM_EFF_ZERO)       { dGenAngleMin = 0.0 ; }
-  if(   smos_Fabs(dGenAngleMax) < SM_EFF_ZERO
-     || smos_Fabs(dGenAngleMax-360.0) < SM_EFF_ZERO) { dGenAngleMax = 360.0 ; }
-  if(dGenAngleMax < dGenAngleMin) { dGenAngleMax += 360.0 ; }
+  // snap to ends for small tolerances, as RebuildSTEPFromNURBParameters does:
+  // a whole generator circle's start and end angles both come out a few
+  // 1e-12 degrees off zero, and must give a whole turn, not an empty one
+  if(   smos_Fabs(dGenAngleMin) < SM_EFF_ZERO_DEG)       { dGenAngleMin  =   0.0; }
+  if(   smos_Fabs(dGenAngleMax) < SM_EFF_ZERO_DEG
+     || smos_Fabs(dGenAngleMax-360.0) < SM_EFF_ZERO_DEG) { dGenAngleMax  = 360.0; }
+  if ( dGenAngleMax < dGenAngleMin+SM_EFF_ZERO_DEG )     { dGenAngleMax += 360.0; }
 
   // define Torus domain
   SmExtent2d sAnalUVDomain(pSweepIvl->GetMin(), dGenAngleMin, pSweepIvl->GetMax(), dGenAngleMax);
