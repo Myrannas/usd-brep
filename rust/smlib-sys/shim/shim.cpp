@@ -4443,6 +4443,14 @@ sm_status sm_brep_merge_faces(sm_brep* brep) {
     return guarded([&] { return static_cast<sm_status>(brep_of(brep)->RemoveTopologicalEdgesAndVertices()); });
 }
 
+sm_status sm_brep_combine(sm_brep* brep, const sm_brep* other) {
+    if (!brep || !other) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (brep_of(brep) == brep_of(other)) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    // FALSE: keep every surface's type, as copied.
+    return guarded(
+        [&] { return static_cast<sm_status>(brep_of(brep)->MergeBrep(*brep_of(other), NULL, NULL, FALSE)); });
+}
+
 sm_status sm_brep_create_tapered_prism(const sm_vec3* points, size_t count, double height, double draft_deg,
                                        sm_brep** out) {
     if (!points || !out) return SM_SHIM_ERR_NULL_ARGUMENT;

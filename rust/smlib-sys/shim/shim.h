@@ -641,6 +641,14 @@ void sm_shell_faces_free(sm_shell_face *faces);
  * follow sm_label's merge rule. */
 sm_status sm_brep_merge_faces(sm_brep *brep);
 
+/* Adds a copy of other's solids to the brep as lumps of their own, labels
+ * and all, without intersecting them with the brep's (SmBrep::MergeBrep,
+ * keeping surface types). For solids that neither touch nor overlap, such as
+ * a pattern's copies, it's their union without a boolean's work; solids that
+ * touch or overlap make a brep that isn't a valid solid, which the caller
+ * must rule out. other is unchanged; it may not be brep itself. */
+sm_status sm_brep_combine(sm_brep *brep, const sm_brep *other);
+
 /* Moves the faces at the given indices of the brep's face list `distance`
  * along their outward normals (negative moves them inward), in place, as a
  * Parasolid face offset does: every other neighbour is extended or trimmed

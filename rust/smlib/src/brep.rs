@@ -1152,6 +1152,20 @@ impl Brep {
         })
     }
 
+    /// Adds a copy of `other`'s solids to this brep as lumps of their own,
+    /// with their labels, without intersecting them with this brep's
+    /// (`SmBrep::MergeBrep`): for solids that neither touch nor overlap, such
+    /// as a pattern's copies, it's their union without a boolean's work.
+    /// Solids that touch or overlap make a brep that isn't a valid solid, so
+    /// the caller must know they're apart; use [`union`](Brep::union)
+    /// otherwise. Every surface keeps its type.
+    pub fn combine(&mut self, other: &Brep) -> Result<(), Error> {
+        // SAFETY: both are live breps on the kernel thread, and distinct,
+        // since self is borrowed mutably.
+        let status = unsafe { sys::sm_brep_combine(self.raw.as_ptr(), other.raw.as_ptr()) };
+        Error::check("SmBrep::MergeBrep", status)
+    }
+
     /// Merges faces that lie on one surface into one face, and edges that lie
     /// on one curve into one edge (`SmBrep::RemoveTopologicalEdgesAndVertices`),
     /// without changing the shape: after a union that leaves a wall in two

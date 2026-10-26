@@ -87,6 +87,11 @@ cargo test -p smlib
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come
   back as single faces either way.
+- `Brep::combine` adds a copy of another brep's solids as lumps of their own
+  (`SmBrep::MergeBrep`), with no boolean: for copies that neither touch nor
+  overlap, such as a pattern's, it's their union in a fraction of the time,
+  and one boolean then takes them all as one tool. Solids that touch or
+  overlap need `union`.
 
 ## Moving, scaling and mirroring
 

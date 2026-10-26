@@ -1,6 +1,7 @@
 //! Reflections on the real kernel: what a solid keeps when it is mirrored
 //! across a plane (its labels, its surfaces' kinds, its volume, its outward
-//! normals) and how the mirrored copy joins the original.
+//! normals) and how the mirrored copy joins the original; and copies of a
+//! solid combined without a boolean, as a pattern's.
 //!
 //! As in `cases.rs`, every test sends its kernel work to one shared kernel
 //! thread.
@@ -743,5 +744,50 @@ fn the_stock_mirror_rebuilds_trims_and_turns_curves_into_nurbs() {
                 assert!(moved > 0);
             }
         }
+    });
+}
+
+#[test]
+fn copies_apart_combine_without_a_boolean() {
+    on_kernel(|k| {
+        let boss = || {
+            let mut boss = Brep::cylinder(k, [60.0, 0.0, 20.0], 6.0, 10.0).unwrap();
+            label(&mut boss);
+            boss
+        };
+        let copies = || {
+            (0..12).map(|i| {
+                let mut copy = boss();
+                copy.rotate_about([0.0; 3], [0.0, 0.0, 1.0], 30.0 * f64::from(i))
+                    .unwrap();
+                copy
+            })
+        };
+        let mut tool = boss();
+        for copy in copies().skip(1) {
+            tool.combine(&copy).unwrap();
+        }
+        assert!(tool.is_manifold().unwrap());
+        assert_eq!(tool.face_count(), 36);
+        let each = boss().volume(1e-9).unwrap();
+        let error = relative(tool.volume(1e-9).unwrap(), 12.0 * each);
+        // The integrator, on copies turned to other angles.
+        assert!(error < 1e-8, "{error:e}");
+        // Every copy keeps its labels.
+        let labels = face_labels(&tool.faces().unwrap());
+        assert!(labels.iter().all(Option::is_some));
+        assert_eq!(labels[..3], labels[33..]);
+
+        // Joined to a plate in one boolean, as joining them one at a time.
+        let plate = || Brep::cuboid(k, [-100.0, -100.0, 0.0], [200.0, 200.0, 20.0]).unwrap();
+        let once = plate().union(tool).unwrap();
+        let each_in_turn = copies().fold(plate(), |plate, copy| plate.union(copy).unwrap());
+        assert!(once.is_manifold().unwrap());
+        assert_eq!(once.face_count(), each_in_turn.face_count());
+        let error = relative(
+            once.volume(1e-9).unwrap(),
+            each_in_turn.volume(1e-9).unwrap(),
+        );
+        assert!(error < 1e-8, "{error:e}");
     });
 }

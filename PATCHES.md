@@ -754,7 +754,8 @@ that keeps what it can analytic, without touching the kernel either:
 ## Notes from the mirrors (no patch needed)
 
 `Brep::mirror` (`sm_brep_mirror`) reflects a brep across a plane and keeps
-every surface and curve what it was. Nothing in the kernel changed.
+every surface and curve what it was, and `Brep::combine` gathers a
+pattern's copies without booleans. Nothing in the kernel changed.
 
 - SMLib has its own reflection, `SmBrep::Mirror`, which `SmBrep::Transform`
   uses for a matrix with a negative determinant (`Brep::mirror_stock` wraps
@@ -815,6 +816,14 @@ every surface and curve what it was. Nothing in the kernel changed.
     don't. Keeping the faceuses' list order, and moving planes and circles
     rigidly rather than finding them again, changed nothing there. The
     torus matches exactly (0 of 15760).
+- `Brep::combine` (`sm_brep_combine`) wraps `SmBrep::MergeBrep`, which
+  copies another brep's topology and attributes in without intersecting it,
+  mapping its infinite region onto this one's. Copies of a solid that
+  neither touch nor overlap come out as one valid brep of several lumps: it
+  is manifold, its volume is the sum to 1e-8, and the copies keep their
+  labels. A boolean then takes them all as one tool, with the result that
+  joining them one at a time gives (`tests/mirror.rs`). It passes
+  `bAddAnalytics = FALSE`, so surfaces keep their types.
 - A half of a part, mirrored and joined to the other half, has the whole
   part's volume to 1e-10. Its planes, its cylinders and its fillets'
   surfaces of revolution that cross the mirror plane merge back into one
