@@ -335,7 +335,7 @@ impl Edge {
 ///
 /// When `len` is non-zero, `ptr` must point to `len` initialised elements that
 /// outlive the returned slice.
-unsafe fn slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
+pub(crate) unsafe fn slice<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
     if len == 0 || ptr.is_null() {
         &[]
     } else {

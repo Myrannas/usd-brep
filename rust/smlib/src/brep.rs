@@ -11,9 +11,10 @@ use crate::faces::{
     BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Sweep, SweptFace,
 };
 use crate::fillet::{EdgeBlend, FilletOptions};
+use crate::imprint::{Imprint, ImprintEdge};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
-use crate::mesh::{Mesh, TessellationParams};
+use crate::mesh::{Mesh, TessellationParams, slice};
 use crate::tessellation::{FaceKey, SurfaceCaches, Tessellation};
 
 /// Relative accuracy of [`Brep::face_centroid`]: placing a feature at a
@@ -584,6 +585,108 @@ impl Brep {
         // SAFETY: self is a live brep on the kernel thread.
         let status = unsafe { sys::sm_brep_merge_faces(self.raw.as_ptr()) };
         Error::check("SmBrep::RemoveTopologicalEdgesAndVertices", status)
+    }
+
+    /// [`merge_faces`](Brep::merge_faces), except that the edges at `keep` in
+    /// [`edges`](Brep::edges) stay, whether or not the faces either side lie
+    /// on one surface (`SmBrep::RemoveTopologicalEdgesAndVertices` with its
+    /// keep list). Keeping every edge but some merges faces only across
+    /// those, as when taking an [`imprint`](Brep::imprint) back off some
+    /// faces. Vertices left in the middle of one curve go, wherever they are.
+    pub fn merge_faces_keeping(&mut self, keep: &[usize]) -> Result<(), Error> {
+        const OP: &str = "SmBrep::RemoveTopologicalEdgesAndVertices";
+        let indices = keep
+            .iter()
+            .map(|&edge| u32::try_from(edge))
+            .collect::<Result<Vec<u32>, _>>()
+            .map_err(|_| Error::InvalidArgument {
+                operation: OP,
+                reason: "an edge index is out of range",
+            })?;
+        // SAFETY: self is a live brep on the kernel thread; indices holds
+        // indices.len() elements.
+        let status = unsafe {
+            sys::sm_brep_merge_faces_keeping(self.raw.as_ptr(), indices.as_ptr(), indices.len())
+        };
+        Error::check(OP, status)
+    }
+
+    /// Imprints `tool` on this brep: splits its faces and edges along the
+    /// curves where `tool`'s boundary meets them, which become edges and
+    /// vertices, and changes nothing else (`SmMerge::ManifoldBoolean` with
+    /// `SM_BO_IMPRINT`). Unlike the booleans, it doesn't merge faces on one
+    /// surface afterwards, so the pieces of a split face stay apart. The
+    /// shape and volume are unchanged.
+    ///
+    /// The pieces of a split face or edge keep its label (see [`Label`]);
+    /// the new edges have none. [`Imprint::edges`] lists every edge lying
+    /// along the tool, with the labels of the tool faces it lies on.
+    ///
+    /// Consumes both, as [`union`](Brep::union).
+    pub fn imprint(self, tool: Brep) -> Result<Imprint, Error> {
+        self.imprint_with(tool, false)
+    }
+
+    /// [`imprint`](Brep::imprint), then sorts the faces as an intersection
+    /// with `tool` would, without deleting any (`SM_BO_INTERSECTION` with
+    /// `bImprintAndClassifyFaces`): [`Imprint::inside`] says which faces lie
+    /// inside the tool.
+    pub fn imprint_classified(self, tool: Brep) -> Result<Imprint, Error> {
+        self.imprint_with(tool, true)
+    }
+
+    fn imprint_with(self, tool: Brep, classify: bool) -> Result<Imprint, Error> {
+        const OP: &str = "SmMerge::ManifoldBoolean (imprint)";
+        let a = ManuallyDrop::new(self);
+        let b = ManuallyDrop::new(tool);
+        let mut out = ptr::null_mut();
+        let mut edges = ptr::null_mut();
+        let mut edge_count = 0;
+        let mut inside = ptr::null_mut();
+        let mut face_count = 0;
+        // SAFETY: a and b are distinct live breps (each owned by value) on the
+        // kernel thread. The shim takes ownership of both for the call; the
+        // outputs are written only on success.
+        let status = unsafe {
+            sys::sm_brep_imprint(
+                a.raw.as_ptr(),
+                b.raw.as_ptr(),
+                i32::from(classify),
+                &mut out,
+                &mut edges,
+                &mut edge_count,
+                &mut inside,
+                &mut face_count,
+            )
+        };
+        if status != sys::SM_STATUS_SUCCESS {
+            // Both are still allocated but may be half-modified: discard them.
+            drop(ManuallyDrop::into_inner(a));
+            drop(ManuallyDrop::into_inner(b));
+            return Err(Error::Kernel {
+                operation: OP,
+                status: crate::Status::from_raw(status),
+            });
+        }
+        debug_assert_eq!(out, a.raw.as_ptr(), "{OP} should return its first operand");
+        // SAFETY: on success edges holds edge_count entries and inside
+        // face_count, which we copy and then free once.
+        let (edges, inside) = unsafe {
+            let copied = (
+                slice(edges, edge_count)
+                    .iter()
+                    .map(ImprintEdge::from_raw)
+                    .collect(),
+                slice(inside, face_count).iter().map(|&b| b != 0).collect(),
+            );
+            sys::sm_imprint_free(edges, inside);
+            copied
+        };
+        Ok(Imprint {
+            brep: Brep::from_raw(OP, out)?,
+            edges,
+            inside,
+        })
     }
 
     /// The indices in [`faces`](Brep::faces) of the faces `query` picks.

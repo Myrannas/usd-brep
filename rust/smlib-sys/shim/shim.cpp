@@ -47,6 +47,7 @@
 #include <SmLine.h>
 #include <SmLoop.h>
 #include <SmLoopuse.h>
+#include <SmMerge.h>
 #include <SmOffsetExecutive.h>
 #include <SmOffsetGeometryCreation.h>
 #include <SmPlane.h>
@@ -4873,5 +4874,163 @@ sm_surface_caches* sm_surface_caches_new(void) { return new (std::nothrow) sm_su
 size_t sm_surface_caches_count(const sm_surface_caches* caches) { return caches ? caches->count() : 0; }
 
 void sm_surface_caches_free(sm_surface_caches* caches) { delete caches; }
+
+}  // extern "C"
+
+// Imprinting. SmApiBooleanWithOptions can imprint, but it deletes the tool
+// or keeps it without saying which of its faces each new edge lies on, and
+// it can't classify faces and imprint without the rest of the boolean. So
+// this drives SmMerge as it does, keeping the tool until the edges' mates on
+// it have been read.
+
+namespace {
+
+// The labels of the faces an edge of the tool lies on, at most two, each
+// once, in the order the edge lists its faces.
+void tool_face_labels(const SmEdge* edge, sm_label out[2]) {
+    std::memset(out, 0, 2 * sizeof(sm_label));
+    SmTArray<SmFace*> faces;
+    edge->GetFaces(faces);
+    size_t written = 0;
+    for (ULONG i = 0; i < faces.GetSize() && written < 2; ++i) {
+        const sm_label label = read_label(faces[i]);
+        if (!label.present) continue;
+        if (written == 1 && std::memcmp(&out[0], &label, sizeof label) == 0) continue;
+        out[written++] = label;
+    }
+}
+
+// Takes the classifying merge's marks off a brep: SM_AI_BOOLEAN_SAVE and
+// SM_AI_BOOLEAN_DELETE on faces, SM_AI_BOOLEAN_INTERSECT on edges and
+// vertices.
+void unmark_merge(SmBrep& brep) {
+    const auto unmark = [](SmAObject* object, ULONG id) {
+        while (SmAttribute* mark = object->FindAttribute(id)) object->RemoveAttribute(mark);
+    };
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        unmark(faces[i], SM_AI_BOOLEAN_SAVE);
+        unmark(faces[i], SM_AI_BOOLEAN_DELETE);
+    }
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) unmark(edges[i], SM_AI_BOOLEAN_INTERSECT);
+    SmTArray<SmVertex*> vertices;
+    brep.GetVertices(vertices);
+    for (ULONG i = 0; i < vertices.GetSize(); ++i) unmark(vertices[i], SM_AI_BOOLEAN_INTERSECT);
+}
+
+// Marks every edge of a brep before an imprint, so the edges it adds are
+// the ones without the mark; split edges pass it to both pieces.
+const ULONG OLD_EDGE_ATTRIBUTE_ID = 0x534d4f45;  // "SMOE"
+
+void mark_edges(SmBrep& brep) {
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        edges[i]->AddAttribute(new (*edges[i]->GetContext()) SmGenericAttribute(
+            OLD_EDGE_ATTRIBUTE_ID, SM_AB_COPY, SmTArray<long>(), SmTArray<double>(), SmTArray<char>()));
+    }
+}
+
+void unmark_edges(SmBrep& brep) {
+    SmTArray<SmEdge*> edges;
+    brep.GetEdges(edges);
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        while (SmAttribute* mark = edges[i]->FindAttribute(OLD_EDGE_ATTRIBUTE_ID)) edges[i]->RemoveAttribute(mark);
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+sm_status sm_brep_imprint(sm_brep* brep, sm_brep* tool, int32_t classify, sm_brep** out, sm_imprint_edge** edges,
+                          size_t* edge_count, uint8_t** inside, size_t* face_count) {
+    if (!brep || !tool || !out || !edges || !edge_count || !inside || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (brep == tool) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmBrep* other = brep_of(tool);
+        std::vector<sm_imprint_edge> along;
+        std::vector<uint8_t> in;
+        mark_edges(*target);
+        {
+            // Imprinting stops before the boolean deletes any face or merges
+            // faces on one surface; classifying goes on to sort the faces as
+            // an intersection would keep them, marking them instead.
+            SmMergeOptions options(FALSE, classify ? FALSE : TRUE, FALSE, classify ? TRUE : FALSE, TRUE);
+            SmMerge merge(*SmApiGetOrCreateContext(), target, other, 0, 0, &options);
+            const SmBooleanOperationType operation = classify ? SM_BO_INTERSECTION : SM_BO_IMPRINT;
+            SmBrep* result = nullptr;
+            const SmStatus status = target->IsManifoldSolid() && other->IsManifoldSolid()
+                                        ? merge.ManifoldBoolean(operation, result)
+                                        : merge.NonManifoldBoolean(operation, result);
+            if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+            if (result != target) return static_cast<sm_status>(SM_ERR);
+
+            SmTArray<SmEdge*> common;
+            SmTArray<SmEdge*> mates;
+            merge.GetTopologyIntersector().GetCommonEdges(common, mates);
+            SmTArray<SmEdge*> all;
+            target->GetEdges(all);
+            std::unordered_map<const SmEdge*, size_t> index;
+            for (ULONG i = 0; i < all.GetSize(); ++i) index.emplace(all[i], i);
+            SmTArray<SmEdge*> tool_edges;
+            other->GetEdges(tool_edges);
+            std::unordered_set<const SmEdge*> on_tool;
+            for (ULONG i = 0; i < tool_edges.GetSize(); ++i) on_tool.insert(tool_edges[i]);
+            for (ULONG i = 0; i < common.GetSize(); ++i) {
+                const auto found = index.find(common[i]);
+                if (found == index.end() || !on_tool.count(mates[i])) continue;
+                sm_imprint_edge edge;
+                std::memset(&edge, 0, sizeof edge);
+                edge.edge = found->second;
+                edge.is_new = common[i]->FindAttribute(OLD_EDGE_ATTRIBUTE_ID) == NULL ? 1 : 0;
+                tool_face_labels(mates[i], edge.tool_faces);
+                along.push_back(edge);
+            }
+            std::sort(along.begin(), along.end(),
+                      [](const sm_imprint_edge& a, const sm_imprint_edge& b) { return a.edge < b.edge; });
+
+            if (classify) {
+                SmTArray<SmFace*> faces;
+                target->GetFaces(faces);
+                for (ULONG i = 0; i < faces.GetSize(); ++i) {
+                    in.push_back(faces[i]->FindAttribute(SM_AI_BOOLEAN_SAVE) != NULL ? 1 : 0);
+                }
+                unmark_merge(*target);
+            }
+            unmark_edges(*target);
+        }
+        std::unique_ptr<sm_imprint_edge[]> edge_array(new sm_imprint_edge[along.size()]);
+        std::copy(along.begin(), along.end(), edge_array.get());
+        std::unique_ptr<uint8_t[]> inside_array(in.empty() ? nullptr : new uint8_t[in.size()]);
+        std::copy(in.begin(), in.end(), inside_array.get());
+        delete other;
+        *out = brep;
+        *edges = edge_array.release();
+        *edge_count = along.size();
+        *inside = inside_array.release();
+        *face_count = in.size();
+        return SM_SUCCESS;
+    });
+}
+
+void sm_imprint_free(sm_imprint_edge* edges, uint8_t* inside) {
+    delete[] edges;
+    delete[] inside;
+}
+
+sm_status sm_brep_merge_faces_keeping(sm_brep* brep, const uint32_t* keep, size_t count) {
+    if (!brep || (count > 0 && !keep)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmBrep* target = brep_of(brep);
+        SmTArray<SmEdge*> kept;
+        if (edges_at(*target, keep, count, kept) != SM_SUCCESS) return SM_SHIM_ERR_BAD_EDGE;
+        return static_cast<sm_status>(target->RemoveTopologicalEdgesAndVertices(&kept));
+    });
+}
 
 }  // extern "C"

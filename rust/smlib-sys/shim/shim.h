@@ -568,6 +568,52 @@ size_t sm_surface_caches_count(const sm_surface_caches *caches);
 /* Deletes the store and its caches. NULL is ignored. */
 void sm_surface_caches_free(sm_surface_caches *caches);
 
+/* An edge of an imprinted brep that lies along the tool's boundary: its
+ * index in the brep's edge list, whether the imprint made it (is_new 1) or
+ * it, or the edge it was split from, was there before (0), and the labels of
+ * the tool's faces it lies on (sm_label.present is 0 for none). One label
+ * where it lies inside a tool face; two where it runs along one of the
+ * tool's edges; none where those faces have none. */
+typedef struct sm_imprint_edge {
+    size_t edge;
+    int32_t is_new;
+    sm_label tool_faces[2];
+} sm_imprint_edge;
+
+/* Imprints `tool` on `brep`: splits brep's faces and edges along the curves
+ * where tool's boundary meets them, which become edges and vertices of
+ * brep, and changes nothing else (SmMerge::ManifoldBoolean with
+ * SM_BO_IMPRINT, keeping the tool). There is no post-process merge, so
+ * pieces of a face on one surface stay apart. The shape is unchanged. Split
+ * faces and edges keep their labels on every piece (see sm_label); the new
+ * edges have none.
+ *
+ * *edges lists, by edge index, every edge of the result that lies along the
+ * tool, new or already there, with the tool faces it lies on (see
+ * sm_imprint_edge).
+ *
+ * With classify non-zero, the imprint goes on to sort the faces as an
+ * intersection would, without deleting any (SM_BO_INTERSECTION with
+ * bImprintAndClassifyFaces): *inside has one byte per face of the result,
+ * non-zero for a face inside the tool, and *face_count is the face count.
+ * Otherwise *inside is NULL and *face_count 0.
+ *
+ * Ownership as for the booleans: on success *out is brep (modified in
+ * place) and tool has been deleted; on failure both are still allocated
+ * but may have been modified, and the caller frees both. Free *edges and
+ * *inside together with sm_imprint_free. */
+sm_status sm_brep_imprint(sm_brep *brep, sm_brep *tool, int32_t classify, sm_brep **out, sm_imprint_edge **edges,
+                          size_t *edge_count, uint8_t **inside, size_t *face_count);
+
+/* Frees the arrays sm_brep_imprint returns. NULLs are ignored. */
+void sm_imprint_free(sm_imprint_edge *edges, uint8_t *inside);
+
+/* sm_brep_merge_faces, except that the edges at the given indices of the
+ * brep's edge list stay, whether or not the faces either side lie on one
+ * surface (SmBrep::RemoveTopologicalEdgesAndVertices with pOptKeepEdges).
+ * SM_SHIM_ERR_BAD_EDGE when an index is out of range or repeated. */
+sm_status sm_brep_merge_faces_keeping(sm_brep *brep, const uint32_t *keep, size_t count);
+
 #ifdef __cplusplus
 }
 #endif

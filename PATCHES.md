@@ -331,3 +331,35 @@ are. The shim's `make_sides_analytic` does it after the sweep:
   and face gaps (5e-15 for a rectangle with a round hole); booleans and face
   merges with the new sides work as before (`tests/planar_faces.rs`,
   `tests/labels.rs`).
+
+## Notes from the imprint work (no patch needed)
+
+`Brep::imprint` and `Brep::imprint_classified` (`sm_brep_imprint`) and
+`Brep::merge_faces_keeping` (`sm_brep_merge_faces_keeping`) are shim and Rust
+only. What the shim relies on:
+
+- `SmMerge::ManifoldBoolean` with `SM_BO_IMPRINT` (or `bImprinting`) returns
+  as soon as the intersection is inserted and the loops are checked, before
+  any face is deleted and before the post-process that merges faces on one
+  surface, so `bBooleanPostProcess` makes no difference: the imprint
+  survives with it on or off. `bImprintAndClassifyFaces` returns before the
+  post-process too, after sorting the faces into keep and delete lists,
+  which it marks with `SM_AI_BOOLEAN_SAVE` and `SM_AI_BOOLEAN_DELETE`
+  (reference attributes) instead of deleting any. The shim reads and removes
+  the marks.
+- No public call fits. `SmApiBooleanWithOptions` keeps or deletes the tool
+  but doesn't say which tool face each new edge lies on, and
+  `SmApiBooleanWithCurves` returns the intersection edges with the default
+  options, under which `SM_BO_IMPRINT` deletes the tool. So the shim builds
+  the `SmMerge` itself with `bKeepOtherBrep`, reads each common edge's mate on
+  the tool (`SmTopologyIntersector::GetCommonEdges`) and the labels of the
+  mate's faces, and then deletes the tool.
+- Split faces keep their label on every piece, and the pieces' UV domains
+  are recomputed to fit them, so they and their neighbours key differently
+  for tessellation. Where the tool only touches a face, as a cylinder tangent
+  to a plane does, the imprint still splits the face along the touching
+  line.
+- `RemoveTopologicalEdgesAndVertices` without a keep list removes every
+  imprinted edge between two pieces of one surface. That includes
+  `Brep::merge_faces` and the shim's own merges in Offset Face's
+  push-through.

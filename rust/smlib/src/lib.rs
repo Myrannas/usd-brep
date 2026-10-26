@@ -42,6 +42,7 @@ mod edges;
 mod error;
 mod faces;
 mod fillet;
+mod imprint;
 mod kernel;
 mod label;
 mod mesh;
@@ -55,6 +56,7 @@ pub use faces::{
     SweptFace,
 };
 pub use fillet::{Continuity, CrossSection, EdgeBlend, FilletOptions};
+pub use imprint::{Imprint, ImprintEdge};
 pub use kernel::Kernel;
 pub use label::{Label, LabelMatch, MAX_ROLE_LEN};
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};
