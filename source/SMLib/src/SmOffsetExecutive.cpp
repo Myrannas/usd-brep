@@ -1457,10 +1457,11 @@ SmBoolean bDebugMeAll = FALSE ;
   SmTArray<SmEdge*>    sNewEdges;
   m_vEUToEU.GetAllFirsts(sOffsetEdgeuses);
 
-  // A local operation mates edges in the original Brep's order: the map's
-  // own order follows the edgeuses' addresses, and it decides which edge is
-  // mated first and which of an edge's sides is the target.
-  if (m_eOffsetOperation == SM_OO_LOCAL_OPERATION)
+  // A local operation or a solid offset (a shell's) mates edges in the
+  // original Brep's order: the map's own order follows the edgeuses'
+  // addresses, and it decides which edge is mated first and which of an
+  // edge's sides is the target.
+  if (m_eOffsetOperation == SM_OO_LOCAL_OPERATION || m_eOffsetOperation == SM_OO_SOLID_OFFSET)
     { sm_SortInBrepOrder(m_pOriginalBrep, sOffsetEdgeuses); }
 
 #ifdef SM_VALIDATE_TOPOLOGY
