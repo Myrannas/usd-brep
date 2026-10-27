@@ -19,7 +19,7 @@ use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams, slice};
 use crate::motion::{Moved, MovedFace, RigidMotion};
-use crate::pipe::{Pipe, PipeFace};
+use crate::pipe::{PathEnd, Pipe, PipeFace, ProfileFace, ProfileSweep};
 use crate::shell::{Shell, ShellFace};
 use crate::tessellation::{FaceKey, SurfaceCaches, Tessellation};
 
@@ -941,48 +941,14 @@ impl Brep {
                 reason,
             })
         };
-        if path.is_empty() {
-            return invalid("the path needs at least one curve");
-        }
-        if let Some(reason) = path.iter().find_map(PlaneCurve::problem) {
-            return invalid(reason);
-        }
-        let circle = |c: &PlaneCurve| matches!(c, PlaneCurve::Circle { .. });
-        if path.len() > 1 && path.iter().any(circle) {
-            return invalid("a circle is a path on its own");
-        }
-        if path
-            .windows(2)
-            .any(|pair| gap(pair[0].end(), pair[1].start()) > LOOP_GAP)
-        {
-            return invalid("each curve of the path must start where the last ended");
-        }
-        // Where each curve meets the next, and the last the first when closed.
-        let closed = path.len() > 1 && gap(path[path.len() - 1].end(), path[0].start()) <= LOOP_GAP;
-        let ring = closed
-            || path.iter().any(|c| match *c {
-                PlaneCurve::Arc { sweep_deg, .. } => sweep_deg.abs() == 360.0,
-                _ => circle(c),
-            });
+        let ring = match path_problem(path) {
+            Ok(ring) => ring,
+            Err(reason) => return invalid(reason),
+        };
         if ring && inner_radius.is_some() {
             return invalid(
                 "a pipe along a closed path can't be hollow: its bore would be sealed inside",
             );
-        }
-        let joints = path.windows(2).map(|pair| (pair[0], pair[1]));
-        let closing = closed.then(|| (path[path.len() - 1], path[0]));
-        for (before, after) in joints.chain(closing) {
-            let ([x1, y1], [x2, y2]) = (before.end_tangent(), after.start_tangent());
-            let turn = (x1 * y2 - y1 * x2).abs().atan2(x1 * x2 + y1 * y2);
-            if turn > MAX_PIPE_TURN_DEG.to_radians() {
-                return invalid("the path turns back on itself");
-            }
-            let arc = |c: PlaneCurve| !matches!(c, PlaneCurve::Line { .. });
-            if turn > 1e-9 && (arc(before) || arc(after)) {
-                return invalid(
-                    "an arc in the path must meet the curves either side of it tangentially",
-                );
-            }
         }
         check_positive(OP, radius, "the radius must be finite and positive")?;
         let inner = inner_radius.unwrap_or(0.0);
@@ -1040,6 +1006,148 @@ impl Brep {
             roles
         };
         Ok(Pipe {
+            solid: Brep::from_raw(OP, out)?,
+            faces: roles,
+        })
+    }
+
+    /// A closed `profile` swept along `path`, lines and arcs in `frame`'s xy
+    /// plane taken as [`pipe`](Brep::pipe) takes them: a groove's tool, or a
+    /// bead's. The profile is a loop of lines and arcs (or a circle) in its
+    /// own (x, y), standing square to the path: x runs across it, positive
+    /// to the left (the frame's z cross the path's direction), and y along
+    /// the frame's z. So a groove on a face, where the frame is the face's
+    /// with z its outward normal, has its profile below y = 0, and a belt
+    /// round a part, where the frame is level and z runs up the walls, has
+    /// it reaching into the part across x.
+    ///
+    /// It's the pipe's construction with the profile in place of the disc:
+    /// a piece per curve, the profile swept along a line as
+    /// [`sweep_face`](Brep::sweep_face) does or turned about an arc's centre
+    /// as [`revolve_face`](Brep::revolve_face) does, met face to face where
+    /// curves meet tangentially and mitred where lines meet at an angle (any
+    /// profile's two sections match on the plane halfway between them), and
+    /// the pieces joined (`SmApiBooleanUnion`). An open path ends at each end
+    /// as `ends` says, its start then its end: [`PathEnd::Square`], the
+    /// profile itself, or [`PathEnd::Round`], the profile's left half (x ≥
+    /// 0) turned half a turn about the frame's z through the end, which is
+    /// round for a profile symmetric across x = 0. A closed path has no
+    /// ends. [`ProfileSweep::faces`] says which path curve and which profile
+    /// segment each side was swept from, and which faces are the ends.
+    ///
+    /// Refuses, besides what [`pipe`](Brep::pipe) refuses of a path, a
+    /// profile that isn't one closed loop, a bend no wider than the profile
+    /// reaches towards its centre, and a round end on a profile that doesn't
+    /// straddle the path (reach both sides of x = 0).
+    pub fn sweep_profile(
+        _kernel: &Kernel,
+        frame: &Frame,
+        path: &[PlaneCurve],
+        profile: &[PlaneCurve],
+        ends: [PathEnd; 2],
+    ) -> Result<ProfileSweep, Error> {
+        const OP: &str = "sm_brep_sweep_profile";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
+        };
+        let ring = match path_problem(path) {
+            Ok(ring) => ring,
+            Err(reason) => return invalid(reason),
+        };
+        if profile.is_empty() {
+            return invalid("the profile needs at least one curve");
+        }
+        if let Some(reason) = profile.iter().find_map(PlaneCurve::problem) {
+            return invalid(reason);
+        }
+        let circle = |c: &PlaneCurve| matches!(c, PlaneCurve::Circle { .. });
+        if profile.len() > 1 && profile.iter().any(circle) {
+            return invalid("a circle is a profile on its own");
+        }
+        let next = profile.iter().cycle().skip(1);
+        if profile
+            .iter()
+            .zip(next)
+            .any(|(curve, after)| gap(curve.end(), after.start()) > LOOP_GAP)
+        {
+            return invalid("the profile's curves must run head to tail and close");
+        }
+        let [min_x, max_x, ..] = extent(profile);
+        let tight = |c: &PlaneCurve| match *c {
+            PlaneCurve::Arc {
+                radius, sweep_deg, ..
+            } => {
+                let towards = if sweep_deg > 0.0 { max_x } else { -min_x };
+                towards >= radius
+            }
+            PlaneCurve::Circle { radius, .. } => max_x >= radius,
+            PlaneCurve::Line { .. } => false,
+        };
+        if path.iter().any(tight) {
+            return invalid(
+                "a bend's radius must be more than the profile reaches towards its centre",
+            );
+        }
+        let round = !ring && ends.contains(&PathEnd::Round);
+        if round && !(min_x < 0.0 && max_x > 0.0) {
+            return invalid("a round end needs a profile reaching both sides of the path");
+        }
+        let raw_path = path
+            .iter()
+            .map(|curve| curve.to_raw(&None, OP))
+            .collect::<Result<Vec<_>, _>>()?;
+        let raw_profile = profile
+            .iter()
+            .map(|curve| curve.to_raw(&None, OP))
+            .collect::<Result<Vec<_>, _>>()?;
+        let [start_end, end_end] = ends.map(|end| match end {
+            PathEnd::Square => sys::SM_PATH_END_SQUARE as i32,
+            PathEnd::Round => sys::SM_PATH_END_ROUND as i32,
+        });
+        let mut out = ptr::null_mut();
+        let mut faces = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: raw_path and raw_profile hold their lengths' curves; the
+        // outputs are written only on success.
+        let status = unsafe {
+            sys::sm_brep_sweep_profile(
+                raw_path.as_ptr(),
+                raw_path.len(),
+                raw_profile.as_ptr(),
+                raw_profile.len(),
+                vec3(frame.origin),
+                vec3(frame.x_axis),
+                vec3(frame.y_axis),
+                start_end,
+                end_end,
+                &mut out,
+                &mut faces,
+                &mut count,
+            )
+        };
+        match status {
+            sys::SM_SHIM_ERR_BAD_PATH => return invalid("the path turns back on itself"),
+            sys::SM_SHIM_ERR_ARC_CORNER => {
+                return invalid(
+                    "an arc in the path must meet the curves either side of it tangentially",
+                );
+            }
+            _ => Error::check(OP, status)?,
+        }
+        // SAFETY: on success faces holds count entries, which we copy and then
+        // free once.
+        let roles = unsafe {
+            let roles = slice(faces, count)
+                .iter()
+                .map(ProfileFace::from_raw)
+                .collect();
+            sys::sm_profile_faces_free(faces);
+            roles
+        };
+        Ok(ProfileSweep {
             solid: Brep::from_raw(OP, out)?,
             faces: roles,
         })
@@ -1981,6 +2089,88 @@ impl fmt::Debug for Brep {
 
 fn gap(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+/// Whether a [`Brep::pipe`] or [`Brep::sweep_profile`] path is a ring
+/// (closed, or a whole circle or turn), or why the shim would refuse it.
+fn path_problem(path: &[PlaneCurve]) -> Result<bool, &'static str> {
+    if path.is_empty() {
+        return Err("the path needs at least one curve");
+    }
+    if let Some(reason) = path.iter().find_map(PlaneCurve::problem) {
+        return Err(reason);
+    }
+    let circle = |c: &PlaneCurve| matches!(c, PlaneCurve::Circle { .. });
+    if path.len() > 1 && path.iter().any(circle) {
+        return Err("a circle is a path on its own");
+    }
+    if path
+        .windows(2)
+        .any(|pair| gap(pair[0].end(), pair[1].start()) > LOOP_GAP)
+    {
+        return Err("each curve of the path must start where the last ended");
+    }
+    // Where each curve meets the next, and the last the first when closed.
+    let closed = path.len() > 1 && gap(path[path.len() - 1].end(), path[0].start()) <= LOOP_GAP;
+    let joints = path.windows(2).map(|pair| (pair[0], pair[1]));
+    let closing = closed.then(|| (path[path.len() - 1], path[0]));
+    for (before, after) in joints.chain(closing) {
+        let ([x1, y1], [x2, y2]) = (before.end_tangent(), after.start_tangent());
+        let turn = (x1 * y2 - y1 * x2).abs().atan2(x1 * x2 + y1 * y2);
+        if turn > MAX_PIPE_TURN_DEG.to_radians() {
+            return Err("the path turns back on itself");
+        }
+        let arc = |c: PlaneCurve| !matches!(c, PlaneCurve::Line { .. });
+        if turn > 1e-9 && (arc(before) || arc(after)) {
+            return Err("an arc in the path must meet the curves either side of it tangentially");
+        }
+    }
+    Ok(closed
+        || path.iter().any(|c| match *c {
+            PlaneCurve::Arc { sweep_deg, .. } => sweep_deg.abs() == 360.0,
+            _ => circle(c),
+        }))
+}
+
+/// The box a loop of lines and arcs lies in: its least and greatest x, then
+/// y.
+fn extent(curves: &[PlaneCurve]) -> [f64; 4] {
+    let mut extent = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+    let mut take = |[x, y]: [f64; 2]| {
+        extent[0] = extent[0].min(x);
+        extent[1] = extent[1].max(x);
+        extent[2] = extent[2].min(y);
+        extent[3] = extent[3].max(y);
+    };
+    for curve in curves {
+        let (centre, radius, from, sweep) = match *curve {
+            PlaneCurve::Line { start, end } => {
+                take(start);
+                take(end);
+                continue;
+            }
+            PlaneCurve::Arc {
+                centre,
+                radius,
+                start_deg,
+                sweep_deg,
+            } => (centre, radius, start_deg, sweep_deg),
+            PlaneCurve::Circle { centre, radius } => (centre, radius, 0.0, 360.0),
+        };
+        let (low, high) = (from.min(from + sweep), from.max(from + sweep));
+        let at = |deg: f64| {
+            let (sin, cos) = deg.to_radians().sin_cos();
+            [centre[0] + radius * cos, centre[1] + radius * sin]
+        };
+        take(at(low));
+        take(at(high));
+        let mut quarter = (low / 90.0).ceil() * 90.0;
+        while quarter < high {
+            take(at(quarter));
+            quarter += 90.0;
+        }
+    }
+    extent
 }
 
 fn c_path(operation: &'static str, path: &Path) -> Result<CString, Error> {
