@@ -51,8 +51,8 @@ static const sm_status SM_SHIM_ERR_DRAFT_CLOSES = 2034;        /* a draft's side
 static const sm_status SM_SHIM_ERR_BAD_PATH = 2035;            /* a pipe's path turns back on itself, or a bend overlaps itself */
 static const sm_status SM_SHIM_ERR_ARC_CORNER = 2036;          /* an arc of a pipe's path meets a curve beside it at an angle */
 static const sm_status SM_SHIM_ERR_BAD_SHELL = 2037;           /* a shell's input isn't a manifold solid, or its result isn't one */
-static const sm_status SM_SHIM_ERR_SPLITS_SOLID = 2038;        /* a face pushed out of the solid would cut it in two */
-static const sm_status SM_SHIM_ERR_EMPTIES_SOLID = 2039;       /* a face pushed out of the solid would leave nothing of it */
+static const sm_status SM_SHIM_ERR_SPLITS_SOLID = 2040;        /* a face pushed out of the solid would cut it in two */
+static const sm_status SM_SHIM_ERR_EMPTIES_SOLID = 2041;       /* a face pushed out of the solid would leave nothing of it */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */

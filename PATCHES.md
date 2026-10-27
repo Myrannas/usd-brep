@@ -726,8 +726,8 @@ push-through's booleans with one more thing set aside.
   part as it was loses what the move swept, and it opens where the face
   and its neighbours run out of it. The result is checked as any
   push-through's is (manifold, outward, loops apart, a trusted volume),
-  with `SHIM_ERR_EMPTIES_SOLID` (2039) when nothing is left and
-  `SHIM_ERR_SPLITS_SOLID` (2038) when it has more shells than before.
+  with `SHIM_ERR_EMPTIES_SOLID` (2041) when nothing is left and
+  `SHIM_ERR_SPLITS_SOLID` (2040) when it has more shells than before.
   `sm_brep_offset_breakout` (`Brep::offset_breakout`) lists the faces it
   breaks through, for callers' words.
 - **Names.** The pushed face keeps its label where it stays and is gone
