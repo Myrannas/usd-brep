@@ -537,6 +537,32 @@ fn refuses_edges_that_dont_run_end_to_end() {
     assert_eq!(reasons, ["the edges must be the brep's and run end to end"; 2]);
 }
 
+#[test]
+fn refuses_a_chain_over_a_sharp_edge() {
+    // The ruling up to the top, then round the top's rim from it: a right
+    // angle, which the interpolated normal would round.
+    let reason = on_kernel(|k| {
+        let (part, chain) = imprinted(k, [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        let top = [0.0, 20.0, 60.0];
+        let near = |a: [f64; 3]| sub(a, top).iter().all(|d| d.abs() < 1e-6);
+        let rim = part
+            .edges()
+            .unwrap()
+            .iter()
+            .find(|e| {
+                e.samples.iter().all(|&p| on_wall(p) && (p[2] - 60.0).abs() < 1e-6)
+                    && (near(e.samples[0]) || near(e.samples[e.samples.len() - 1]))
+            })
+            .map(|e| e.index)
+            .unwrap();
+        match part.sweep_profile_along(&[chain[0], rim], &square().0, 8, 1e-4) {
+            Err(Error::InvalidArgument { reason, .. }) => reason,
+            other => panic!("{other:?}"),
+        }
+    });
+    assert_eq!(reason, "the edges must meet tangentially, not at a sharp edge");
+}
+
 /// That the mesh's triangles wind with the kernel's normals and enclose the
 /// solid's volume to 1%.
 fn assert_mesh(mesh: &Mesh, volume: f64) {

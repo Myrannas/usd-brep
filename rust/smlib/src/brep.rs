@@ -1158,7 +1158,9 @@ impl Brep {
     /// whose path leaves one plane (a diagonal across a round, a line on a
     /// NURBS face). The edges, by index in [`edges`](Brep::edges), run end
     /// to end in order, each either way along its curve, and join
-    /// tangentially. The profile is [`sweep_profile`](Brep::sweep_profile)'s:
+    /// tangentially, within 1e-3 radians: a chain over a sharp edge of the
+    /// part is refused, since the normal would round its corner. The
+    /// profile is [`sweep_profile`](Brep::sweep_profile)'s:
     /// x to the left of the chain, y along the outward normal of the faces
     /// it lies on.
     ///
@@ -1235,10 +1237,15 @@ impl Brep {
                 &mut count,
             )
         };
-        if status == sys::SM_SHIM_ERR_BAD_EDGE {
-            return invalid("the edges must be the brep's and run end to end");
+        match status {
+            sys::SM_SHIM_ERR_BAD_EDGE => {
+                return invalid("the edges must be the brep's and run end to end");
+            }
+            sys::SM_SHIM_ERR_ARC_CORNER => {
+                return invalid("the edges must meet tangentially, not at a sharp edge");
+            }
+            _ => Error::check(OP, status)?,
         }
-        Error::check(OP, status)?;
         // SAFETY: on success faces holds count entries, which we copy and then
         // free once.
         let roles = unsafe {

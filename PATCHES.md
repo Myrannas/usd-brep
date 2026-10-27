@@ -1095,11 +1095,14 @@ line along its normal makes them, its y following the faces' normal.
 - Tests (`sweep_profile.rs`): a square groove up a cylinder's side, its
   volume and what it cuts within 1e-4 of the exact ones and its floor its
   depth in; round half an ellipse on a cylinder's side, its floor its depth
-  in all the way round; edges that don't run end to end refused.
+  in all the way round; edges that don't run end to end, or meet at a
+  sharp edge, refused.
 - On the crate: diagonals at 15° to 60° across a vertical round (a plane,
   the round's ellipse, a plane), a line at 10° across the front and both
   rounds (5 edges, 489 mm), and a diagonal and a level line across the
-  rounds stretched into NURBS (`Brep::scale_axes_keeping`). Every profile
+  rounds stretched into NURBS (`Brep::scale_axes_keeping`), and over the
+  corner of a box rounded 20 on every edge, where three rounds meet (a
+  plane, a cylinder, a sphere, a cylinder). Every profile
   (a V whose slopes run on, square, round, stepped) at 16 samples an edge
   and 1e-2, 32 and 1e-3, 64 and 1e-4 sweeps and cuts manifold. A 140 to
   240 mm groove sweeps in 10 to 70 ms and cuts in 13 to 95; the 489 mm one
@@ -1108,6 +1111,11 @@ line along its normal makes them, its y following the faces' normal.
   What a cut removes is 3e-3 to 9e-3 under the profile's area times the
   length, as it should be on a convex round, and agrees across the
   tolerances to 4e-4.
+- Edges must meet tangentially, within 1e-3 radians, or the chain is
+  refused (`SM_SHIM_ERR_ARC_CORNER`). Over a box's sharp edge the
+  interpolated normal rounds the corner: the groove came out 2 to 8% off
+  its volume at 16 and 32 samples an edge, and at 64 the sweep failed
+  (`SM_SHIM_ERR_BAD_SWEEP`) or the cut did (`SM_ERR`).
 - A V whose corners lie on the surface crashed in the cut, on the 15°
   diagonal at 1e-3 (`SIGSEGV` in `SmApiBooleanDifference`, at
   `sm_WhichPVToCombine`); at 1e-2 it cut, leaving slivers of its walls.

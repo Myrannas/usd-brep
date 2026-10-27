@@ -666,9 +666,10 @@ void sm_profile_faces_free(sm_profile_face *faces);
  * lies along, by its index in `edges`; the sweep splits its sides only where
  * it isn't smooth, not at every edge.
  * SM_SHIM_ERR_BAD_EDGE for an edge out of range or a chain that doesn't run
- * end to end; SM_ERR_INVALID_INPUT for an empty profile or a tolerance that
- * isn't positive; the kernel's status, or SM_SHIM_ERR_BAD_SWEEP, when it
- * builds no solid. The brep is unchanged. */
+ * end to end; SM_SHIM_ERR_ARC_CORNER where edges meet at more than 1e-3
+ * radians (over a sharp edge of the part); SM_ERR_INVALID_INPUT for an empty
+ * profile or a tolerance that isn't positive; the kernel's status, or
+ * SM_SHIM_ERR_BAD_SWEEP, when it builds no solid. The brep is unchanged. */
 sm_status sm_brep_sweep_profile_along(const sm_brep *brep, const uint32_t *edges, size_t edge_count,
                                       const sm_plane_curve *profile, size_t profile_count, uint32_t samples,
                                       double tolerance, sm_brep **out, sm_profile_face **faces,

@@ -8278,6 +8278,24 @@ sm_status sweep_profile_along(const SmBrep& brep, const std::vector<const SmEdge
         }
         senses.Add(forward ? TRUE : FALSE);
     }
+    // Where the edges meet they must run on smoothly. Across a sharp edge of
+    // the part the interpolated normal rounds the corner, and the groove came
+    // out 2 to 8% off its volume, or not at all, by the samples.
+    const double kink = 1e-3;
+    for (size_t i = 1; i < chain.size(); ++i) {
+        const SmExtent1d before = splines[i - 1]->GetNaturalInterval();
+        const SmExtent1d after = splines[i]->GetNaturalInterval();
+        SmPoint3d point;
+        SmVector3d leaving, arriving;
+        if (!curve_at(splines[i - 1].get(), senses[i - 1] ? before.GetMax() : before.GetMin(), point, &leaving) ||
+            !curve_at(splines[i].get(), senses[i] ? after.GetMin() : after.GetMax(), point, &arriving)) {
+            return SM_ERR;
+        }
+        leaving.Unitize(FALSE);
+        arriving.Unitize(FALSE);
+        const double along = (senses[i - 1] == senses[i] ? 1.0 : -1.0) * leaving.Dot(arriving);
+        if (along < std::cos(kink)) return SM_SHIM_ERR_ARC_CORNER;
+    }
     std::unique_ptr<SmBSplineCurve> path;
     if (chain.size() == 1) {
         path = std::move(splines[0]);
