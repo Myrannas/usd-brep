@@ -1065,7 +1065,7 @@ turn about the frame's z through the path's end and joins it.
   68 ms and cuts in 7 to 22; a 100 mm line takes 1.4 to 3 ms with square
   ends and 7 to 14 with round ones, and cuts in 1 to 2. What each cut
   removes is the profile's area under the surface times the length to
-  1e-7 or better. 20 lines with round ends sweep in 157 ms;
+  4e-7 or better. 20 lines with round ends sweep in 157 ms;
   `Brep::combine` gathers them in 2 ms and one cut takes 38, against a
   union of 34 and a cut of 40, or 222 ms for all twenty cut one by one.
 - A profile whose top corners lie on the surface is fragile. A V belt whose
