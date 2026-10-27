@@ -1,6 +1,8 @@
+use std::ffi::CString;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::path::Path;
 use std::ptr::{self, NonNull};
 
 use smlib_sys as sys;
@@ -8,7 +10,8 @@ use smlib_sys as sys;
 use crate::edges::{EDGE_SAMPLES, EdgeGeometry, EdgeQuery, Tolerance};
 use crate::error::Error;
 use crate::faces::{
-    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Sweep,
+    BoundaryCurve, FaceCentroid, FaceGeometry, FaceQuery, Frame, PlaneCurve, Relationship,
+    ScaleReport, Sweep,
 };
 use crate::fillet::{EdgeBlend, FilletOptions};
 use crate::imprint::{Imprint, ImprintEdge};
@@ -446,6 +449,200 @@ impl Brep {
             )
         };
         Error::check("SmApiTransform", status)
+    }
+
+    /// Moves the brep rigidly (`SmApiTransform`): the point p goes to
+    /// `rotation · p + translation`, with `rotation` given row by row. It
+    /// must be a rotation, orthonormal with determinant +1, to within 1e-9;
+    /// otherwise this fails with `SHIM_ERR_BAD_FRAME` and leaves the brep
+    /// alone.
+    ///
+    /// Every surface and curve keeps its type and parameterisation, so a
+    /// plane stays a plane and a face keeps its (u, v) domain, and every face
+    /// and edge keeps its index and [`Label`].
+    pub fn transform(
+        &mut self,
+        rotation: [[f64; 3]; 3],
+        translation: [f64; 3],
+    ) -> Result<(), Error> {
+        const OP: &str = "SmApiTransform";
+        check_point(OP, translation)?;
+        let rows = rotation.as_flattened();
+        // SAFETY: self is a live brep on the kernel thread; rows holds the
+        // nine doubles the shim reads.
+        let status =
+            unsafe { sys::sm_brep_transform(self.raw.as_ptr(), rows.as_ptr(), vec3(translation)) };
+        Error::check(OP, status)
+    }
+
+    /// Moves the brep by `offset`: [`transform`](Brep::transform) with no
+    /// rotation.
+    pub fn translate(&mut self, offset: [f64; 3]) -> Result<(), Error> {
+        self.transform(IDENTITY, offset)
+    }
+
+    /// Turns the brep by `angle_deg` degrees about the line through `point`
+    /// along `axis`, counter-clockwise seen from the axis's tip:
+    /// [`transform`](Brep::transform) with that rotation.
+    pub fn rotate_about(
+        &mut self,
+        point: [f64; 3],
+        axis: [f64; 3],
+        angle_deg: f64,
+    ) -> Result<(), Error> {
+        const OP: &str = "SmApiTransform";
+        check_point(OP, point)?;
+        let rotation = rotation(axis, angle_deg).ok_or(Error::InvalidArgument {
+            operation: OP,
+            reason: "the axis must be finite and not zero, and the angle finite",
+        })?;
+        let turned = rotate(&rotation, point);
+        self.transform(rotation, [0, 1, 2].map(|i| point[i] - turned[i]))
+    }
+
+    /// Scales the brep by `factor` about `point`, which stays put: the point
+    /// p goes to `point + factor · (p - point)`. The factor must be finite
+    /// and positive.
+    ///
+    /// A uniform scale keeps every surface and curve's kind and parameters:
+    /// planes, cylinders, cones, spheres, tori and offset surfaces stay what
+    /// they are. The volume scales by `factor³`. Every face and edge keeps
+    /// its index and [`Label`]. The brep's tolerance, and every face's,
+    /// edge's and vertex's, scale with it, so every gap stays within the
+    /// tolerance it was within; other breps and the kernel's own tolerance
+    /// are untouched. It is [`scale_axes_keeping`](Brep::scale_axes_keeping)
+    /// with equal factors, and fails as that does, leaving the brep alone.
+    pub fn scale_about(&mut self, point: [f64; 3], factor: f64) -> Result<(), Error> {
+        self.scale_axes_keeping(point, [factor; 3], false).map(|_| ())
+    }
+
+    /// Scales the brep about `point` by a factor along each of x, y and z:
+    /// the point p goes to `point + factors * (p - point)`, axis by axis.
+    /// The factors must be finite and positive.
+    ///
+    /// SMLib's own scale (`SmBrep::Transform`) turns every surface and curve
+    /// into a NURBS before a non-uniform scale; this keeps every one analytic
+    /// that the scale leaves so: everything under equal factors, and
+    /// otherwise planes and lines, a cylinder or cone along a scale axis
+    /// whose other two factors are equal (its radius and height scaled),
+    /// circles in a plane the scale keeps round, and surfaces of extrusion. A
+    /// circle the scale stretches becomes an ellipse where the images of its
+    /// axes stay square. With `extrusions`, a cylinder stretched across its
+    /// axis becomes an ellipse swept along a line (`SmSurfOfExtrusion`, which
+    /// [`Surface`](crate::Surface) reports as `Other`); without, a NURBS, as
+    /// is every other surface the scale distorts (spheres and tori among
+    /// them).
+    ///
+    /// Each new surface and curve keeps the old one's parameters and lies
+    /// where the scale takes the old one, so faces keep their (u, v) domains
+    /// and edges their intervals and UV trim curves. Every face and edge
+    /// keeps its index and [`Label`]. The brep's tolerance, and every
+    /// face's, edge's and vertex's, scale by the largest factor. The
+    /// returned report counts what stayed analytic. All of it is worked out
+    /// before the brep changes: it fails with `SHIM_ERR_BAD_SCALE`, leaving
+    /// the brep alone, for a surface or curve with no exact image (an offset
+    /// surface under unequal factors, a curve that isn't a B-spline) or one
+    /// that two faces or edges share.
+    pub fn scale_axes_keeping(
+        &mut self,
+        point: [f64; 3],
+        factors: [f64; 3],
+        extrusions: bool,
+    ) -> Result<ScaleReport, Error> {
+        const OP: &str = "sm_brep_scale_keeping";
+        check_point(OP, point)?;
+        for factor in factors {
+            check_positive(OP, factor, "scale factors must be finite and positive")?;
+        }
+        let mut report = EMPTY_REPORT;
+        // SAFETY: self is a live brep on the kernel thread; report outlives
+        // the call.
+        let status = unsafe {
+            sys::sm_brep_scale_keeping(
+                self.raw.as_ptr(),
+                vec3(point),
+                vec3(factors),
+                i32::from(extrusions),
+                &mut report,
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(scale_report(&report))
+    }
+
+    /// Reflects the brep across the plane through `point` with `normal`,
+    /// which may have any finite length but zero: the point p goes to
+    /// `p - 2 ((p - point) · n) n` for the unit normal n.
+    ///
+    /// A reflection is an isometry, so every surface and curve keeps its kind
+    /// and its parameters: planes, cylinders, cones, spheres, tori, surfaces
+    /// of revolution (SMLib's fillets on circular edges) and of extrusion,
+    /// offset surfaces, lines, circles and ellipses, with their radii.
+    /// Planes, circles and ellipses move as a rigid motion would move them:
+    /// by the reflection after one across their own plane, which is rigid.
+    /// Everything else is [`scale_axes_keeping`](Brep::scale_axes_keeping)'s
+    /// path with a factor of -1 along the normal: each NURBS is reflected
+    /// exactly, and its analytic surface is rebuilt, found again or from its
+    /// own description, an offset surface from its reflected base. SMLib's
+    /// own `SmBrep::Mirror` turns every curve into a NURBS and rebuilds every
+    /// UV trim curve; here faces keep their (u, v) domains and edges their
+    /// intervals and UV trim curves. Each face's (u, v) now runs the other
+    /// way round, so the faces' sides and the order of the faces round each
+    /// edge flip as `SmBrep::Mirror` flips them, and the result is a valid
+    /// solid with its normals facing out and its volume unchanged. Every
+    /// face and edge keeps its index and [`Label`]; tolerances are unchanged.
+    /// The returned report counts what stayed analytic.
+    ///
+    /// Fails with `SHIM_ERR_BAD_SCALE`, leaving the brep alone, for a brep
+    /// [`scale_axes_keeping`](Brep::scale_axes_keeping) refuses, or one with
+    /// a face that hasn't two sides or an edge used an odd number of times.
+    pub fn mirror(&mut self, point: [f64; 3], normal: [f64; 3]) -> Result<ScaleReport, Error> {
+        const OP: &str = "sm_brep_mirror";
+        check_point(OP, point)?;
+        check_normal(OP, normal)?;
+        let mut report = EMPTY_REPORT;
+        // SAFETY: self is a live brep on the kernel thread; report outlives
+        // the call.
+        let status = unsafe {
+            sys::sm_brep_mirror(self.raw.as_ptr(), vec3(point), vec3(normal), &mut report)
+        };
+        Error::check(OP, status)?;
+        Ok(scale_report(&report))
+    }
+
+    /// Writes the brep to an SMLib binary file (`SmApiWriteBrepToFile`),
+    /// labels and all.
+    pub fn write_file(&self, path: &Path) -> Result<(), Error> {
+        const OP: &str = "SmApiWriteBrepToFile";
+        let path = c_path(OP, path)?;
+        // SAFETY: self is a live brep on the kernel thread; path outlives
+        // the call.
+        let status = unsafe { sys::sm_brep_write_file(self.raw.as_ptr(), path.as_ptr()) };
+        Error::check(OP, status)
+    }
+
+    /// Reads a brep back from a file [`write_file`](Brep::write_file) wrote
+    /// (`SmApiReadBrepFromFile`).
+    pub fn read_file(_kernel: &Kernel, path: &Path) -> Result<Brep, Error> {
+        const OP: &str = "SmApiReadBrepFromFile";
+        let path = c_path(OP, path)?;
+        let mut out = ptr::null_mut();
+        // SAFETY: path outlives the call; a fresh brep out, on the kernel
+        // thread.
+        let status = unsafe { sys::sm_brep_read_file(path.as_ptr(), &mut out) };
+        Error::check(OP, status)?;
+        Brep::from_raw(OP, out)
+    }
+
+    /// The brep's tolerance in model units (`SmBrep::GetTolerance`): how far
+    /// apart the kernel lets a vertex lie from its edges and faces, and an
+    /// edge from its faces.
+    pub fn tolerance(&self) -> Result<f64, Error> {
+        let mut tolerance = 0.0;
+        // SAFETY: self is a live brep on the kernel thread.
+        let status = unsafe { sys::sm_brep_tolerance(self.raw.as_ptr(), &mut tolerance) };
+        Error::check("SmBrep::GetTolerance", status)?;
+        Ok(tolerance)
     }
 
     /// Sweeps the planar face at `face` in [`faces`](Brep::faces) along its
@@ -927,6 +1124,58 @@ impl Brep {
             brep: Brep::from_raw(OP, out)?,
             faces,
         })
+    }
+
+    /// How this solid and `other` lie (`SmApiBrepRelationship`): apart,
+    /// touching, overlapping, or one inside the other. Their closest
+    /// approach (`SmTopologySolver::BrepBrepSolve`) says whether their
+    /// surfaces meet, exactly, and then whether either lies inside the other;
+    /// when they meet, whether they overlap is told by sampling either's
+    /// vertices and face points against the other, so an overlap every
+    /// sample misses reads as touching.
+    pub fn relationship(&self, other: &Brep) -> Result<Relationship, Error> {
+        const OP: &str = "SmApiBrepRelationship";
+        let (mut relationship, mut distance) = (0, 0.0);
+        // SAFETY: both are live breps on the kernel thread; the outputs
+        // outlive the call.
+        let status = unsafe {
+            sys::sm_brep_relationship(
+                self.raw.as_ptr(),
+                other.raw.as_ptr(),
+                &mut relationship,
+                &mut distance,
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(match relationship {
+            sys::SM_RELATIONSHIP_APART => Relationship::Apart { gap: distance },
+            sys::SM_RELATIONSHIP_TOUCHING => Relationship::Touching,
+            sys::SM_RELATIONSHIP_OVERLAPPING => Relationship::Overlapping,
+            sys::SM_RELATIONSHIP_CONTAINS => Relationship::Contains { gap: distance },
+            sys::SM_RELATIONSHIP_INSIDE => Relationship::Inside { gap: distance },
+            _ => {
+                return Err(Error::InvalidArgument {
+                    operation: OP,
+                    reason: "the kernel answered with a relationship it doesn't name",
+                });
+            }
+        })
+    }
+
+    /// Adds a copy of `other`'s solids to this brep as lumps of their own,
+    /// with their labels, without intersecting them with this brep's
+    /// (`SmBrep::MergeBrep`): for solids that neither touch nor overlap, such
+    /// as a pattern's copies, it's their union without a boolean's work.
+    /// Every surface keeps its type. Unless their bounding boxes are apart,
+    /// it asks [`relationship`](Brep::relationship) first, and refuses solids
+    /// that aren't [`Apart`](Relationship::Apart) with `SHIM_ERR_NOT_APART`,
+    /// leaving this brep alone, since merging them would make a brep that
+    /// isn't a valid solid; use [`union`](Brep::union) for those.
+    pub fn combine(&mut self, other: &Brep) -> Result<(), Error> {
+        // SAFETY: both are live breps on the kernel thread, and distinct,
+        // since self is borrowed mutably.
+        let status = unsafe { sys::sm_brep_combine(self.raw.as_ptr(), other.raw.as_ptr()) };
+        Error::check("SmBrep::MergeBrep", status)
     }
 
     /// Merges faces that lie on one surface into one face, and edges that lie
@@ -1734,8 +1983,65 @@ fn gap(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).hypot(a[1] - b[1])
 }
 
+fn c_path(operation: &'static str, path: &Path) -> Result<CString, Error> {
+    path.to_str()
+        .and_then(|path| CString::new(path).ok())
+        .ok_or(Error::InvalidArgument {
+            operation,
+            reason: "the path must be UTF-8 without NUL bytes",
+        })
+}
+
 fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
     sys::sm_vec3 { x, y, z }
+}
+
+const IDENTITY: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+const EMPTY_REPORT: sys::sm_scale_report = sys::sm_scale_report {
+    faces_kept: 0,
+    faces_extruded: 0,
+    faces_nurbs: 0,
+    faces_were_nurbs: 0,
+    curves_kept: 0,
+    curves_stretched: 0,
+    curves_nurbs: 0,
+    curves_were_nurbs: 0,
+};
+
+fn scale_report(report: &sys::sm_scale_report) -> ScaleReport {
+    ScaleReport {
+        faces_kept: report.faces_kept,
+        faces_extruded: report.faces_extruded,
+        faces_nurbs: report.faces_nurbs,
+        faces_were_nurbs: report.faces_were_nurbs,
+        curves_kept: report.curves_kept,
+        curves_stretched: report.curves_stretched,
+        curves_nurbs: report.curves_nurbs,
+        curves_were_nurbs: report.curves_were_nurbs,
+    }
+}
+
+/// The rotation by `angle_deg` degrees about `axis`, counter-clockwise seen
+/// from its tip (Rodrigues' formula), row by row. `None` for a zero or
+/// non-finite axis or angle.
+fn rotation(axis: [f64; 3], angle_deg: f64) -> Option<[[f64; 3]; 3]> {
+    let length = axis.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if !length.is_finite() || length == 0.0 || !angle_deg.is_finite() {
+        return None;
+    }
+    let [x, y, z] = axis.map(|c| c / length);
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    let t = 1.0 - cos;
+    Some([
+        [cos + x * x * t, x * y * t - z * sin, x * z * t + y * sin],
+        [y * x * t + z * sin, cos + y * y * t, y * z * t - x * sin],
+        [z * x * t - y * sin, z * y * t + x * sin, cos + z * z * t],
+    ])
+}
+
+fn rotate(rotation: &[[f64; 3]; 3], point: [f64; 3]) -> [f64; 3] {
+    rotation.map(|row| row[0] * point[0] + row[1] * point[1] + row[2] * point[2])
 }
 
 const EMPTY_EDGE: sys::sm_edge_geometry = sys::sm_edge_geometry {
@@ -1789,6 +2095,18 @@ fn check_point(operation: &'static str, point: [f64; 3]) -> Result<(), Error> {
         Err(Error::InvalidArgument {
             operation,
             reason: "coordinates must be finite",
+        })
+    }
+}
+
+fn check_normal(operation: &'static str, normal: [f64; 3]) -> Result<(), Error> {
+    let length = normal.iter().map(|c| c * c).sum::<f64>().sqrt();
+    if length.is_finite() && length > 0.0 {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument {
+            operation,
+            reason: "the normal must be finite and not zero",
         })
     }
 }

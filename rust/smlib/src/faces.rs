@@ -115,6 +115,58 @@ impl Frame {
     }
 }
 
+/// What [`Brep::scale_axes_keeping`](crate::Brep::scale_axes_keeping) or
+/// [`Brep::mirror`](crate::Brep::mirror) made of a brep's faces and edges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScaleReport {
+    /// Analytic faces still of the same kind.
+    pub faces_kept: u32,
+    /// Cylinders stretched across their axis, now ellipses swept along a
+    /// line.
+    pub faces_extruded: u32,
+    /// Analytic faces now NURBS.
+    pub faces_nurbs: u32,
+    /// Faces that were NURBS already.
+    pub faces_were_nurbs: u32,
+    /// Lines, and circles and ellipses still of the same kind.
+    pub curves_kept: u32,
+    /// Circles now ellipses.
+    pub curves_stretched: u32,
+    /// Analytic curves now NURBS.
+    pub curves_nurbs: u32,
+    /// Curves that were NURBS already.
+    pub curves_were_nurbs: u32,
+}
+
+/// How two solids lie, from
+/// [`Brep::relationship`](crate::Brep::relationship).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Relationship {
+    /// Their surfaces are more than both breps' tolerances apart, and
+    /// neither lies in the other's material. A solid in a cavity of the
+    /// other is apart.
+    Apart {
+        /// Their surfaces' closest approach.
+        gap: f64,
+    },
+    /// Their surfaces meet, and no sample of either's vertices and face
+    /// points lies inside the other.
+    Touching,
+    /// Their surfaces meet, and a sample of one's points lies inside the
+    /// other.
+    Overlapping,
+    /// The other lies in this one's material.
+    Contains {
+        /// The gap between their walls.
+        gap: f64,
+    },
+    /// This lies in the other's material.
+    Inside {
+        /// The gap between their walls.
+        gap: f64,
+    },
+}
+
 /// A closed solid swept from a planar face by
 /// [`Brep::sweep_face`](crate::Brep::sweep_face) (a prism) or
 /// [`Brep::revolve_face`](crate::Brep::revolve_face).

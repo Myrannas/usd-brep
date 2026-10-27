@@ -3,11 +3,13 @@
 - `smlib-sys`: builds SMLib (`source/SMLib`) and SM_API (`source/SM_API`) with
   the `cc` crate, plus a C shim (`smlib-sys/shim`), and exposes the shim through
   committed bindgen bindings.
-- `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, booleans,
-  face sweeps, face offsets, rigid face moves, face merging, fillets, chamfers, volume, manifold
-  check, face and edge queries, labels) and `Mesh`, a tessellation that keeps its links to
-  the B-rep: per-triangle face ids, per-vertex surface (u, v), per-face
-  surface parameters, per-edge polylines, and every face's and edge's label.
+- `smlib`: the safe API. `Kernel`, `Brep` (primitives, placement, transforms,
+  scales and mirrors, combining solids that are apart, booleans, face sweeps,
+  face offsets, rigid face moves, face merging, fillets, chamfers, volume,
+  manifold check, face and edge queries, labels) and `Mesh`, a tessellation
+  that keeps its links to the B-rep: per-triangle face ids, per-vertex
+  surface (u, v), per-face surface parameters, per-edge polylines, and every
+  face's and edge's label.
 
 ## Fillets and chamfers
 
@@ -86,6 +88,76 @@ cargo test -p smlib
   one curve (`SmBrep::RemoveTopologicalEdgesAndVertices`). Booleans already
   do this along their intersection curves, so an offset face's walls come
   back as single faces either way.
+- `Brep::combine` adds a copy of another brep's solids as lumps of their own
+  (`SmBrep::MergeBrep`), with no boolean: for copies that neither touch nor
+  overlap, such as a pattern's, it's their union in a fraction of the time,
+  and one boolean then takes them all as one tool. Solids that touch or
+  overlap need `union`.
+
+## Moving, scaling and mirroring
+
+- `Brep::transform(rotation, translation)` moves a brep rigidly
+  (`SmApiTransform`): p goes to R p + t. `Brep::translate` and
+  `Brep::rotate_about` (degrees about a line) are shorthands. R must be a
+  rotation to 1e-9 (`SHIM_ERR_BAD_FRAME` otherwise). Every surface and curve
+  keeps its type and (u, v), every face and edge its index and label, and the
+  volume holds. A moved brep tessellates to the same vertices, where the
+  motion takes the old ones to within `f32` rounding.
+- `Brep::scale_axes_keeping(point, factors, extrusions)` scales each axis on
+  its own. SMLib's own scale turns every surface and curve into a NURBS
+  before a non-uniform scale (`SmBrep::TurnToNURBS`); this works out each one
+  anew and keeps it analytic wherever the scale leaves it so: everything
+  under equal factors, and otherwise planes and lines, a cylinder or cone
+  along a scale axis whose other two factors are equal, circles in a plane
+  the scale keeps round, and surfaces of extrusion. Circles it stretches
+  become ellipses. With `extrusions`, a cylinder stretched across its axis
+  becomes an ellipse swept along a line (`SmSurfOfExtrusion`, reported as
+  `Surface::Other`); otherwise it, like the spheres, tori and everything else
+  the scale distorts, becomes a NURBS. A `ScaleReport` counts what became
+  what. Faces keep their (u, v) domains, edges their intervals and UV trim
+  curves, so it tessellates the same whatever ran first, and tolerances
+  scale by the largest factor. It works everything out before changing the
+  brep, so a scale it can't make (an offset surface under unequal factors,
+  `SHIM_ERR_BAD_SCALE`) leaves the brep as it was.
+- `Brep::scale_about(point, factor)` is that with equal factors: every
+  surface keeps its kind, offset surfaces included, radii scale, angles
+  don't, and the volume scales by the cube.
+- `Brep::mirror(point, normal)` reflects a brep across a plane. Every surface
+  and curve keeps its kind and (u, v): planes, cylinders, cones, spheres,
+  tori, surfaces of revolution (fillets on circular edges) and of extrusion,
+  offset surfaces, lines, circles and ellipses. Faces' sides and the order of
+  faces round each edge flip, so the result is a valid solid facing out, and
+  every face and edge keeps its index and label. SMLib's own `SmBrep::Mirror`
+  turns every curve into a NURBS, reparameterises faces, rebuilds every UV
+  trim curve and makes a torus a NURBS surface of revolution.
+- `Mesh::transform` and `Mesh::mirror` move or reflect a tessellation as the
+  brep it came from moves or reflects, turning a mirrored mesh's triangles
+  round. The result has the moved or mirrored brep's own vertices to within
+  `f32` rounding and is a watertight mesh of it facing out, though a few
+  quads may split along the other diagonal from the brep's own tessellation.
+  It lets a caller keep a body's triangles through a move, which its
+  `FaceKey`s, hashing the geometry where it lies, don't survive.
+- `Brep::combine(other)` adds a copy of another solid as lumps of this one
+  without a boolean (`SmBrep::MergeBrep`), for copies that are apart, such
+  as a pattern's; one boolean then takes them all. It refuses solids that
+  touch, overlap or lie one inside the other (`SHIM_ERR_NOT_APART`).
+  `Brep::relationship(other)` says how two solids lie
+  (`SmApiBrepRelationship`): apart, touching, overlapping, or one inside the
+  other. Its closest approach is exact between planes and spheres but falls
+  short beside cylinders and cones (by about 0.3 of the radius side on, 0.6
+  at 45°), so round copies closer than that read as touching and `combine`
+  refuses them.
+- `Brep::tolerance` reads the brep's tolerance; `Brep::write_file` and
+  `Brep::read_file` write and read SMLib's binary format (labels don't come
+  back).
+
+`tests/transform.rs` and `tests/mirror.rs` check labels, surfaces, (u, v),
+volumes, triangles and later fillets and booleans through each of them;
+`tests/mirror.rs` also mirrors half a symmetric part and joins it back.
+`tests/transform_bodies.rs` puts every kind of body the crate makes through
+each (run it with `--nocapture` for which surfaces stay analytic under which,
+and the timings), checks `Mesh::transform` and `Mesh::mirror` against the
+moved and mirrored breps' own meshes, and combines copies.
 
 ## Labels
 

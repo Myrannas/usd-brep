@@ -51,6 +51,8 @@ static const sm_status SM_SHIM_ERR_DRAFT_CLOSES = 2034;        /* a draft's side
 static const sm_status SM_SHIM_ERR_BAD_PATH = 2035;            /* a pipe's path turns back on itself, or a bend overlaps itself */
 static const sm_status SM_SHIM_ERR_ARC_CORNER = 2036;          /* an arc of a pipe's path meets a curve beside it at an angle */
 static const sm_status SM_SHIM_ERR_BAD_SHELL = 2037;           /* a shell's input isn't a manifold solid, or its result isn't one */
+static const sm_status SM_SHIM_ERR_BAD_SCALE = 2038;           /* a scale factor isn't finite and positive, or a surface or curve has no exact image under it */
+static const sm_status SM_SHIM_ERR_NOT_APART = 2039;           /* solids to combine touch, overlap or lie one inside the other */
 static const sm_status SM_SHIM_ERR_SPLITS_SOLID = 2040;        /* a face pushed out of the solid would cut it in two */
 static const sm_status SM_SHIM_ERR_EMPTIES_SOLID = 2041;       /* a face pushed out of the solid would leave nothing of it */
 
@@ -416,6 +418,85 @@ sm_status sm_brep_set_edge_label(sm_brep *brep, size_t edge, const sm_label *lab
  * must be unit length and perpendicular to within 1e-9. */
 sm_status sm_brep_place(sm_brep *brep, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y_axis);
 
+/* Moves the brep rigidly (SmApiTransform): the point p goes to R p + t, with
+ * R given row by row in rotation. R must be a rotation to within 1e-9: unit
+ * columns, perpendicular, the third the cross product of the first two;
+ * SM_SHIM_ERR_BAD_FRAME otherwise. Every surface and curve keeps its type
+ * and parameterisation, and every face and edge its label. */
+sm_status sm_brep_transform(sm_brep *brep, const double rotation[9], sm_vec3 translation);
+
+/* The brep's tolerance (SmBrep::GetTolerance), in model units. */
+sm_status sm_brep_tolerance(const sm_brep *brep, double *out);
+
+/* What sm_brep_scale_keeping or sm_brep_mirror made of the brep's faces and
+ * edges. */
+typedef struct sm_scale_report {
+    uint32_t faces_kept;        /* analytic, and still of the same kind */
+    uint32_t faces_extruded;    /* cylinders stretched across their axis, now ellipses swept along a line */
+    uint32_t faces_nurbs;       /* analytic, now NURBS */
+    uint32_t faces_were_nurbs;  /* NURBS before, and still */
+    uint32_t curves_kept;       /* lines, and circles or ellipses still of the same kind */
+    uint32_t curves_stretched;  /* circles now ellipses */
+    uint32_t curves_nurbs;      /* analytic, now NURBS */
+    uint32_t curves_were_nurbs; /* NURBS before, and still */
+} sm_scale_report;
+
+/* Scales the brep about a point: the point p goes to
+ * point + factors * (p - point), axis by axis. The factors must be finite and
+ * positive; SM_SHIM_ERR_BAD_SCALE otherwise. Rather than SmBrep::Transform,
+ * which turns every surface and curve into a NURBS before a non-uniform
+ * scale (SmBrep::TurnToNURBS), this works out each face's surface and each
+ * edge's curve anew, keeping it analytic wherever the scale leaves it so:
+ * everything under equal factors (an offset surface's distance scaled with
+ * it), and otherwise planes and lines, a cylinder or cone along a scale axis
+ * whose other two factors are equal, circles in a plane the scale keeps
+ * round, and surfaces of extrusion. A circle the scale stretches becomes an
+ * ellipse when the images of its axes stay square; with extrusions, a
+ * cylinder stretched across its axis becomes an ellipse swept along a line
+ * (an SmSurfOfExtrusion). Every other B-spline surface or curve becomes its
+ * NURBS, scaled exactly. Each new surface and curve keeps the old one's
+ * parameters and lies where the scale takes it to within a thousandth of the
+ * brep's tolerance, so faces keep their domains and edges their intervals and
+ * UV trim curves; every face and edge keeps its label. The brep's tolerance,
+ * and every face's, edge's and vertex's, scale by the largest factor, so every
+ * gap stays within the tolerance it was within; the kernel's context and
+ * other breps are untouched. SM_SHIM_ERR_BAD_SCALE, with the brep unchanged,
+ * when a surface or curve has no exact image this can make (an offset surface
+ * under unequal factors, a curve that isn't a B-spline) or two faces or edges
+ * share one. report may be NULL; it is written only on success. */
+sm_status sm_brep_scale_keeping(sm_brep *brep, sm_vec3 point, sm_vec3 factors, int32_t extrusions,
+                                sm_scale_report *report);
+
+/* Reflects the brep across the plane through point with the given normal
+ * (any finite length but zero): the point p goes to p - 2 ((p - point) . n) n
+ * for the unit normal n. Every surface and curve keeps its kind and its
+ * parameters. Planes, circles and ellipses move by the rigid motion that
+ * moves their own plane as the reflection does (the reflection after one
+ * across that plane), through their own Transform, as a rigid move would.
+ * Everything else takes sm_brep_scale_keeping's path with a factor of -1
+ * along n: its NURBS is reflected exactly, and cylinders, cones and spheres
+ * are found in it again, while tori, surfaces of revolution (SMLib's fillets
+ * on circular edges) and of extrusion, which SMLib can't find in a NURBS, are
+ * made from their own description, and an offset surface from its reflected
+ * base with its distance negated. Rather than SmBrep::Mirror, which turns
+ * every curve into a NURBS and rebuilds every UV trim curve. Each face's
+ * normal Su x Sv then points into the solid, so the faces' two sides swap
+ * shells and the order of faces round each edge reverses, as SmBrep::Mirror
+ * does: the result is a valid solid facing out. Faces keep their (u, v)
+ * domains, edges their intervals and UV trim curves, and every face and edge
+ * its label; tolerances are unchanged. SM_SHIM_ERR_BAD_FRAME for a point or
+ * normal that isn't finite, or a zero normal; SM_SHIM_ERR_BAD_SCALE as
+ * sm_brep_scale_keeping, and for a face without two sides or an edge with an
+ * odd number of uses, with the brep unchanged; SM_SHIM_ERR_BROKE_SOLID if
+ * turning its topology round fails after the geometry has changed. report
+ * may be NULL; it is written only on success. */
+sm_status sm_brep_mirror(sm_brep *brep, sm_vec3 point, sm_vec3 normal, sm_scale_report *report);
+
+/* Writes the brep to an SMLib binary file (SmApiWriteBrepToFile), and reads
+ * one back (SmApiReadBrepFromFile, keeping the UV trim curves it holds). */
+sm_status sm_brep_write_file(const sm_brep *brep, const char *path);
+sm_status sm_brep_read_file(const char *path, sm_brep **out);
+
 /* Sweeps the planar face at an index of the brep's face list along its
  * outward normal by distance (negative sweeps into the solid), making a new
  * closed prism (SmApiCreateCurveSweepFromFaces, translational, capped). The
@@ -559,6 +640,39 @@ void sm_shell_faces_free(sm_shell_face *faces);
  * (SmBrep::RemoveTopologicalEdgesAndVertices). The shape is unchanged. Labels
  * follow sm_label's merge rule. */
 sm_status sm_brep_merge_faces(sm_brep *brep);
+
+/* How two solids lie (SmApiBrepRelationship): relationship is
+ * SM_RELATIONSHIP_APART when their surfaces are more than both breps'
+ * tolerances apart and neither lies in the other's material, distance their
+ * closest approach (SmTopologySolver::BrepBrepSolve); SM_RELATIONSHIP_CONTAINS
+ * or SM_RELATIONSHIP_INSIDE when a lies all round b or b round a, distance
+ * the gap between their walls; otherwise their surfaces meet, distance 0, and
+ * SM_RELATIONSHIP_OVERLAPPING when a sample of either's vertices and face
+ * points lies inside the other, SM_RELATIONSHIP_TOUCHING when none does (so
+ * an overlap every sample misses reads as touching). A solid in a cavity of
+ * the other is apart. */
+static const int32_t SM_RELATIONSHIP_APART = 0;
+static const int32_t SM_RELATIONSHIP_TOUCHING = 1;
+static const int32_t SM_RELATIONSHIP_OVERLAPPING = 2;
+static const int32_t SM_RELATIONSHIP_CONTAINS = 3;
+static const int32_t SM_RELATIONSHIP_INSIDE = 4;
+sm_status sm_brep_relationship(const sm_brep *a, const sm_brep *b, int32_t *relationship, double *distance);
+
+/* Adds a copy of other's solids to the brep as lumps of their own, labels
+ * and all, without intersecting them with the brep's (SmBrep::MergeBrep,
+ * keeping surface types). For solids that neither touch nor overlap, such as
+ * a pattern's copies, it's their union without a boolean's work. Unless their
+ * bounding boxes are apart by more than both tolerances, it asks whether they
+ * are apart as sm_brep_relationship does (their surfaces' closest approach,
+ * searched no further than both tolerances, then whether a point of each lies
+ * outside the other), and refuses solids that aren't with
+ * SM_SHIM_ERR_NOT_APART, the brep unchanged, since merging them would make a
+ * brep that isn't a valid solid. A solid in a cavity of the other isn't apart
+ * here. The closest approach is a lower bound on round faces (see
+ * Brep::relationship in the Rust crate), so copies of a cylinder closer than
+ * about half its radius can be refused though apart. other is unchanged; it
+ * may not be brep itself. */
+sm_status sm_brep_combine(sm_brep *brep, const sm_brep *other);
 
 /* Moves the faces at the given indices of the brep's face list `distance`
  * along their outward normals (negative moves them inward), in place, as a
