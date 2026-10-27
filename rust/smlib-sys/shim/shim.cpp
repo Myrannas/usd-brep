@@ -7719,6 +7719,733 @@ sm_status create_pipe(const sm_plane_curve* path, size_t count, const SmAxis2Pla
     return SM_SUCCESS;
 }
 
+// A profile to sweep along a path (sm_brep_sweep_profile): its curves in its
+// own (x, y), each labelled with its index so the sides swept from it can be
+// traced back, and the box it lies in.
+struct Profile {
+    std::vector<sm_plane_curve> curves;
+    double min_x = SM_BIG_DOUBLE, max_x = -SM_BIG_DOUBLE, min_y = SM_BIG_DOUBLE, max_y = -SM_BIG_DOUBLE;
+    // How far it reaches across the path either way.
+    double reach() const { return std::max(-min_x, max_x); }
+};
+
+// Where a line, arc or circle starts and ends, and the point halfway along.
+void curve_points(const sm_plane_curve& curve, double start[2], double end[2], double middle[2]) {
+    if (curve.kind == SM_PLANE_LINE) {
+        for (int k = 0; k < 2; ++k) {
+            start[k] = curve.a[k];
+            end[k] = curve.b[k];
+            middle[k] = 0.5 * (curve.a[k] + curve.b[k]);
+        }
+        return;
+    }
+    const double from = curve.kind == SM_PLANE_CIRCLE ? 0.0 : curve.start_deg;
+    const double sweep = curve.kind == SM_PLANE_CIRCLE ? 360.0 : curve.sweep_deg;
+    const auto at = [&](double deg, double out[2]) {
+        out[0] = curve.a[0] + curve.radius * std::cos(deg * SM_PI / 180.0);
+        out[1] = curve.a[1] + curve.radius * std::sin(deg * SM_PI / 180.0);
+    };
+    at(from, start);
+    at(from + sweep, end);
+    at(from + 0.5 * sweep, middle);
+}
+
+// Grows the profile's box to take in the curve: a line's ends, an arc's ends
+// and the quarter turns it passes.
+void take_in(Profile& profile, const sm_plane_curve& curve) {
+    const auto point = [&](double x, double y) {
+        profile.min_x = std::min(profile.min_x, x);
+        profile.max_x = std::max(profile.max_x, x);
+        profile.min_y = std::min(profile.min_y, y);
+        profile.max_y = std::max(profile.max_y, y);
+    };
+    if (curve.kind == SM_PLANE_LINE) {
+        point(curve.a[0], curve.a[1]);
+        point(curve.b[0], curve.b[1]);
+        return;
+    }
+    const double from = curve.kind == SM_PLANE_CIRCLE ? 0.0 : curve.start_deg;
+    const double sweep = curve.kind == SM_PLANE_CIRCLE ? 360.0 : curve.sweep_deg;
+    const double low = std::min(from, from + sweep), high = std::max(from, from + sweep);
+    const auto at = [&](double deg) {
+        point(curve.a[0] + curve.radius * std::cos(deg * SM_PI / 180.0),
+              curve.a[1] + curve.radius * std::sin(deg * SM_PI / 180.0));
+    };
+    at(low);
+    at(high);
+    for (double deg = std::ceil(low / 90.0) * 90.0; deg < high; deg += 90.0) at(deg);
+}
+
+// The label a profile curve's edge carries: its index.
+sm_label profile_label(int32_t index) {
+    sm_label label{};
+    label.present = 1;
+    label.feature = SWEPT_ROLE;
+    label.index = static_cast<uint32_t>(index);
+    std::memcpy(label.role, "profile", 8);
+    return label;
+}
+
+// The profile segment an edge of a profile's sheet came from, or -1 (a round
+// end's cut along the axis).
+int32_t profile_segment(const SmBrep& sheet, int32_t edge) {
+    SmTArray<SmEdge*> edges;
+    sheet.GetEdges(edges);
+    if (edge < 0 || static_cast<ULONG>(edge) >= edges.GetSize()) return -1;
+    const sm_label label = read_label(edges[static_cast<ULONG>(edge)]);
+    if (!label.present || label.feature != SWEPT_ROLE || std::strcmp(label.role, "profile") != 0) return -1;
+    return static_cast<int32_t>(label.index);
+}
+
+// The profile's left half, x >= 0, for a round end: its curves cut where
+// they cross x = 0, the pieces on the left kept with their labels, and the
+// ends left open on x = 0 joined in pairs up it by unlabelled lines. False
+// when nothing of it lies to the left.
+bool left_half(const Profile& profile, Profile& half) {
+    const double tolerance = 1e-9 * std::max(1.0, profile.reach() + profile.max_y - profile.min_y);
+    std::vector<sm_plane_curve> kept;
+    for (const sm_plane_curve& curve : profile.curves) {
+        std::vector<sm_plane_curve> pieces;
+        if (curve.kind == SM_PLANE_LINE) {
+            const double xa = curve.a[0], xb = curve.b[0];
+            if ((xa < -tolerance && xb > tolerance) || (xa > tolerance && xb < -tolerance)) {
+                const double t = xa / (xa - xb);
+                sm_plane_curve first = curve, second = curve;
+                first.b[0] = second.a[0] = 0.0;
+                first.b[1] = second.a[1] = curve.a[1] + t * (curve.b[1] - curve.a[1]);
+                pieces = {first, second};
+            } else {
+                pieces = {curve};
+            }
+        } else {
+            // Where the arc crosses x = 0, by its angle, in the order it runs.
+            const double from = curve.kind == SM_PLANE_CIRCLE ? 0.0 : curve.start_deg;
+            const double sweep = curve.kind == SM_PLANE_CIRCLE ? 360.0 : curve.sweep_deg;
+            std::vector<double> cuts;
+            if (std::fabs(curve.a[0]) < curve.radius) {
+                const double angle = std::acos(-curve.a[0] / curve.radius) * 180.0 / SM_PI;
+                for (double crossing : {angle, -angle}) {
+                    // Along the arc, from 0 to |sweep|.
+                    double along = sweep > 0.0 ? crossing - from : from - crossing;
+                    along = std::fmod(along, 360.0);
+                    if (along < 0.0) along += 360.0;
+                    if (along > 1e-9 && along < std::fabs(sweep) - 1e-9) cuts.push_back(along);
+                }
+            }
+            std::sort(cuts.begin(), cuts.end());
+            cuts.push_back(std::fabs(sweep));
+            double done = 0.0;
+            const double turn = sweep < 0.0 ? -1.0 : 1.0;
+            for (double cut : cuts) {
+                sm_plane_curve piece = curve;
+                piece.kind = SM_PLANE_ARC;
+                piece.start_deg = from + turn * done;
+                piece.sweep_deg = turn * (cut - done);
+                pieces.push_back(piece);
+                done = cut;
+            }
+        }
+        for (const sm_plane_curve& piece : pieces) {
+            double start[2], end[2], middle[2];
+            curve_points(piece, start, end, middle);
+            if (middle[0] > tolerance) kept.push_back(piece);
+        }
+    }
+    if (kept.empty()) return false;
+    // Ends no other kept piece meets are on x = 0: join them up it in pairs.
+    std::vector<std::array<double, 2>> ends;
+    for (const sm_plane_curve& piece : kept) {
+        if (piece.kind == SM_PLANE_CIRCLE) continue;
+        double start[2], end[2], middle[2];
+        curve_points(piece, start, end, middle);
+        for (const double* point : {start, end}) ends.push_back({point[0], point[1]});
+    }
+    std::vector<std::array<double, 2>> open;
+    for (size_t i = 0; i < ends.size(); ++i) {
+        size_t meets = 0;
+        for (size_t j = 0; j < ends.size(); ++j) {
+            if (i != j && std::hypot(ends[i][0] - ends[j][0], ends[i][1] - ends[j][1]) <= 1e-6) ++meets;
+        }
+        if (meets == 0) open.push_back(ends[i]);
+    }
+    if (open.size() % 2 != 0) return false;
+    for (const auto& point : open) {
+        if (std::fabs(point[0]) > 1e-6) return false;
+    }
+    std::sort(open.begin(), open.end(), [](const auto& a, const auto& b) { return a[1] < b[1]; });
+    half = Profile{};
+    for (const sm_plane_curve& piece : kept) {
+        half.curves.push_back(piece);
+        take_in(half, piece);
+    }
+    for (size_t i = 0; i + 1 < open.size(); i += 2) {
+        sm_plane_curve up{};
+        up.kind = SM_PLANE_LINE;
+        up.a[0] = open[i][0];
+        up.a[1] = open[i][1];
+        up.b[0] = open[i + 1][0];
+        up.b[1] = open[i + 1][1];
+        half.curves.push_back(up);
+        take_in(half, up);
+    }
+    return true;
+}
+
+// The profile as one planar face, its sheet placed with the profile's x
+// along `left`, its y along `up` and its face's normal along left x up, the
+// way it's swept.
+sm_status profile_sheet(const Profile& profile, const SmPoint3d& origin, const SmVector3d& left, const SmVector3d& up,
+                        std::unique_ptr<SmBrep>& sheet) {
+    SmBrep* raw = nullptr;
+    sm_status status = planar_faces(profile.curves.data(), profile.curves.size(), raw);
+    if (status != SM_SUCCESS) return status;
+    sheet.reset(raw);
+    SmTArray<SmFace*> faces;
+    sheet->GetFaces(faces);
+    if (faces.GetSize() != 1) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return static_cast<sm_status>(SmApiTransform(sheet.get(), SmAxis2Placement(origin, left, up)));
+}
+
+// The labels a swept profile's pieces carry while they're joined:
+// SWEPT_ROLE's feature id, the path curve as the index, and the
+// sm_profile_role and profile segment in the role.
+void mark_profile(SmFace& face, int32_t role, int32_t path, int32_t segment) {
+    sm_label label{};
+    label.present = 1;
+    label.feature = SWEPT_ROLE;
+    label.index = static_cast<uint32_t>(path);
+    std::snprintf(label.role, sizeof label.role, "profile %d %d", static_cast<int>(role), static_cast<int>(segment));
+    write_label(face, label);
+}
+
+// One curve's piece of a profile swept along the path: the profile square to
+// the curve at its start, swept along a line (sweep_face) or turned about an
+// arc's centre (revolve_face), `before` and `after` longer at each end (in
+// model units along the curve), each side marked with the curve's index and
+// the profile segment it came from, and its ends marked as the path's start
+// and end when `first` or `last`.
+sm_status profile_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame,
+                        const Profile& profile, double before, double after, bool first, bool last,
+                        std::unique_ptr<SmBrep>& piece) {
+    const SmVector3d x = frame.GetXAxis(), y = frame.GetYAxis(), normal = frame.GetZAxis();
+    const auto world = [&](double u, double v) { return frame.GetOrigin() + x * u + y * v; };
+    SmPoint3d origin;
+    SmVector3d tangent;
+    double angle = 0.0;
+    SmPoint3d centre;
+    if (!segment.round) {
+        tangent = x * segment.start_tangent[0] + y * segment.start_tangent[1];
+        origin = world(segment.start[0], segment.start[1]) - tangent * before;
+    } else {
+        const double r = segment.curve.radius;
+        const double turn = segment.sweep < 0.0 ? -1.0 : 1.0;
+        const double from = (segment.curve.kind == SM_PLANE_CIRCLE ? 0.0 : segment.curve.start_deg) -
+                            turn * before / r * 180.0 / SM_PI;
+        angle = segment.sweep + turn * (before + after) / r * 180.0 / SM_PI;
+        if (std::fabs(angle) > 360.0) return SM_SHIM_ERR_BAD_PATH;
+        const double a = from * SM_PI / 180.0;
+        centre = world(segment.curve.a[0], segment.curve.a[1]);
+        origin = world(segment.curve.a[0] + r * std::cos(a), segment.curve.a[1] + r * std::sin(a));
+        tangent = (x * -std::sin(a) + y * std::cos(a)) * turn;
+    }
+    std::unique_ptr<SmBrep> sheet;
+    sm_status status = profile_sheet(profile, origin, normal * tangent, normal, sheet);
+    if (status != SM_SUCCESS) return status;
+    SmTArray<SmFace*> sheet_faces;
+    sheet->GetFaces(sheet_faces);
+
+    SmBrep* swept = nullptr;
+    std::vector<sm_swept_face> roles;
+    if (!segment.round) {
+        const double length = std::hypot(segment.end[0] - segment.start[0], segment.end[1] - segment.start[1]);
+        status = sweep_face(*sheet, sheet_faces[0], length + before + after, swept, roles);
+    } else {
+        status = revolve_face(*sheet, sheet_faces[0], centre, normal, angle, swept, roles);
+    }
+    if (status != SM_SUCCESS) return status;
+    piece.reset(swept);
+    SmTArray<SmFace*> faces;
+    piece->GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (roles[i].role == SM_SWEPT_SIDE) {
+            mark_profile(*faces[i], SM_PROFILE_SIDE, index, profile_segment(*sheet, roles[i].source_edge));
+        } else if (roles[i].role == SM_SWEPT_START && first) {
+            mark_profile(*faces[i], SM_PROFILE_START, -1, -1);
+        } else if (roles[i].role == SM_SWEPT_END && last) {
+            mark_profile(*faces[i], SM_PROFILE_END, -1, -1);
+        }
+    }
+    return SM_SUCCESS;
+}
+
+// A round end where the path starts or ends: the profile's left half,
+// square to the path there, turned half a turn about the frame's normal
+// through the path's end, ahead of the end or behind the start, each face
+// marked as that end with the profile segment it came from.
+sm_status round_end(const PipeSegment& segment, bool at_end, const SmAxis2Placement& frame, const Profile& half,
+                    std::unique_ptr<SmBrep>& cap) {
+    const SmVector3d x = frame.GetXAxis(), y = frame.GetYAxis(), normal = frame.GetZAxis();
+    const double* point = at_end ? segment.end : segment.start;
+    const double* direction = at_end ? segment.end_tangent : segment.start_tangent;
+    const SmPoint3d corner = frame.GetOrigin() + x * point[0] + y * point[1];
+    const SmVector3d tangent = x * direction[0] + y * direction[1];
+    std::unique_ptr<SmBrep> sheet;
+    sm_status status = profile_sheet(half, corner, normal * tangent, normal, sheet);
+    if (status != SM_SUCCESS) return status;
+    SmTArray<SmFace*> sheet_faces;
+    sheet->GetFaces(sheet_faces);
+    // Turning the left, normal x tangent, by a positive angle about the
+    // normal takes it back along the path: a start turns that way, an end
+    // the other, forward.
+    SmBrep* turned = nullptr;
+    std::vector<sm_swept_face> roles;
+    status = revolve_face(*sheet, sheet_faces[0], corner, normal, at_end ? -180.0 : 180.0, turned, roles);
+    if (status != SM_SUCCESS) return status;
+    cap.reset(turned);
+    const int32_t role = at_end ? SM_PROFILE_END : SM_PROFILE_START;
+    SmTArray<SmFace*> faces;
+    cap->GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const int32_t source = roles[i].role == SM_SWEPT_SIDE ? profile_segment(*sheet, roles[i].source_edge) : -1;
+        mark_profile(*faces[i], role, -1, source);
+    }
+    return SM_SUCCESS;
+}
+
+// Joins `piece` into `solid` (SmApiBooleanUnion), or makes it the solid when
+// there's none yet.
+sm_status join_piece(std::unique_ptr<SmBrep>& solid, std::unique_ptr<SmBrep>& piece) {
+    if (!solid) {
+        solid = std::move(piece);
+        return SM_SUCCESS;
+    }
+    SmBrep* a = solid.release();
+    SmBrep* joined = nullptr;
+    const SmApiStatus status = SmApiBooleanUnion(a, piece.get(), joined);
+    if (status != SM_SUCCESS || joined != a) {
+        delete a;
+        return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    }
+    piece.release();  // the union deleted it
+    solid.reset(joined);
+    return SM_SUCCESS;
+}
+
+// The profile swept along the path, as solid_pipe joins a pipe's pieces: a
+// piece per curve, mitred to its neighbours where they meet at an angle (each
+// made longer at that end, by enough for its end to clear the plane halfway
+// between them, and cut there), met face to face where they meet
+// tangentially, and joined; then an open path's round ends joined on. The
+// faces' marks say what each is.
+sm_status sweep_profile(const sm_plane_curve* path, size_t count, const Profile& profile,
+                        const SmAxis2Placement& frame, int32_t start_end, int32_t end_end, SmBrep*& out,
+                        std::vector<sm_profile_face>& roles) {
+    std::vector<PipeSegment> segments;
+    for (size_t i = 0; i < count; ++i) segments.push_back(pipe_segment(path[i]));
+    const PipeSegment& first = segments.front();
+    const PipeSegment& last = segments.back();
+    const bool closed = std::hypot(last.end[0] - first.start[0], last.end[1] - first.start[1]) <= 1e-6;
+    std::vector<PipeJoint> joints;
+    for (size_t i = 0; i + 1 < count; ++i) joints.push_back(pipe_joint(segments[i], segments[i + 1]));
+    if (closed && count > 1) joints.push_back(pipe_joint(last, first));
+    for (size_t i = 0; i < joints.size(); ++i) {
+        const bool round = segments[i].round || segments[(i + 1) % count].round;
+        if (joints[i].turn > MAX_PIPE_TURN) return SM_SHIM_ERR_BAD_PATH;
+        if (round && joints[i].mitred()) return SM_SHIM_ERR_ARC_CORNER;
+    }
+    // A bend turns the profile about its centre, which must lie beyond the
+    // profile: the left reaches towards an anticlockwise bend's centre, the
+    // right towards a clockwise one's.
+    for (const PipeSegment& segment : segments) {
+        if (!segment.round) continue;
+        const double towards = segment.sweep > 0.0 ? profile.max_x : -profile.min_x;
+        if (towards >= segment.curve.radius) return SM_SHIM_ERR_BAD_PATH;
+    }
+    Profile half;
+    const bool rounded = !closed && (start_end == SM_PATH_END_ROUND || end_end == SM_PATH_END_ROUND);
+    if (rounded && !(profile.min_x < 0.0 && profile.max_x > 0.0 && left_half(profile, half))) {
+        return SM_SHIM_ERR_BAD_PATH;
+    }
+    const double reach = profile.reach();
+    // Big enough for a box to cover any piece beyond a mitre.
+    double size = 8.0 * (reach + std::fabs(profile.min_y) + std::fabs(profile.max_y));
+    for (const PipeSegment& segment : segments) {
+        for (const double* p : {segment.start, segment.end}) size += std::hypot(p[0], p[1]);
+        if (segment.round) size += 2.0 * segment.curve.radius;
+    }
+    for (const PipeJoint& joint : joints) size += 2.0 * reach * (std::tan(joint.turn / 2.0) + 1.0);
+
+    const auto extension = [&](const PipeJoint& joint) {
+        return joint.mitred() ? reach * std::tan(joint.turn / 2.0) + reach : 0.0;
+    };
+    const SmVector3d x = frame.GetXAxis(), y = frame.GetYAxis();
+    std::unique_ptr<SmBrep> solid;
+    for (size_t i = 0; i < count; ++i) {
+        const PipeJoint* behind = i > 0 ? &joints[i - 1] : (closed && count > 1 ? &joints.back() : nullptr);
+        const PipeJoint* ahead = i < joints.size() && (i + 1 < count || (closed && count > 1)) ? &joints[i] : nullptr;
+        std::unique_ptr<SmBrep> piece;
+        sm_status status = profile_piece(segments[i], static_cast<int32_t>(i), frame, profile,
+                                         behind ? extension(*behind) : 0.0, ahead ? extension(*ahead) : 0.0,
+                                         i == 0 && !closed, i + 1 == count && !closed, piece);
+        if (status != SM_SUCCESS) return status;
+        for (const auto& [joint, keep_before] : {std::make_pair(behind, false), std::make_pair(ahead, true)}) {
+            if (!joint || !joint->mitred()) continue;
+            const SmPoint3d corner = frame.GetOrigin() + x * joint->corner[0] + y * joint->corner[1];
+            const SmVector3d mitre = x * joint->mitre[0] + y * joint->mitre[1];
+            status = cut_beyond(piece, corner, keep_before ? mitre : mitre * -1.0, size);
+            if (status != SM_SUCCESS) return status;
+        }
+        status = join_piece(solid, piece);
+        if (status != SM_SUCCESS) return status;
+    }
+    for (const auto& [end, at_end] : {std::make_pair(start_end, false), std::make_pair(end_end, true)}) {
+        if (closed || end != SM_PATH_END_ROUND) continue;
+        std::unique_ptr<SmBrep> cap;
+        sm_status status = round_end(at_end ? last : first, at_end, frame, half, cap);
+        if (status == SM_SUCCESS) status = join_piece(solid, cap);
+        if (status != SM_SUCCESS) return status;
+    }
+    if (!is_manifold_solid(*solid)) return SM_SHIM_ERR_BAD_SWEEP;
+    SmTArray<SmFace*> faces;
+    solid->GetFaces(faces);
+    roles.assign(faces.GetSize(), sm_profile_face{SM_PROFILE_SIDE, -1, -1});
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const sm_label label = read_label(faces[i]);
+        int role = 0, segment = -1;
+        if (!label.present || label.feature != SWEPT_ROLE ||
+            std::sscanf(label.role, "profile %d %d", &role, &segment) != 2) {
+            continue;
+        }
+        roles[i].role = role;
+        roles[i].path = role == SM_PROFILE_SIDE ? static_cast<int32_t>(label.index) : -1;
+        roles[i].profile = segment;
+    }
+    remove_labels(*solid);
+    out = solid.release();
+    return SM_SUCCESS;
+}
+
+// Turns a B-spline round to run the other way along its own interval.
+SmStatus reverse(SmBSplineCurve& curve) {
+    const SmExtent1d whole = curve.GetNaturalInterval();
+    SmExtent1d reversed;
+    return curve.ReverseParameterization(whole, reversed);
+}
+
+// A point on a curve, and its derivative when `tangent` isn't null.
+bool curve_at(const SmCurve* curve, double t, SmPoint3d& point, SmVector3d* tangent) {
+    SmVector3d at;
+    SmVector3d* point_out = &at;
+    SmVector3d* tangent_out = tangent;
+    SmVector3d* no_second = nullptr;
+    if (SmApiEvaluateCurve(curve, t, point_out, tangent_out, no_second) != SM_SUCCESS) return false;
+    point = SmPoint3d(at.x, at.y, at.z);
+    return true;
+}
+
+// The edge's curve between its ends as a B-spline of its own, and where it
+// starts and ends.
+sm_status edge_spline(const SmEdge* edge, std::unique_ptr<SmBSplineCurve>& out, SmPoint3d& start, SmPoint3d& end) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    const SmCurve* curve = edge->GetCurve();
+    if (!curve) return SM_ERR;
+    double t0 = 0.0, t1 = 0.0;
+    SmApiStatus status = SmApiEdgeParameterRange(edge, t0, t1);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    // As in describe_edge, the range can reach an ulp past the curve's.
+    const SmExtent1d domain = curve->GetNaturalInterval();
+    t0 = std::min(std::max(t0, domain.GetMin()), domain.GetMax());
+    t1 = std::min(std::max(t1, domain.GetMin()), domain.GetMax());
+    if (!curve_at(curve, t0, start, nullptr) || !curve_at(curve, t1, end, nullptr)) return SM_ERR;
+    if (curve->GetType() == SmLine_TYPE) {
+        SmBSplineCurve* raw = nullptr;
+        const SmStatus made = SmBSplineCurve::CreateLineSegment(*context, 3, start, end, raw);
+        if (made != SM_SUCCESS || !raw) return made != SM_SUCCESS ? static_cast<sm_status>(made) : SM_ERR;
+        out.reset(raw);
+        return SM_SUCCESS;
+    }
+    SmCurve* copy = nullptr;
+    const SmStatus copied = curve->GetType() == SmBSplineCurve_TYPE ? curve->Copy(*context, copy)
+                                                                     : curve->CopyAnalyticAsNurb(*context, copy);
+    if (copied != SM_SUCCESS || !copy || copy->GetType() != SmBSplineCurve_TYPE) {
+        delete copy;
+        return copied != SM_SUCCESS ? static_cast<sm_status>(copied) : SM_ERR;
+    }
+    out.reset(static_cast<SmBSplineCurve*>(copy));
+    // The copy's parameters needn't be the curve's: trim it where the ends
+    // lie on it.
+    double s0 = 0.0, s1 = 0.0, distance = 0.0;
+    SmPoint3d closest;
+    if (SmApiCurveClosestPoint(out.get(), start, closest, s0, distance) != SM_SUCCESS ||
+        SmApiCurveClosestPoint(out.get(), end, closest, s1, distance) != SM_SUCCESS) {
+        return SM_ERR;
+    }
+    if (s1 < s0) return SM_ERR;
+    SmExtent1d range(s0, s1);
+    const SmExtent1d whole = out->GetNaturalInterval();
+    if (std::fabs(s0 - whole.GetMin()) > 1e-12 || std::fabs(s1 - whole.GetMax()) > 1e-12) {
+        const SmStatus trimmed = out->Trim(range);
+        if (trimmed != SM_SUCCESS) return static_cast<sm_status>(trimmed);
+    }
+    return SM_SUCCESS;
+}
+
+// The profile as one closed B-spline in a sweep's local frame: its x along
+// the frame's y, its y along the frame's z.
+sm_status profile_section(const Profile& profile, std::unique_ptr<SmBSplineCurve>& out) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    std::vector<std::unique_ptr<SmBSplineCurve>> owned;
+    SmTArray<SmBSplineCurve*> pieces;
+    const SmAxis2Placement upright(SmPoint3d(0.0, 0.0, 0.0), SmVector3d(0.0, 1.0, 0.0), SmVector3d(0.0, 0.0, 1.0));
+    for (const sm_plane_curve& curve : profile.curves) {
+        SmCurve* raw = nullptr;
+        sm_status status = plane_curve(curve, raw);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmCurve> made(raw);
+        std::unique_ptr<SmBSplineCurve> spline;
+        if (made->GetType() == SmBSplineCurve_TYPE) {
+            spline.reset(static_cast<SmBSplineCurve*>(made.release()));
+            // An arc runs anticlockwise from SmApiCreateArc; turn it to
+            // run as the profile does.
+            SmPoint3d start;
+            if (!curve_at(spline.get(), spline->GetNaturalInterval().GetMin(), start, nullptr)) return SM_ERR;
+            if (curve.kind == SM_PLANE_ARC && std::hypot(start.x - curve.a[0] - curve.radius * std::cos(curve.start_deg * SM_PI / 180.0),
+                                                         start.y - curve.a[1] - curve.radius * std::sin(curve.start_deg * SM_PI / 180.0)) > 1e-6) {
+                const SmStatus reversed = reverse(*spline);
+                if (reversed != SM_SUCCESS) return static_cast<sm_status>(reversed);
+            }
+        } else {
+            SmBSplineCurve* line = nullptr;
+            const SmStatus status_line = SmBSplineCurve::CreateLineSegment(
+                *context, 3, SmPoint3d(curve.a[0], curve.a[1], 0.0), SmPoint3d(curve.b[0], curve.b[1], 0.0), line);
+            if (status_line != SM_SUCCESS || !line) return SM_ERR;
+            spline.reset(line);
+        }
+        const SmStatus moved = spline->Transform(upright);
+        if (moved != SM_SUCCESS) return static_cast<sm_status>(moved);
+        pieces.Add(spline.get());
+        owned.push_back(std::move(spline));
+    }
+    if (pieces.GetSize() == 1) {
+        out = std::move(owned[0]);
+        return SM_SUCCESS;
+    }
+    SmBSplineCurve* joined = nullptr;
+    const SmStatus status = SmBSplineCurve::CreateByJoining(*context, pieces, nullptr, joined);
+    if (status != SM_SUCCESS || !joined) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    out.reset(joined);
+    return SM_SUCCESS;
+}
+
+// Which piece of a joined curve a parameter falls in, given where each
+// piece ends along it.
+int32_t piece_at(const std::vector<double>& ends, double t) {
+    for (size_t i = 0; i < ends.size(); ++i) {
+        if (t <= ends[i]) return static_cast<int32_t>(i);
+    }
+    return -1;
+}
+
+// sm_brep_sweep_profile_along's work: the chain joined into one path, the
+// normal sampled along it and interpolated, the profile swept with its z
+// following it, the sides split where the sweep isn't smooth, capped and
+// stitched into a solid, and each side told by the profile segment and edge
+// its middle lies on.
+sm_status sweep_profile_along(const SmBrep& brep, const std::vector<const SmEdge*>& chain, const Profile& profile,
+                              uint32_t samples, double tolerance, SmBrep*& out,
+                              std::vector<sm_profile_face>& roles) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    // The edges' splines, each the way the chain runs.
+    std::vector<std::unique_ptr<SmBSplineCurve>> splines(chain.size());
+    std::vector<std::array<SmPoint3d, 2>> ends(chain.size());
+    for (size_t i = 0; i < chain.size(); ++i) {
+        const sm_status status = edge_spline(chain[i], splines[i], ends[i][0], ends[i][1]);
+        if (status != SM_SUCCESS) return status;
+    }
+    const double gap = std::max(1e3 * SM_ZONE_TOL_3D, 1e-6);
+    SmTArray<SmBoolean> senses;
+    for (size_t i = 0; i < chain.size(); ++i) {
+        bool forward = true;
+        if (chain.size() > 1) {
+            if (i == 0) {
+                const auto& next = ends[1];
+                forward = std::min(ends[0][1].DistanceBetween(next[0]), ends[0][1].DistanceBetween(next[1])) <= gap;
+            } else {
+                const SmPoint3d& previous = senses[i - 1] ? ends[i - 1][1] : ends[i - 1][0];
+                forward = ends[i][0].DistanceBetween(previous) <= gap;
+                if (!forward && ends[i][1].DistanceBetween(previous) > gap) return SM_SHIM_ERR_BAD_EDGE;
+            }
+        }
+        senses.Add(forward ? TRUE : FALSE);
+    }
+    // Where the edges meet they must run on smoothly. Across a sharp edge of
+    // the part the interpolated normal rounds the corner, and the groove came
+    // out 2 to 8% off its volume, or not at all, by the samples.
+    const double kink = 1e-3;
+    for (size_t i = 1; i < chain.size(); ++i) {
+        const SmExtent1d before = splines[i - 1]->GetNaturalInterval();
+        const SmExtent1d after = splines[i]->GetNaturalInterval();
+        SmPoint3d point;
+        SmVector3d leaving, arriving;
+        if (!curve_at(splines[i - 1].get(), senses[i - 1] ? before.GetMax() : before.GetMin(), point, &leaving) ||
+            !curve_at(splines[i].get(), senses[i] ? after.GetMin() : after.GetMax(), point, &arriving)) {
+            return SM_ERR;
+        }
+        leaving.Unitize(FALSE);
+        arriving.Unitize(FALSE);
+        const double along = (senses[i - 1] == senses[i] ? 1.0 : -1.0) * leaving.Dot(arriving);
+        if (along < std::cos(kink)) return SM_SHIM_ERR_ARC_CORNER;
+    }
+    std::unique_ptr<SmBSplineCurve> path;
+    if (chain.size() == 1) {
+        path = std::move(splines[0]);
+        if (!senses[0] && reverse(*path) != SM_SUCCESS) return SM_ERR;
+    } else {
+        SmTArray<SmBSplineCurve*> pieces;
+        for (auto& spline : splines) pieces.Add(spline.get());
+        SmBSplineCurve* joined = nullptr;
+        const SmStatus status = SmBSplineCurve::CreateByJoining(*context, pieces, &senses, joined);
+        if (status != SM_SUCCESS || !joined) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+        path.reset(joined);
+    }
+    // A line alone is a spline of degree 1, along which the sweep fails.
+    if (path->GetDegree() < 3 && path->DegreeElevate(3) != SM_SUCCESS) return SM_ERR;
+    const SmExtent1d range = path->GetNaturalInterval();
+    // Where each edge ends along the path.
+    std::vector<double> edge_ends;
+    for (size_t i = 0; i < chain.size(); ++i) {
+        const SmPoint3d& end = senses[i] ? ends[i][1] : ends[i][0];
+        double t = 0.0, distance = 0.0;
+        SmPoint3d closest;
+        if (SmApiCurveClosestPoint(path.get(), end, closest, t, distance) != SM_SUCCESS) return SM_ERR;
+        edge_ends.push_back(i + 1 == chain.size() ? range.GetMax() : t);
+    }
+
+    // The faces the chain lies on, and the outward normal at points along
+    // it: the mean of the nearest face's and any other within reach, made
+    // square to the path.
+    std::vector<const SmFace*> faces;
+    for (const SmEdge* edge : chain) {
+        SmTArray<SmFace*> users;
+        edge->GetFaces(users);
+        for (ULONG i = 0; i < users.GetSize(); ++i) {
+            if (std::find(faces.begin(), faces.end(), users[i]) == faces.end()) faces.push_back(users[i]);
+        }
+    }
+    const size_t count = std::max<size_t>(8, samples * chain.size()) + 1;
+    SmTArray<SmPoint3d> normals;
+    SmTArray<double> params;
+    for (size_t k = 0; k < count; ++k) {
+        const double t = range.Evaluate(static_cast<double>(k) / static_cast<double>(count - 1));
+        SmPoint3d point;
+        SmVector3d tangent;
+        if (!curve_at(path.get(), t, point, &tangent)) return SM_ERR;
+        tangent.Unitize(FALSE);
+        SmVector3d sum(0.0, 0.0, 0.0);
+        double nearest = SM_BIG_DOUBLE;
+        std::vector<std::pair<double, SmVector3d>> found;
+        for (const SmFace* face : faces) {
+            SmPoint3d closest;
+            double distance = 0.0;
+            if (SmApiFaceClosestPoint(SM_CONST_CAST(SmFace*, face), point, closest, distance) != SM_SUCCESS) continue;
+            double normal[3];
+            if (!outward_normal(face, point, normal)) continue;
+            found.emplace_back(distance, SmVector3d(normal[0], normal[1], normal[2]));
+            nearest = std::min(nearest, distance);
+        }
+        for (const auto& [distance, normal] : found) {
+            if (distance <= nearest + gap) sum += normal;
+        }
+        sum -= tangent * sum.Dot(tangent);
+        if (sum.Length() < 1e-9) return SM_SHIM_ERR_BAD_EDGE;
+        sum.Unitize(FALSE);
+        normals.Add(SmPoint3d(sum.x, sum.y, sum.z));
+        params.Add(t);
+    }
+    SmBSplineCurve* raw_normals = nullptr;
+    SmStatus status = SmBSplineCurve::InterpolatePoints(*context, normals, &params, 3, nullptr, nullptr, FALSE,
+                                                        SM_IT_CHORDLENGTH, raw_normals);
+    if (status != SM_SUCCESS || !raw_normals) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    std::unique_ptr<SmBSplineCurve> normal_curve(raw_normals);
+    status = normal_curve->EditParameterization(range);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+
+    std::unique_ptr<SmBSplineCurve> section;
+    sm_status shim = profile_section(profile, section);
+    if (shim != SM_SUCCESS) return shim;
+    // Where each profile segment ends along the section.
+    std::vector<double> segment_ends;
+    const SmExtent1d section_range = section->GetNaturalInterval();
+    for (size_t i = 0; i < profile.curves.size(); ++i) {
+        double start[2], end[2], middle[2];
+        curve_points(profile.curves[i], start, end, middle);
+        double t = 0.0, distance = 0.0;
+        SmPoint3d closest;
+        if (SmApiCurveClosestPoint(section.get(), SmPoint3d(0.0, end[0], end[1]), closest, t, distance) != SM_SUCCESS) {
+            return SM_ERR;
+        }
+        segment_ends.push_back(i + 1 == profile.curves.size() ? section_range.GetMax() : t);
+    }
+
+    SmBSplineSurface* raw_surface = nullptr;
+    status = SmBSplineSurface::CreateOrientedSweepSurface(*context, section.get(), path.get(), normal_curve.get(),
+                                                          tolerance, raw_surface);
+    if (status != SM_SUCCESS || !raw_surface) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    const SmExtent2d domain = raw_surface->GetNaturalUVDomain();
+
+    std::unique_ptr<SmBrep> solid(new (*context) SmBrep());
+    SmTArray<SmFace*> sides;
+    status = solid->CreateFacesFromSurface(raw_surface, domain, SM_CT_C1, sides);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    // The sweep runs along u, the section along v. Cap each end with the
+    // sides' sections there.
+    SmTArray<SmCurve*> caps[2];
+    for (ULONG i = 0; i < sides.GetSize(); ++i) {
+        SmSurface* surface = sides[i]->GetSurface();
+        const SmExtent2d own = surface->GetNaturalUVDomain();
+        const double at[2] = {own.GetMin().x, own.GetMax().x};
+        const double whole[2] = {domain.GetMin().x, domain.GetMax().x};
+        for (int end = 0; end < 2; ++end) {
+            if (std::fabs(at[end] - whole[end]) > 1e-9 * (1.0 + std::fabs(whole[end]))) continue;
+            SmBSplineCurve* iso = nullptr;
+            status = surface->CreateIsoParametricCurve(*context, SM_SP_U, at[end], tolerance / 10.0, iso);
+            if (status != SM_SUCCESS || !iso) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+            caps[end].Add(iso);
+        }
+        // What it was swept from and along, by its middle.
+        const SmPoint2d middle = own.Evaluate(0.5, 0.5);
+        mark_profile(*sides[i], SM_PROFILE_SIDE, piece_at(edge_ends, middle.x), piece_at(segment_ends, middle.y));
+    }
+    SmTArray<SmFace*> start_caps, end_caps;
+    status = solid->CreatePlanarFacesWith3DCurves(nullptr, caps[0], tolerance, start_caps);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    status = solid->CreatePlanarFacesWith3DCurves(nullptr, caps[1], tolerance, end_caps);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    for (ULONG i = 0; i < start_caps.GetSize(); ++i) mark_profile(*start_caps[i], SM_PROFILE_START, -1, -1);
+    for (ULONG i = 0; i < end_caps.GetSize(); ++i) mark_profile(*end_caps[i], SM_PROFILE_END, -1, -1);
+    status = solid->StitchAndOrient();
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    if (!is_manifold_solid(*solid)) return SM_SHIM_ERR_BAD_SWEEP;
+    SmTArray<SmFace*> all;
+    solid->GetFaces(all);
+    roles.assign(all.GetSize(), sm_profile_face{SM_PROFILE_SIDE, -1, -1});
+    for (ULONG i = 0; i < all.GetSize(); ++i) {
+        const sm_label label = read_label(all[i]);
+        int role = 0, segment = -1;
+        if (!label.present || label.feature != SWEPT_ROLE ||
+            std::sscanf(label.role, "profile %d %d", &role, &segment) != 2) {
+            continue;
+        }
+        roles[i].role = role;
+        roles[i].path = role == SM_PROFILE_SIDE ? static_cast<int32_t>(label.index) : -1;
+        roles[i].profile = segment;
+    }
+    remove_labels(*solid);
+    (void)brep;
+    out = solid.release();
+    return SM_SUCCESS;
+}
+
 // How far `point` is from the surface `face` lies on.
 bool off_surface(const SmFace* face, const SmPoint3d& point, double& distance) {
     SmPoint3d closest;
@@ -7908,6 +8635,82 @@ sm_status sm_brep_create_pipe(const sm_plane_curve* path, size_t count, sm_vec3 
 }
 
 void sm_pipe_faces_free(sm_pipe_face* faces) { delete[] faces; }
+
+sm_status sm_brep_sweep_profile(const sm_plane_curve* path, size_t path_count, const sm_plane_curve* profile,
+                                size_t profile_count, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y_axis,
+                                int32_t start_end, int32_t end_end, sm_brep** out, sm_profile_face** faces,
+                                size_t* face_count) {
+    if (!path || !profile || !out || !faces || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    const double dot = x_axis.x * y_axis.x + x_axis.y * y_axis.y + x_axis.z * y_axis.z;
+    if (!std::isfinite(origin.x) || !std::isfinite(origin.y) || !std::isfinite(origin.z) || !unit_vector(x_axis) ||
+        !unit_vector(y_axis) || std::fabs(dot) > 1e-9) {
+        return SM_SHIM_ERR_BAD_FRAME;
+    }
+    const auto end_kind = [](int32_t end) { return end == SM_PATH_END_SQUARE || end == SM_PATH_END_ROUND; };
+    if (path_count == 0 || profile_count == 0 || !end_kind(start_end) || !end_kind(end_end)) {
+        return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    }
+    return guarded([&] {
+        Profile shape;
+        for (size_t i = 0; i < profile_count; ++i) {
+            sm_plane_curve curve = profile[i];
+            curve.label = profile_label(static_cast<int32_t>(i));
+            shape.curves.push_back(curve);
+            take_in(shape, curve);
+        }
+        const SmAxis2Placement frame(SmPoint3d(origin.x, origin.y, origin.z), SmVector3d(x_axis.x, x_axis.y, x_axis.z),
+                                     SmVector3d(y_axis.x, y_axis.y, y_axis.z));
+        SmBrep* solid = nullptr;
+        std::vector<sm_profile_face> roles;
+        const sm_status status = sweep_profile(path, path_count, shape, frame, start_end, end_end, solid, roles);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> owned(solid);
+        std::unique_ptr<sm_profile_face[]> array(new sm_profile_face[roles.size()]);
+        std::copy(roles.begin(), roles.end(), array.get());
+        *out = handle_of(owned.release());
+        *faces = array.release();
+        *face_count = roles.size();
+        return SM_SUCCESS;
+    });
+}
+
+void sm_profile_faces_free(sm_profile_face* faces) { delete[] faces; }
+
+sm_status sm_brep_sweep_profile_along(const sm_brep* brep, const uint32_t* edges, size_t edge_count,
+                                      const sm_plane_curve* profile, size_t profile_count, uint32_t samples,
+                                      double tolerance, sm_brep** out, sm_profile_face** faces,
+                                      size_t* face_count) {
+    if (!brep || !edges || !profile || !out || !faces || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (edge_count == 0 || profile_count == 0 || !std::isfinite(tolerance) || tolerance <= 0.0) {
+        return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    }
+    return guarded([&] {
+        const SmBrep& source = *brep_of(brep);
+        SmTArray<SmEdge*> all;
+        source.GetEdges(all);
+        std::vector<const SmEdge*> chain;
+        for (size_t i = 0; i < edge_count; ++i) {
+            if (edges[i] >= all.GetSize()) return SM_SHIM_ERR_BAD_EDGE;
+            chain.push_back(all[edges[i]]);
+        }
+        Profile shape;
+        for (size_t i = 0; i < profile_count; ++i) {
+            shape.curves.push_back(profile[i]);
+            take_in(shape, profile[i]);
+        }
+        SmBrep* solid = nullptr;
+        std::vector<sm_profile_face> roles;
+        const sm_status status = sweep_profile_along(source, chain, shape, samples, tolerance, solid, roles);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> owned(solid);
+        std::unique_ptr<sm_profile_face[]> array(new sm_profile_face[roles.size()]);
+        std::copy(roles.begin(), roles.end(), array.get());
+        *out = handle_of(owned.release());
+        *faces = array.release();
+        *face_count = roles.size();
+        return SM_SUCCESS;
+    });
+}
 
 sm_status sm_brep_shell(const sm_brep* brep, double thickness, const uint32_t* open, size_t open_count,
                         sm_brep** out, sm_shell_face** faces, size_t* face_count) {

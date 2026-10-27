@@ -593,6 +593,88 @@ sm_status sm_brep_create_pipe(const sm_plane_curve *path, size_t count, sm_vec3 
 /* Frees the array sm_brep_create_pipe returns. NULL is ignored. */
 void sm_pipe_faces_free(sm_pipe_face *faces);
 
+/* What a face of a profile swept along a path is (sm_brep_sweep_profile). */
+enum sm_profile_role {
+    /* A side, swept from one profile segment along one curve of the path. */
+    SM_PROFILE_SIDE = 0,
+    /* The path's start: a square end's cap, or a face of a round end turned
+     * from a profile segment. */
+    SM_PROFILE_START = 1,
+    /* The path's end, likewise. */
+    SM_PROFILE_END = 2
+};
+
+/* How a profile swept along an open path ends (sm_brep_sweep_profile). */
+enum sm_path_end {
+    /* A flat cap: the profile itself. */
+    SM_PATH_END_SQUARE = 0,
+    /* The profile's left half (x >= 0) turned half a turn about the frame's
+     * z through the path's end, round beyond it. */
+    SM_PATH_END_ROUND = 1
+};
+
+/* One face of a swept profile, in the order of its face list: its
+ * sm_profile_role, the path curve a side was swept along (-1 for an end, or
+ * when the shim couldn't tell) and the profile segment a side or a round
+ * end's face was swept from (-1 for a square cap, or when it couldn't tell). */
+typedef struct sm_profile_face {
+    int32_t role;
+    int32_t path;
+    int32_t profile;
+} sm_profile_face;
+
+/* A closed profile swept along a path of lines and arcs in the plane through
+ * origin spanned by x_axis and y_axis (unit and perpendicular), the path as
+ * sm_brep_create_pipe takes it. The profile is a loop of lines and arcs (or a
+ * circle) in its own (x, y): it stands square to the path, x across it,
+ * positive to the left (the frame's z cross the path's direction), and y
+ * along the frame's z, so a groove on a face, where z is the face's outward
+ * normal, has its profile below y = 0, and a belt round a part, where z runs
+ * along the walls, has it across x. It's sm_brep_create_pipe's construction
+ * with the profile in place of the disc: a piece per curve, the profile swept
+ * along a line or turned about an arc's centre, mitred where lines meet at an
+ * angle (any profile's sections match on the plane halfway between them),
+ * and the pieces joined. An open path ends as start_end and end_end say
+ * (sm_path_end); a closed one has no ends. *faces says what each face is
+ * (sm_profile_face); free it with sm_profile_faces_free.
+ * SM_ERR_INVALID_INPUT for an empty path or profile, or a profile that isn't
+ * one face; SM_SHIM_ERR_BAD_PATH when the path turns back on itself, a bend
+ * is no wider than the profile reaches towards its centre, or a round end's
+ * profile doesn't straddle the path; SM_SHIM_ERR_ARC_CORNER when an arc meets
+ * a curve beside it at an angle; the kernel's status, or
+ * SM_SHIM_ERR_BAD_SWEEP, when it builds no solid. */
+sm_status sm_brep_sweep_profile(const sm_plane_curve *path, size_t path_count, const sm_plane_curve *profile,
+                                size_t profile_count, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y_axis,
+                                int32_t start_end, int32_t end_end, sm_brep **out, sm_profile_face **faces,
+                                size_t *face_count);
+
+/* Frees the array sm_brep_sweep_profile and sm_brep_sweep_profile_along
+ * return. NULL is ignored. */
+void sm_profile_faces_free(sm_profile_face *faces);
+
+/* A closed profile swept along a chain of the brep's edges, its frame
+ * turning with the faces' normal: an experiment for paths that leave one
+ * plane. The edges, at indices of the brep's edge list, run end to end in
+ * order (each may run either way along its curve) and join tangentially.
+ * The profile is sm_brep_sweep_profile's, x to the left of the chain and y
+ * along the outward normal of the faces the chain lies on (the mean of an
+ * edge's two faces'), and is carried along the chain as one sweep
+ * (SmBSplineSurface::CreateOrientedSweepSurface, a fork patch) whose frame's
+ * z follows that normal, interpolated through `samples` points per edge, the
+ * surface approximated to `tolerance`, capped flat at both ends. *faces says
+ * what each face is (sm_profile_face): a side's path is the edge its middle
+ * lies along, by its index in `edges`; the sweep splits its sides only where
+ * it isn't smooth, not at every edge.
+ * SM_SHIM_ERR_BAD_EDGE for an edge out of range or a chain that doesn't run
+ * end to end; SM_SHIM_ERR_ARC_CORNER where edges meet at more than 1e-3
+ * radians (over a sharp edge of the part); SM_ERR_INVALID_INPUT for an empty
+ * profile or a tolerance that isn't positive; the kernel's status, or
+ * SM_SHIM_ERR_BAD_SWEEP, when it builds no solid. The brep is unchanged. */
+sm_status sm_brep_sweep_profile_along(const sm_brep *brep, const uint32_t *edges, size_t edge_count,
+                                      const sm_plane_curve *profile, size_t profile_count, uint32_t samples,
+                                      double tolerance, sm_brep **out, sm_profile_face **faces,
+                                      size_t *face_count);
+
 /* What a face of a shelled solid is (sm_brep_shell), by the face of the
  * solid it came from. */
 enum sm_shell_role {

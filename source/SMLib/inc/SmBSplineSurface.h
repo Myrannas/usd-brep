@@ -740,6 +740,24 @@ public:
       SmBSplineSurface    *& rpNewSurf                // out: new sweptSurface
     );
 
+    // create surface by sweeping a section curve along a trajectory curve,
+    // turning it so that its local z follows an orientation curve:
+    // NewSurf(u,v) = TrajectoryCurve(v) + A(v) * SectionCurve(u), where A(v)
+    // takes x to the trajectory's unit tangent, z to OrientationCurve(v)
+    // made unit, and y to z cross x. The section is given in that local
+    // frame, not placed on the trajectory. An approximate surface, as the
+    // non-translational sweep is. (game-cad fork: PATCHES.md)
+    static SmStatus CreateOrientedSweepSurface
+    (
+      const SmContext      & crContext,               // in : context for new object construction
+      const SmBSplineCurve * cpSectionCurve,          // in : u direction curve for new Surface, in the local frame
+      const SmBSplineCurve * cpTrajectoryCurve,       // in : v direction curve for new Surface, G1 smooth
+      const SmBSplineCurve * cpOrientationCurve,      // in : local z at each v, square to the trajectory, any length
+                                                      //    : OrientationCurve->NaturalInterval must equal TrajectoryCurve->NaturalInterval
+      double                 dThisApproxTol3d,        // in : Max distance between exact surface and newSurf approximation
+      SmBSplineSurface    *& rpNewSurf                // out: new sweptSurface
+    );
+
     // create surface by sweeping a series of section curves along
     // trajectory curves -- currently, two.
     static SmStatus CreateSweepSurface

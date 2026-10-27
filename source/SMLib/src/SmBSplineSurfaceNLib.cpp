@@ -5850,6 +5850,60 @@ SmBoolean bDebugMe = FALSE;
 
 } // end SmBSplineSurface::CreateSweepSurface
 
+/*******************************************************************//**
+PURPOSE: Sweep a section curve along a trajectory curve, its local z
+         following an orientation curve (N_CreateSweepScale's curZ),
+         rather than a frame carried along from the trajectory's start.
+
+NOTES: game-cad fork (PATCHES.md). The section is given in the local
+       frame: x along the trajectory, z along the orientation curve.
+***********************************************************************/
+SmStatus SmBSplineSurface::CreateOrientedSweepSurface
+  (const SmContext      & crContext,               // in : context for new object construction
+   const SmBSplineCurve * cpSectionCurve,          // in : u direction curve for new Surface, in the local frame
+   const SmBSplineCurve * cpTrajectoryCurve,       // in : v direction curve for new Surface
+   const SmBSplineCurve * cpOrientationCurve,      // in : local z at each v
+   double                 dThisApproxTol3d,        // in : Max distance between exact surface and newSurf approximation
+   SmBSplineSurface    *& rpNewSurf)               // out: new sweptSurface
+{
+  SM_ASSERT_MSG(rpNewSurf == NULL,_T("SmBSplineSurface::CreateOrientedSweepSurface - output pointer not NULL on input")) ;
+  NER(cpSectionCurve) ;
+  NER(cpTrajectoryCurve) ;
+  NER(cpOrientationCurve) ;
+
+  NL_STACKS  nlStacks;
+  NL_SURFACE nlSurf;
+  SmNLibStackHandler sSH1(&nlStacks);
+  N_SrfInitArrays(&nlSurf);
+
+  NL_CURVE *nlCurvS = ((SmBSplineCurve *)cpSectionCurve)->GetOrCreateGwNurbPointer();
+  NL_CURVE *nlCurvT = ((SmBSplineCurve *)cpTrajectoryCurve)->GetOrCreateGwNurbPointer();
+  NL_CURVE *nlCurvZ = ((SmBSplineCurve *)cpOrientationCurve)->GetOrCreateGwNurbPointer();
+
+  // Z0 is unused when curZ is given.
+  NL_VECTOR nlZAxis;
+  nlZAxis.x = 0.0; nlZAxis.y = 0.0; nlZAxis.z = 1.0;
+
+  // Cubic along the sweep even on a straight trajectory: the frame turns.
+  NL_DEGREE nlDeg = 3;
+  NL_PARAMETER nlDummy = 0.0;
+  NL_SER(N_CreateSweepScale( nlCurvT, nlCurvS,
+                             nlZAxis,
+                             nlCurvZ,
+                             NULL,
+                             NL_NO,
+                             nlDummy,
+                             nlDeg,
+                             NL_UDIR,
+                             dThisApproxTol3d,
+                             &nlSurf,
+                             &nlStacks));
+
+  rpNewSurf = new (crContext) SmBSplineSurface((gw_SURFACE *)&nlSurf) ;
+  return SM_SUCCESS;
+
+} // end SmBSplineSurface::CreateOrientedSweepSurface
+
 
 /*******************************************************************//**
    Local helper routines for CreateSweepSurface(), multi-profile version:

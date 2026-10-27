@@ -79,6 +79,16 @@ cargo test -p smlib
   walls are cylinders and tori), lines mitred where they meet at an angle,
   all joined. `Pipe::faces` says which face is the outer wall, the inner
   wall or a cap, and which path curve each wall was swept along.
+- `Brep::sweep_profile` is the pipe's construction for any closed profile
+  of lines and arcs, its x across the path and its y along the frame's z:
+  lines swept, arcs turned, lines mitred, an open path's ends square or
+  round (half the profile turned about the end). `ProfileSweep::faces` says
+  which path curve and profile segment each side came from. This is a panel
+  line's groove.
+- `Brep::sweep_profile_along` sweeps such a profile along a chain of the
+  brep's own edges, its y following the faces' normal, as one NURBS sweep
+  (patch `23281a6`): a groove whose path leaves one plane, across a round or
+  a NURBS face. An experiment, for now.
 - `Brep::shell` hollows a solid inward to a wall thickness, chosen faces
   left open (`SmApiShellBrepFull`). `Shell::faces` says which face stays
   outside, which is the rim of an opened face, which is the inner face
