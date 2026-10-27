@@ -1153,6 +1153,108 @@ impl Brep {
         })
     }
 
+    /// A closed `profile` swept along a chain of this brep's `edges`, its
+    /// frame turning with the faces' normal: an experiment for panel lines
+    /// whose path leaves one plane (a diagonal across a round, a line on a
+    /// NURBS face). The edges, by index in [`edges`](Brep::edges), run end
+    /// to end in order, each either way along its curve, and join
+    /// tangentially. The profile is [`sweep_profile`](Brep::sweep_profile)'s:
+    /// x to the left of the chain, y along the outward normal of the faces
+    /// it lies on.
+    ///
+    /// The chain is joined into one B-spline and the profile swept along it
+    /// once, by SMLib's NURBS sweep with its frame's z following the normal
+    /// (`SmBSplineSurface::CreateOrientedSweepSurface`, a fork patch), the
+    /// normal sampled `samples` times an edge and interpolated, the surface
+    /// approximated to `tolerance`. Its ends are capped flat. The sides are
+    /// NURBS, split where the sweep isn't smooth; [`ProfileFace::Side`]'s
+    /// path is the edge a side's middle lies along, by its index in `edges`.
+    /// The brep is unchanged.
+    pub fn sweep_profile_along(
+        &self,
+        edges: &[usize],
+        profile: &[PlaneCurve],
+        samples: u32,
+        tolerance: f64,
+    ) -> Result<ProfileSweep, Error> {
+        const OP: &str = "sm_brep_sweep_profile_along";
+        let invalid = |reason| {
+            Err(Error::InvalidArgument {
+                operation: OP,
+                reason,
+            })
+        };
+        if edges.is_empty() {
+            return invalid("the chain needs at least one edge");
+        }
+        if profile.is_empty() {
+            return invalid("the profile needs at least one curve");
+        }
+        if let Some(reason) = profile.iter().find_map(PlaneCurve::problem) {
+            return invalid(reason);
+        }
+        let next = profile.iter().cycle().skip(1);
+        if profile.len() > 1
+            && profile
+                .iter()
+                .zip(next)
+                .any(|(curve, after)| gap(curve.end(), after.start()) > LOOP_GAP)
+        {
+            return invalid("the profile's curves must run head to tail and close");
+        }
+        check_positive(OP, tolerance, "the tolerance must be finite and positive")?;
+        let edges = edges
+            .iter()
+            .map(|&edge| u32::try_from(edge))
+            .collect::<Result<Vec<u32>, _>>()
+            .map_err(|_| Error::InvalidArgument {
+                operation: OP,
+                reason: "an edge index is out of range",
+            })?;
+        let raw_profile = profile
+            .iter()
+            .map(|curve| curve.to_raw(&None, OP))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut out = ptr::null_mut();
+        let mut faces = ptr::null_mut();
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; edges and
+        // raw_profile hold their lengths' elements; the outputs are written
+        // only on success.
+        let status = unsafe {
+            sys::sm_brep_sweep_profile_along(
+                self.raw.as_ptr(),
+                edges.as_ptr(),
+                edges.len(),
+                raw_profile.as_ptr(),
+                raw_profile.len(),
+                samples,
+                tolerance,
+                &mut out,
+                &mut faces,
+                &mut count,
+            )
+        };
+        if status == sys::SM_SHIM_ERR_BAD_EDGE {
+            return invalid("the edges must be the brep's and run end to end");
+        }
+        Error::check(OP, status)?;
+        // SAFETY: on success faces holds count entries, which we copy and then
+        // free once.
+        let roles = unsafe {
+            let roles = slice(faces, count)
+                .iter()
+                .map(ProfileFace::from_raw)
+                .collect();
+            sys::sm_profile_faces_free(faces);
+            roles
+        };
+        Ok(ProfileSweep {
+            solid: Brep::from_raw(OP, out)?,
+            faces: roles,
+        })
+    }
+
     /// The solid hollowed to a wall `thickness` thick, inward from its faces,
     /// with the faces at `open` in [`faces`](Brep::faces) left open
     /// (`SmApiShellBrepFull`: SMLib insets the solid, those faces left where

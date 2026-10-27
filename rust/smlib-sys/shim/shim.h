@@ -648,8 +648,31 @@ sm_status sm_brep_sweep_profile(const sm_plane_curve *path, size_t path_count, c
                                 int32_t start_end, int32_t end_end, sm_brep **out, sm_profile_face **faces,
                                 size_t *face_count);
 
-/* Frees the array sm_brep_sweep_profile returns. NULL is ignored. */
+/* Frees the array sm_brep_sweep_profile and sm_brep_sweep_profile_along
+ * return. NULL is ignored. */
 void sm_profile_faces_free(sm_profile_face *faces);
+
+/* A closed profile swept along a chain of the brep's edges, its frame
+ * turning with the faces' normal: an experiment for paths that leave one
+ * plane. The edges, at indices of the brep's edge list, run end to end in
+ * order (each may run either way along its curve) and join tangentially.
+ * The profile is sm_brep_sweep_profile's, x to the left of the chain and y
+ * along the outward normal of the faces the chain lies on (the mean of an
+ * edge's two faces'), and is carried along the chain as one sweep
+ * (SmBSplineSurface::CreateOrientedSweepSurface, a fork patch) whose frame's
+ * z follows that normal, interpolated through `samples` points per edge, the
+ * surface approximated to `tolerance`, capped flat at both ends. *faces says
+ * what each face is (sm_profile_face): a side's path is the edge its middle
+ * lies along, by its index in `edges`; the sweep splits its sides only where
+ * it isn't smooth, not at every edge.
+ * SM_SHIM_ERR_BAD_EDGE for an edge out of range or a chain that doesn't run
+ * end to end; SM_ERR_INVALID_INPUT for an empty profile or a tolerance that
+ * isn't positive; the kernel's status, or SM_SHIM_ERR_BAD_SWEEP, when it
+ * builds no solid. The brep is unchanged. */
+sm_status sm_brep_sweep_profile_along(const sm_brep *brep, const uint32_t *edges, size_t edge_count,
+                                      const sm_plane_curve *profile, size_t profile_count, uint32_t samples,
+                                      double tolerance, sm_brep **out, sm_profile_face **faces,
+                                      size_t *face_count);
 
 /* What a face of a shelled solid is (sm_brep_shell), by the face of the
  * solid it came from. */

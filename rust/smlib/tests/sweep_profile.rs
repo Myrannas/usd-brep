@@ -14,7 +14,8 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use smlib::{
-    Brep, Error, Frame, Kernel, Mesh, PathEnd, PlaneCurve, ProfileFace, Surface, TessellationParams,
+    Brep, Error, Frame, Kernel, Label, Mesh, PathEnd, PlaneCurve, ProfileFace, Surface,
+    TessellationParams,
 };
 
 type Job = Box<dyn FnOnce(&Kernel) + Send>;
@@ -389,6 +390,151 @@ fn refuses_what_it_cant_sweep() {
         reason(corner, square().0, [PathEnd::Square; 2]),
         "an arc in the path must meet the curves either side of it tangentially"
     );
+}
+
+/// A cylinder 20 round and 60 tall, along z, and the edges a box imprints
+/// on its wall where the box's top face, on the plane through (0, 0, 30)
+/// along `x` and `y`, crosses it, by how far along `y` their middles lie.
+/// The box lies on the plane's side away from its normal, `x` × `y`, and
+/// on the side of the plane through the axis along `y` that `x` points to.
+fn imprinted(kernel: &Kernel, x: [f64; 3], y: [f64; 3]) -> (Brep, Vec<usize>) {
+    let cylinder = Brep::cylinder(kernel, [0.0; 3], 20.0, 60.0).unwrap();
+    let frame = Frame::new([0.0, 0.0, 30.0], x, y).unwrap();
+    let mut tool = Brep::cuboid(kernel, [0.0, -50.0, -100.0], [50.0, 100.0, 100.0]).unwrap();
+    tool.place(&frame).unwrap();
+    let up = frame.z_axis();
+    let mut top = None;
+    for face in tool.faces().unwrap() {
+        if face.normal.is_some_and(|n| dot(n, up) > 0.999) {
+            top = Some(face.index as u32);
+        }
+        let label = Label { feature: 1, role: "box".into(), index: face.index as u32 };
+        tool.set_face_label(face.index, &label).unwrap();
+    }
+    let imprint = cylinder.imprint(tool).unwrap();
+    let edges = imprint.brep.edges().unwrap();
+    let along = |e: usize| edges[e].samples.iter().map(|&p| dot(p, y)).sum::<f64>();
+    let mut chain: Vec<usize> = imprint
+        .edges
+        .iter()
+        .filter(|e| e.tool_faces.len() == 1 && Some(e.tool_faces[0].index) == top)
+        .map(|e| e.edge)
+        .filter(|&e| edges[e].samples.iter().all(|p| on_wall(*p)))
+        .collect();
+    chain.sort_by(|&a, &b| along(a).total_cmp(&along(b)));
+    (imprint.brep, chain)
+}
+
+fn on_wall(p: [f64; 3]) -> bool {
+    (p[0].hypot(p[1]) - 20.0).abs() < 1e-6
+}
+
+/// How far the floor's edges lie from the cylinder's axis, nearest and
+/// farthest, and the volumes of the groove, the part and what the groove
+/// cuts from it.
+struct Along {
+    roles: Vec<ProfileFace>,
+    manifold: bool,
+    volume: f64,
+    floor: [f64; 2],
+    removed: f64,
+    cut_manifold: bool,
+}
+
+fn along(x: [f64; 3], y: [f64; 3], profile: Vec<PlaneCurve>) -> Along {
+    on_kernel(move |k| {
+        let (part, chain) = imprinted(k, x, y);
+        let swept = part.sweep_profile_along(&chain, &profile, 16, 1e-4).unwrap();
+        let floor: Vec<usize> = (0..swept.faces.len())
+            .filter(|&f| matches!(swept.faces[f], ProfileFace::Side { profile: Some(0), .. }))
+            .collect();
+        let radial = |p: [f64; 3]| p[0].hypot(p[1]);
+        let mut range = [f64::MAX, f64::MIN];
+        for edge in swept.solid.edges().unwrap() {
+            if edge.faces.iter().any(|f| f.is_some_and(|f| floor.contains(&(f as usize)))) {
+                for &p in &edge.samples {
+                    range = [range[0].min(radial(p)), range[1].max(radial(p))];
+                }
+            }
+        }
+        let before = part.volume(1e-9).unwrap();
+        let groove = swept.solid.try_clone().unwrap();
+        let cut = part.difference(groove).unwrap();
+        Along {
+            roles: swept.faces.clone(),
+            manifold: swept.solid.is_manifold().unwrap(),
+            volume: swept.solid.volume(1e-9).unwrap(),
+            floor: range,
+            removed: before - cut.volume(1e-9).unwrap(),
+            cut_manifold: cut.is_manifold().unwrap(),
+        }
+    })
+}
+
+#[test]
+fn a_groove_up_a_cylinders_side_follows_its_normal() {
+    // A box's face on the plane x = 0 crosses the wall up y = 20, straight,
+    // its normal +y all the way: the groove is its profile times 60 long,
+    // its floor 2 in from the wall, and it cuts the cylinder's segment
+    // under the surface across its width.
+    let (profile, area) = square();
+    let groove = along([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], profile.clone());
+    let side = |path: usize| {
+        (0..profile.len())
+            .map(|segment| ProfileFace::Side { path: Some(path), profile: Some(segment) })
+            .collect::<Vec<_>>()
+    };
+    assert!(groove.manifold);
+    assert!(side(0).iter().all(|role| groove.roles.contains(role)), "{:?}", groove.roles);
+    assert!(groove.roles.contains(&ProfileFace::Start { profile: None }));
+    assert!(groove.roles.contains(&ProfileFace::End { profile: None }));
+    assert!((groove.volume - area * 60.0).abs() < 1e-4 * area * 60.0, "{}", groove.volume);
+    assert!((groove.floor[0] - (20.0 - D)).abs() < 1e-3, "{:?}", groove.floor);
+    let h = W / 2.0;
+    let below = 2.0 * (h / 2.0 * (400.0 - h * h).sqrt() + 200.0 * (h / 20.0).asin()) - W * (20.0 - D);
+    assert!(groove.cut_manifold);
+    assert!((groove.removed - below * 60.0).abs() < 1e-4 * below * 60.0, "{} vs {}", groove.removed, below * 60.0);
+}
+
+#[test]
+fn a_groove_round_a_cylinder_turns_with_its_normal() {
+    // A plane 30° from level crosses the wall in an ellipse, whose half on
+    // +x the box marks: its normal turns half a turn round the axis, and the
+    // floor stays 2 in from the wall, as far as half the width across it
+    // reaches round.
+    let (sin, cos) = 30f64.to_radians().sin_cos();
+    let groove = along([1.0, 0.0, 0.0], [0.0, cos, sin], square().0);
+    assert!(groove.manifold);
+    let h = W / 2.0;
+    let reach = ((20.0 - D) * (20.0 - D) + h * h).sqrt();
+    assert!(groove.floor[0] > 20.0 - D - 1e-3 && groove.floor[1] < reach + 1e-3, "{:?}", groove.floor);
+    assert!(groove.cut_manifold);
+    assert!(groove.removed > 0.0 && groove.removed < groove.volume);
+}
+
+#[test]
+fn refuses_edges_that_dont_run_end_to_end() {
+    let reasons = on_kernel(|k| {
+        let (part, chain) = imprinted(k, [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        // Two rulings up the wall, apart: the box's, and its side's or the
+        // cylinder's seam.
+        let upright = |p: &[[f64; 3]]| p.iter().all(|&q| on_wall(q) && q[0] == p[0][0] && q[1] == p[0][1]);
+        let rulings: Vec<usize> = part
+            .edges()
+            .unwrap()
+            .iter()
+            .filter(|e| upright(&e.samples[..]))
+            .map(|e| e.index)
+            .take(2)
+            .collect();
+        assert_eq!(rulings.len(), 2);
+        let beyond = vec![chain[0], part.edge_count()];
+        [rulings, beyond].map(|edges| match part.sweep_profile_along(&edges, &square().0, 8, 1e-4) {
+            Err(Error::InvalidArgument { reason, .. }) => reason,
+            other => panic!("{other:?}"),
+        })
+    });
+    assert_eq!(reasons, ["the edges must be the brep's and run end to end"; 2]);
 }
 
 /// That the mesh's triangles wind with the kernel's normals and enclose the

@@ -8125,6 +8125,309 @@ sm_status sweep_profile(const sm_plane_curve* path, size_t count, const Profile&
     return SM_SUCCESS;
 }
 
+// Turns a B-spline round to run the other way along its own interval.
+SmStatus reverse(SmBSplineCurve& curve) {
+    const SmExtent1d whole = curve.GetNaturalInterval();
+    SmExtent1d reversed;
+    return curve.ReverseParameterization(whole, reversed);
+}
+
+// A point on a curve, and its derivative when `tangent` isn't null.
+bool curve_at(const SmCurve* curve, double t, SmPoint3d& point, SmVector3d* tangent) {
+    SmVector3d at;
+    SmVector3d* point_out = &at;
+    SmVector3d* tangent_out = tangent;
+    SmVector3d* no_second = nullptr;
+    if (SmApiEvaluateCurve(curve, t, point_out, tangent_out, no_second) != SM_SUCCESS) return false;
+    point = SmPoint3d(at.x, at.y, at.z);
+    return true;
+}
+
+// The edge's curve between its ends as a B-spline of its own, and where it
+// starts and ends.
+sm_status edge_spline(const SmEdge* edge, std::unique_ptr<SmBSplineCurve>& out, SmPoint3d& start, SmPoint3d& end) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    const SmCurve* curve = edge->GetCurve();
+    if (!curve) return SM_ERR;
+    double t0 = 0.0, t1 = 0.0;
+    SmApiStatus status = SmApiEdgeParameterRange(edge, t0, t1);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    // As in describe_edge, the range can reach an ulp past the curve's.
+    const SmExtent1d domain = curve->GetNaturalInterval();
+    t0 = std::min(std::max(t0, domain.GetMin()), domain.GetMax());
+    t1 = std::min(std::max(t1, domain.GetMin()), domain.GetMax());
+    if (!curve_at(curve, t0, start, nullptr) || !curve_at(curve, t1, end, nullptr)) return SM_ERR;
+    if (curve->GetType() == SmLine_TYPE) {
+        SmBSplineCurve* raw = nullptr;
+        const SmStatus made = SmBSplineCurve::CreateLineSegment(*context, 3, start, end, raw);
+        if (made != SM_SUCCESS || !raw) return made != SM_SUCCESS ? static_cast<sm_status>(made) : SM_ERR;
+        out.reset(raw);
+        return SM_SUCCESS;
+    }
+    SmCurve* copy = nullptr;
+    const SmStatus copied = curve->GetType() == SmBSplineCurve_TYPE ? curve->Copy(*context, copy)
+                                                                     : curve->CopyAnalyticAsNurb(*context, copy);
+    if (copied != SM_SUCCESS || !copy || copy->GetType() != SmBSplineCurve_TYPE) {
+        delete copy;
+        return copied != SM_SUCCESS ? static_cast<sm_status>(copied) : SM_ERR;
+    }
+    out.reset(static_cast<SmBSplineCurve*>(copy));
+    // The copy's parameters needn't be the curve's: trim it where the ends
+    // lie on it.
+    double s0 = 0.0, s1 = 0.0, distance = 0.0;
+    SmPoint3d closest;
+    if (SmApiCurveClosestPoint(out.get(), start, closest, s0, distance) != SM_SUCCESS ||
+        SmApiCurveClosestPoint(out.get(), end, closest, s1, distance) != SM_SUCCESS) {
+        return SM_ERR;
+    }
+    if (s1 < s0) return SM_ERR;
+    SmExtent1d range(s0, s1);
+    const SmExtent1d whole = out->GetNaturalInterval();
+    if (std::fabs(s0 - whole.GetMin()) > 1e-12 || std::fabs(s1 - whole.GetMax()) > 1e-12) {
+        const SmStatus trimmed = out->Trim(range);
+        if (trimmed != SM_SUCCESS) return static_cast<sm_status>(trimmed);
+    }
+    return SM_SUCCESS;
+}
+
+// The profile as one closed B-spline in a sweep's local frame: its x along
+// the frame's y, its y along the frame's z.
+sm_status profile_section(const Profile& profile, std::unique_ptr<SmBSplineCurve>& out) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    std::vector<std::unique_ptr<SmBSplineCurve>> owned;
+    SmTArray<SmBSplineCurve*> pieces;
+    const SmAxis2Placement upright(SmPoint3d(0.0, 0.0, 0.0), SmVector3d(0.0, 1.0, 0.0), SmVector3d(0.0, 0.0, 1.0));
+    for (const sm_plane_curve& curve : profile.curves) {
+        SmCurve* raw = nullptr;
+        sm_status status = plane_curve(curve, raw);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmCurve> made(raw);
+        std::unique_ptr<SmBSplineCurve> spline;
+        if (made->GetType() == SmBSplineCurve_TYPE) {
+            spline.reset(static_cast<SmBSplineCurve*>(made.release()));
+            // An arc runs anticlockwise from SmApiCreateArc; turn it to
+            // run as the profile does.
+            SmPoint3d start;
+            if (!curve_at(spline.get(), spline->GetNaturalInterval().GetMin(), start, nullptr)) return SM_ERR;
+            if (curve.kind == SM_PLANE_ARC && std::hypot(start.x - curve.a[0] - curve.radius * std::cos(curve.start_deg * SM_PI / 180.0),
+                                                         start.y - curve.a[1] - curve.radius * std::sin(curve.start_deg * SM_PI / 180.0)) > 1e-6) {
+                const SmStatus reversed = reverse(*spline);
+                if (reversed != SM_SUCCESS) return static_cast<sm_status>(reversed);
+            }
+        } else {
+            SmBSplineCurve* line = nullptr;
+            const SmStatus status_line = SmBSplineCurve::CreateLineSegment(
+                *context, 3, SmPoint3d(curve.a[0], curve.a[1], 0.0), SmPoint3d(curve.b[0], curve.b[1], 0.0), line);
+            if (status_line != SM_SUCCESS || !line) return SM_ERR;
+            spline.reset(line);
+        }
+        const SmStatus moved = spline->Transform(upright);
+        if (moved != SM_SUCCESS) return static_cast<sm_status>(moved);
+        pieces.Add(spline.get());
+        owned.push_back(std::move(spline));
+    }
+    if (pieces.GetSize() == 1) {
+        out = std::move(owned[0]);
+        return SM_SUCCESS;
+    }
+    SmBSplineCurve* joined = nullptr;
+    const SmStatus status = SmBSplineCurve::CreateByJoining(*context, pieces, nullptr, joined);
+    if (status != SM_SUCCESS || !joined) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    out.reset(joined);
+    return SM_SUCCESS;
+}
+
+// Which piece of a joined curve a parameter falls in, given where each
+// piece ends along it.
+int32_t piece_at(const std::vector<double>& ends, double t) {
+    for (size_t i = 0; i < ends.size(); ++i) {
+        if (t <= ends[i]) return static_cast<int32_t>(i);
+    }
+    return -1;
+}
+
+// sm_brep_sweep_profile_along's work: the chain joined into one path, the
+// normal sampled along it and interpolated, the profile swept with its z
+// following it, the sides split where the sweep isn't smooth, capped and
+// stitched into a solid, and each side told by the profile segment and edge
+// its middle lies on.
+sm_status sweep_profile_along(const SmBrep& brep, const std::vector<const SmEdge*>& chain, const Profile& profile,
+                              uint32_t samples, double tolerance, SmBrep*& out,
+                              std::vector<sm_profile_face>& roles) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    // The edges' splines, each the way the chain runs.
+    std::vector<std::unique_ptr<SmBSplineCurve>> splines(chain.size());
+    std::vector<std::array<SmPoint3d, 2>> ends(chain.size());
+    for (size_t i = 0; i < chain.size(); ++i) {
+        const sm_status status = edge_spline(chain[i], splines[i], ends[i][0], ends[i][1]);
+        if (status != SM_SUCCESS) return status;
+    }
+    const double gap = std::max(1e3 * SM_ZONE_TOL_3D, 1e-6);
+    SmTArray<SmBoolean> senses;
+    for (size_t i = 0; i < chain.size(); ++i) {
+        bool forward = true;
+        if (chain.size() > 1) {
+            if (i == 0) {
+                const auto& next = ends[1];
+                forward = std::min(ends[0][1].DistanceBetween(next[0]), ends[0][1].DistanceBetween(next[1])) <= gap;
+            } else {
+                const SmPoint3d& previous = senses[i - 1] ? ends[i - 1][1] : ends[i - 1][0];
+                forward = ends[i][0].DistanceBetween(previous) <= gap;
+                if (!forward && ends[i][1].DistanceBetween(previous) > gap) return SM_SHIM_ERR_BAD_EDGE;
+            }
+        }
+        senses.Add(forward ? TRUE : FALSE);
+    }
+    std::unique_ptr<SmBSplineCurve> path;
+    if (chain.size() == 1) {
+        path = std::move(splines[0]);
+        if (!senses[0] && reverse(*path) != SM_SUCCESS) return SM_ERR;
+    } else {
+        SmTArray<SmBSplineCurve*> pieces;
+        for (auto& spline : splines) pieces.Add(spline.get());
+        SmBSplineCurve* joined = nullptr;
+        const SmStatus status = SmBSplineCurve::CreateByJoining(*context, pieces, &senses, joined);
+        if (status != SM_SUCCESS || !joined) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+        path.reset(joined);
+    }
+    // A line alone is a spline of degree 1, along which the sweep fails.
+    if (path->GetDegree() < 3 && path->DegreeElevate(3) != SM_SUCCESS) return SM_ERR;
+    const SmExtent1d range = path->GetNaturalInterval();
+    // Where each edge ends along the path.
+    std::vector<double> edge_ends;
+    for (size_t i = 0; i < chain.size(); ++i) {
+        const SmPoint3d& end = senses[i] ? ends[i][1] : ends[i][0];
+        double t = 0.0, distance = 0.0;
+        SmPoint3d closest;
+        if (SmApiCurveClosestPoint(path.get(), end, closest, t, distance) != SM_SUCCESS) return SM_ERR;
+        edge_ends.push_back(i + 1 == chain.size() ? range.GetMax() : t);
+    }
+
+    // The faces the chain lies on, and the outward normal at points along
+    // it: the mean of the nearest face's and any other within reach, made
+    // square to the path.
+    std::vector<const SmFace*> faces;
+    for (const SmEdge* edge : chain) {
+        SmTArray<SmFace*> users;
+        edge->GetFaces(users);
+        for (ULONG i = 0; i < users.GetSize(); ++i) {
+            if (std::find(faces.begin(), faces.end(), users[i]) == faces.end()) faces.push_back(users[i]);
+        }
+    }
+    const size_t count = std::max<size_t>(8, samples * chain.size()) + 1;
+    SmTArray<SmPoint3d> normals;
+    SmTArray<double> params;
+    for (size_t k = 0; k < count; ++k) {
+        const double t = range.Evaluate(static_cast<double>(k) / static_cast<double>(count - 1));
+        SmPoint3d point;
+        SmVector3d tangent;
+        if (!curve_at(path.get(), t, point, &tangent)) return SM_ERR;
+        tangent.Unitize(FALSE);
+        SmVector3d sum(0.0, 0.0, 0.0);
+        double nearest = SM_BIG_DOUBLE;
+        std::vector<std::pair<double, SmVector3d>> found;
+        for (const SmFace* face : faces) {
+            SmPoint3d closest;
+            double distance = 0.0;
+            if (SmApiFaceClosestPoint(SM_CONST_CAST(SmFace*, face), point, closest, distance) != SM_SUCCESS) continue;
+            double normal[3];
+            if (!outward_normal(face, point, normal)) continue;
+            found.emplace_back(distance, SmVector3d(normal[0], normal[1], normal[2]));
+            nearest = std::min(nearest, distance);
+        }
+        for (const auto& [distance, normal] : found) {
+            if (distance <= nearest + gap) sum += normal;
+        }
+        sum -= tangent * sum.Dot(tangent);
+        if (sum.Length() < 1e-9) return SM_SHIM_ERR_BAD_EDGE;
+        sum.Unitize(FALSE);
+        normals.Add(SmPoint3d(sum.x, sum.y, sum.z));
+        params.Add(t);
+    }
+    SmBSplineCurve* raw_normals = nullptr;
+    SmStatus status = SmBSplineCurve::InterpolatePoints(*context, normals, &params, 3, nullptr, nullptr, FALSE,
+                                                        SM_IT_CHORDLENGTH, raw_normals);
+    if (status != SM_SUCCESS || !raw_normals) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    std::unique_ptr<SmBSplineCurve> normal_curve(raw_normals);
+    status = normal_curve->EditParameterization(range);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+
+    std::unique_ptr<SmBSplineCurve> section;
+    sm_status shim = profile_section(profile, section);
+    if (shim != SM_SUCCESS) return shim;
+    // Where each profile segment ends along the section.
+    std::vector<double> segment_ends;
+    const SmExtent1d section_range = section->GetNaturalInterval();
+    for (size_t i = 0; i < profile.curves.size(); ++i) {
+        double start[2], end[2], middle[2];
+        curve_points(profile.curves[i], start, end, middle);
+        double t = 0.0, distance = 0.0;
+        SmPoint3d closest;
+        if (SmApiCurveClosestPoint(section.get(), SmPoint3d(0.0, end[0], end[1]), closest, t, distance) != SM_SUCCESS) {
+            return SM_ERR;
+        }
+        segment_ends.push_back(i + 1 == profile.curves.size() ? section_range.GetMax() : t);
+    }
+
+    SmBSplineSurface* raw_surface = nullptr;
+    status = SmBSplineSurface::CreateOrientedSweepSurface(*context, section.get(), path.get(), normal_curve.get(),
+                                                          tolerance, raw_surface);
+    if (status != SM_SUCCESS || !raw_surface) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    const SmExtent2d domain = raw_surface->GetNaturalUVDomain();
+
+    std::unique_ptr<SmBrep> solid(new (*context) SmBrep());
+    SmTArray<SmFace*> sides;
+    status = solid->CreateFacesFromSurface(raw_surface, domain, SM_CT_C1, sides);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    // The sweep runs along u, the section along v. Cap each end with the
+    // sides' sections there.
+    SmTArray<SmCurve*> caps[2];
+    for (ULONG i = 0; i < sides.GetSize(); ++i) {
+        SmSurface* surface = sides[i]->GetSurface();
+        const SmExtent2d own = surface->GetNaturalUVDomain();
+        const double at[2] = {own.GetMin().x, own.GetMax().x};
+        const double whole[2] = {domain.GetMin().x, domain.GetMax().x};
+        for (int end = 0; end < 2; ++end) {
+            if (std::fabs(at[end] - whole[end]) > 1e-9 * (1.0 + std::fabs(whole[end]))) continue;
+            SmBSplineCurve* iso = nullptr;
+            status = surface->CreateIsoParametricCurve(*context, SM_SP_U, at[end], tolerance / 10.0, iso);
+            if (status != SM_SUCCESS || !iso) return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+            caps[end].Add(iso);
+        }
+        // What it was swept from and along, by its middle.
+        const SmPoint2d middle = own.Evaluate(0.5, 0.5);
+        mark_profile(*sides[i], SM_PROFILE_SIDE, piece_at(edge_ends, middle.x), piece_at(segment_ends, middle.y));
+    }
+    SmTArray<SmFace*> start_caps, end_caps;
+    status = solid->CreatePlanarFacesWith3DCurves(nullptr, caps[0], tolerance, start_caps);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    status = solid->CreatePlanarFacesWith3DCurves(nullptr, caps[1], tolerance, end_caps);
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    for (ULONG i = 0; i < start_caps.GetSize(); ++i) mark_profile(*start_caps[i], SM_PROFILE_START, -1, -1);
+    for (ULONG i = 0; i < end_caps.GetSize(); ++i) mark_profile(*end_caps[i], SM_PROFILE_END, -1, -1);
+    status = solid->StitchAndOrient();
+    if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+    if (!is_manifold_solid(*solid)) return SM_SHIM_ERR_BAD_SWEEP;
+    SmTArray<SmFace*> all;
+    solid->GetFaces(all);
+    roles.assign(all.GetSize(), sm_profile_face{SM_PROFILE_SIDE, -1, -1});
+    for (ULONG i = 0; i < all.GetSize(); ++i) {
+        const sm_label label = read_label(all[i]);
+        int role = 0, segment = -1;
+        if (!label.present || label.feature != SWEPT_ROLE ||
+            std::sscanf(label.role, "profile %d %d", &role, &segment) != 2) {
+            continue;
+        }
+        roles[i].role = role;
+        roles[i].path = role == SM_PROFILE_SIDE ? static_cast<int32_t>(label.index) : -1;
+        roles[i].profile = segment;
+    }
+    remove_labels(*solid);
+    (void)brep;
+    out = solid.release();
+    return SM_SUCCESS;
+}
+
 // How far `point` is from the surface `face` lies on.
 bool off_surface(const SmFace* face, const SmPoint3d& point, double& distance) {
     SmPoint3d closest;
@@ -8354,6 +8657,42 @@ sm_status sm_brep_sweep_profile(const sm_plane_curve* path, size_t path_count, c
 }
 
 void sm_profile_faces_free(sm_profile_face* faces) { delete[] faces; }
+
+sm_status sm_brep_sweep_profile_along(const sm_brep* brep, const uint32_t* edges, size_t edge_count,
+                                      const sm_plane_curve* profile, size_t profile_count, uint32_t samples,
+                                      double tolerance, sm_brep** out, sm_profile_face** faces,
+                                      size_t* face_count) {
+    if (!brep || !edges || !profile || !out || !faces || !face_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (edge_count == 0 || profile_count == 0 || !std::isfinite(tolerance) || tolerance <= 0.0) {
+        return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    }
+    return guarded([&] {
+        const SmBrep& source = *brep_of(brep);
+        SmTArray<SmEdge*> all;
+        source.GetEdges(all);
+        std::vector<const SmEdge*> chain;
+        for (size_t i = 0; i < edge_count; ++i) {
+            if (edges[i] >= all.GetSize()) return SM_SHIM_ERR_BAD_EDGE;
+            chain.push_back(all[edges[i]]);
+        }
+        Profile shape;
+        for (size_t i = 0; i < profile_count; ++i) {
+            shape.curves.push_back(profile[i]);
+            take_in(shape, profile[i]);
+        }
+        SmBrep* solid = nullptr;
+        std::vector<sm_profile_face> roles;
+        const sm_status status = sweep_profile_along(source, chain, shape, samples, tolerance, solid, roles);
+        if (status != SM_SUCCESS) return status;
+        std::unique_ptr<SmBrep> owned(solid);
+        std::unique_ptr<sm_profile_face[]> array(new sm_profile_face[roles.size()]);
+        std::copy(roles.begin(), roles.end(), array.get());
+        *out = handle_of(owned.release());
+        *faces = array.release();
+        *face_count = roles.size();
+        return SM_SUCCESS;
+    });
+}
 
 sm_status sm_brep_shell(const sm_brep* brep, double thickness, const uint32_t* open, size_t open_count,
                         sm_brep** out, sm_shell_face** faces, size_t* face_count) {

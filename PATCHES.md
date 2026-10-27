@@ -20,6 +20,7 @@ Base: upstream `v1.0.0` (`c9c5979`).
 | `cd41f50` | `SmTorus.cpp` | Found revolving: `SmTorus::IsNurbSurfaceTorus` snaps the generator circle's start and end angles to 0 and 360 only within `SM_EFF_ZERO` (1e-12 degrees). A circle revolved a whole turn on a tilted plane came out with both 2.7e-12 degrees off zero, and the torus got an empty (u, v) domain. | Snap within `SM_EFF_ZERO_DEG` and turn an end no further than the start into a whole turn, as `RebuildSTEPFromNURBParameters` in the same file does. Nothing in the kernel calls it (its call in `CopyAndAddAnalytics` is commented out); the shim's revolve does. |
 | `c7639c2` | `SmTorus.cpp` | Found piping and revolving: `SmTorus::IsNurbSurfaceTorus` took the major radius as the distance between the first parallel circle's centre and the generator circle's, too long whenever that circle isn't the equator (a pipe bent round 10 came back a torus of 11.18), and the generator's start and end angles unsigned, so a point below the torus's plane read as one above and the torus ran half a turn round the tube from its surface. | Drop the height between the centres, and sign the angles towards the torus's z axis, the generator circle's y axis. Of 30 circles revolved about axes every way on two planes, 22 were recognised before and 30 after. |
 | `0afdfdb` | `SmOffsetExecutive.cpp` | Found hollowing: `a9a7a28` put a local operation's edges in the brep's order but left solid offsets, which shells are, on the edgeuses' addresses. The same shell came out differently from one process to the next: a box with its top's rim rounded hollowed to 41034, 42223 or 43578 mm³, and a box rounded on every edge failed in one run and not the next. | Mate a solid offset's edges in the original brep's order too (`sm_SortInBrepOrder`). Three runs of each give the same result. |
+| `23281a6` | `SmBSplineSurface.h`, `SmBSplineSurfaceNLib.cpp` | Found sweeping grooves off one plane: `SmBSplineSurface::CreateSweepSurface` starts the section's frame from any vector square to the trajectory's start tangent (`MakeUnitOrthoVectors`) and gives `N_CreateSweepScale` no orientation curve, so a profile swept along a path across a round has no way to stay square to the surface. `N_CreateSweepScale` takes one (`curZ`), but nothing outside NLib reaches it. | Add `SmBSplineSurface::CreateOrientedSweepSurface`, which passes an orientation curve as `curZ`, the section given in the local frame (x along the trajectory, z along the curve), cubic along the sweep. Only adds a method; the shim's `sweep_profile_along` calls it. |
 
 `source/SM_API` is unmodified. Each offset patch before `0afdfdb` changes only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
@@ -31,7 +32,8 @@ given a keep list: `RemoveTopologicalEdgesAndVertices()` without one, as
 every boolean's post-process and `Brep::merge_faces` call it, is as it was.
 The torus patches change only `SmTorus::IsNurbSurfaceTorus`, which only the
 shim calls. Patch `0afdfdb` changes only solid offsets
-(`SM_OO_SOLID_OFFSET`), which only the shim's shell makes.
+(`SM_OO_SOLID_OFFSET`), which only the shim's shell makes. Patch `23281a6`
+only adds a method.
 
 ## Notes from the bring-up (no patch needed)
 
@@ -1023,3 +1025,90 @@ calling the kernel's own scale or mirror. Nothing in the kernel changed.
   0 to 216 of the triangles split along the other diagonal. Either is a
   watertight mesh of the moved or mirrored solid facing out, though not bit
   for bit the one it would make.
+
+## Notes from the grooves spike
+
+A panel line is a groove: a profile swept along a path on the part and cut
+from it. The spike's harness is game-cad's
+`crates/smlib-backend/examples/groove_spike.rs`, on its sample crate.
+
+### Profiles along a path in a plane (no patch needed)
+
+`Brep::sweep_profile` (`sm_brep_sweep_profile`) is the pipe's construction
+for any closed profile of lines and arcs: a piece per path curve, the
+profile standing square to the path at its start (its x across to the
+left, its y along the frame's z), swept along a line or turned about an
+arc's centre; where lines meet at an angle each piece is made
+`reach tan(turn / 2) + reach` longer, `reach` the profile's farthest point
+from the path, and cut at the plane halfway between them. Any profile's
+sections agree on that plane, so the mitre is exact for any profile, as it
+was for a disc. A round end turns the profile's left half (x ≥ 0) half a
+turn about the frame's z through the path's end and joins it.
+
+- Refused, in words: a bend no wider than the profile reaches towards its
+  centre, a round end on a profile wholly to one side of the path, an arc
+  meeting a curve at an angle and a turn past 179° (as the pipe's).
+- The union merges sides on one surface. A level segment's side (a floor,
+  a step, the top) comes back one face for the whole path, from the first
+  curve, and a line carrying straight on from the one before it merges its
+  sides into that one's. Names must come from the roles that survive.
+- A half circle's floor turned round a bend comes back a surface of
+  revolution (`SmSurfOfRevolution`, `Surface::Other` 15020), not a torus.
+- Results (`rust/smlib/tests/sweep_profile.rs`): square, V, round and
+  stepped profiles straight, round a rounded rectangle's bends, mitred at a
+  square frame's corners and a zig-zag's (51° to 90°), with round ends,
+  flat and on a tilted plane: manifold, volumes within 1e-6 of the
+  profile's area times the path's length (Pappus round the bends).
+- On the crate, median of 5: a 240 × 140 hatch outline with R 12 corners
+  on the front sweeps in 31 to 67 ms by profile and cuts in 4 to 5 ms; a
+  belt round all four sides, across the vertical rounds, sweeps in 19 to
+  68 ms and cuts in 7 to 22; a 100 mm line takes 1.4 to 3 ms with square
+  ends and 7 to 14 with round ones, and cuts in 1 to 2. What each cut
+  removes is the profile's area under the surface times the length to
+  1e-7 or better. 20 lines with round ends sweep in 157 ms;
+  `Brep::combine` gathers them in 2 ms and one cut takes 38, against a
+  union of 34 and a cut of 40, or 222 ms for all twenty cut one by one.
+- A profile whose top corners lie on the surface is fragile. A V belt whose
+  corners were 1.5e-5 outside the walls (the path read off the bounding
+  box, padded by the tolerance) cut to a manifold solid 195114 mm³ larger,
+  with `SM_SUCCESS`; on the walls exactly it was 7.6e-5 under. A V whose
+  slopes run on 1 past the surface, closed above it, is 1.4e-6 under. Run
+  a profile's sides on past the surface.
+
+### Profiles along a path off a plane (patch `23281a6`)
+
+`Brep::sweep_profile_along` (`sm_brep_sweep_profile_along`) sweeps a
+profile along a chain of a brep's own edges, as an imprint of a sketch's
+line along its normal makes them, its y following the faces' normal.
+
+- SMLib's sweeps can't: `SmApiCreatePipeSweep` takes a disc, and
+  `SmBSplineSurface::CreateSweepSurface` starts the frame from any vector
+  square to the start tangent. Patch `23281a6` passes NLib's sweep an
+  orientation curve instead.
+- The chain becomes one B-spline (`CreateByJoining`; a line alone is
+  raised to degree 3, since the sweep fails on degree 1, status 1001). The
+  normal is sampled along it, the mean of the chain's faces' outward
+  normals nearest each point, made square to the tangent and interpolated.
+  The sides are the swept surface's faces (`CreateFacesFromSurface`, split
+  where it isn't C1, so once per edge where a round meets a plane), the
+  caps planar faces in the end sections, stitched and checked manifold.
+- Tests (`sweep_profile.rs`): a square groove up a cylinder's side, its
+  volume and what it cuts within 1e-4 of the exact ones and its floor its
+  depth in; round half an ellipse on a cylinder's side, its floor its depth
+  in all the way round; edges that don't run end to end refused.
+- On the crate: diagonals at 15° to 60° across a vertical round (a plane,
+  the round's ellipse, a plane), a line at 10° across the front and both
+  rounds (5 edges, 489 mm), and a diagonal and a level line across the
+  rounds stretched into NURBS (`Brep::scale_axes_keeping`). Every profile
+  (a V whose slopes run on, square, round, stepped) at 16 samples an edge
+  and 1e-2, 32 and 1e-3, 64 and 1e-4 sweeps and cuts manifold. A 140 to
+  240 mm groove sweeps in 10 to 70 ms and cuts in 13 to 95; the 489 mm one
+  in 29 to 142 and 25 to 67. A square groove's floor on the round lies
+  18.5000 from its axis, its depth in, to 18.52 where it reaches across.
+  What a cut removes is 3e-3 to 9e-3 under the profile's area times the
+  length, as it should be on a convex round, and agrees across the
+  tolerances to 4e-4.
+- A V whose corners lie on the surface crashed in the cut, on the 15°
+  diagonal at 1e-3 (`SIGSEGV` in `SmApiBooleanDifference`, at
+  `sm_WhichPVToCombine`); at 1e-2 it cut, leaving slivers of its walls.
+  Profiles run on past the surface are fine.
