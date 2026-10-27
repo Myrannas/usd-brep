@@ -15,7 +15,7 @@ use std::sync::mpsc;
 
 use smlib::{
     Brep, Continuity, EdgeBlend, EdgeQuery, Error, FaceQuery, FilletOptions, Frame, Kernel, Label,
-    Mesh, Surface, SurfaceKind, TessellationParams, Tolerance,
+    LabelMatch, Mesh, Surface, SurfaceKind, TessellationParams, Tolerance,
 };
 
 const L: f64 = 100.0;
@@ -1113,11 +1113,15 @@ fn offset_face_fails_cleanly_when_a_face_would_vanish() {
     for (name, d, outcome) in outcomes {
         println!("{name} d={d:+}: {outcome:?}");
         let error = outcome.expect_err("a vanishing face must not come back as a solid");
+        // Pushed past the bottom, the plain box's top breaks out of it, and
+        // would leave nothing.
+        let expected: &[&str] = if d == -45.0 {
+            &["SHIM_ERR_EMPTIES_SOLID"]
+        } else {
+            &["SHIM_ERR_BROKE_SOLID", "SHIM_ERR_CHANGED_TOPOLOGY"]
+        };
         assert!(
-            matches!(
-                status_name(&error),
-                Some("SHIM_ERR_BROKE_SOLID" | "SHIM_ERR_CHANGED_TOPOLOGY")
-            ),
+            status_name(&error).is_some_and(|status| expected.contains(&status)),
             "{name} d={d}: {error}"
         );
     }
@@ -2358,4 +2362,128 @@ fn a_pushed_face_meets_the_face_beyond_one_it_swallows() {
             "{name}: the crate's faces, a wall and a floor or top"
         );
     }
+}
+
+/// The box with its vertical edges finished (`Some(true)` rounded 8,
+/// `Some(false)` chamfered with legs of 8) and a pocket 20 tall and 30 deep
+/// cut into its front from x = `wall` to 10. Its -X side is labelled 1/-X,
+/// the pocket's left wall 2/wall, and the finish's faces 3/finish.
+fn pocketed(k: &Kernel, finish: Option<bool>, wall: f64) -> Result<Brep, Error> {
+    let vertical = EdgeQuery::ParallelTo { direction: UP };
+    let part = match finish {
+        None => block(k)?,
+        Some(true) => block(k)?.fillet(&[EdgeBlend::round(vertical, 8.0)], &options())?,
+        Some(false) => {
+            block(k)?.chamfer(&vertical, 8.0 * 2f64.sqrt(), &Tolerance::default())?
+        }
+    };
+    let mut part = part.difference(span(k, [wall, -W / 2.0 - 1.0, -10.0], [10.0, 0.0, 10.0])?)?;
+    for face in part.faces()? {
+        let label = match face.surface {
+            Surface::Plane { origin, normal, .. }
+                if normal[0].abs() > 0.999 && (origin[0] + L / 2.0).abs() < 1e-9 =>
+            {
+                Label::new(1, "-X")
+            }
+            Surface::Plane { origin, normal, .. }
+                if normal[0].abs() > 0.999 && (origin[0] - wall).abs() < 1e-9 =>
+            {
+                Label::new(2, "wall")
+            }
+            Surface::Plane { normal, .. } if normal[0].abs() > 1e-6 && normal[1].abs() > 1e-6 => {
+                Label::new(3, "finish")
+            }
+            Surface::Cylinder { .. } => Label::new(3, "finish"),
+            _ => continue,
+        };
+        part.set_face_label(face.index, &label)?;
+    }
+    Ok(part)
+}
+
+#[test]
+fn a_pushed_face_breaks_out_of_the_part() {
+    // The pocket's left wall, 20 mm in from the box's side, pushed toward
+    // it: at -21 and -33 it opens out of the side; with the vertical edges
+    // rounded or chamfered, at -19 it breaks out through the round or
+    // chamfer alone and keeps the part of the wall still inside. Each is
+    // the box with the pocket cut that wide, labels and all: the wall gone
+    // where it's outside, the side and the finish keeping theirs round the
+    // opening, the finish on the front left edge notched, or cut in two.
+    for finish in [None, Some(true), Some(false)] {
+        for d in [-19.0, -21.0, -33.0] {
+            let (volume, expected, labels, reference_labels, through) = on_kernel(move |k| {
+                let part = pocketed(k, finish, -30.0)?;
+                let wall = FaceQuery::Labelled(LabelMatch::role(2, "wall"));
+                let picked = part.find_faces(&wall, &Tolerance::default())?;
+                let all = part.faces()?;
+                let mut through: Vec<String> = part
+                    .offset_breakout(&picked, d)?
+                    .iter()
+                    .filter_map(|&f| all[f].label.as_ref().map(ToString::to_string))
+                    .collect();
+                through.sort();
+                let moved = part.offset_faces(&picked, d)?;
+                moved.tessellate(&TessellationParams::default())?;
+                assert!(moved.is_manifold()?, "{finish:?} d={d}");
+                let labelled = |b: &Brep| -> Result<Vec<String>, Error> {
+                    let mut labels: Vec<String> = b
+                        .faces()?
+                        .iter()
+                        .map(|f| f.label.as_ref().map_or("-".into(), ToString::to_string))
+                        .collect();
+                    labels.sort();
+                    Ok(labels)
+                };
+                let reference = pocketed(k, finish, -30.0 + d)?;
+                Ok::<_, Error>((
+                    moved.volume(PRECISE)?,
+                    reference.volume(PRECISE)?,
+                    labelled(&moved)?,
+                    labelled(&reference)?,
+                    through,
+                ))
+            })
+            .unwrap_or_else(|e| panic!("{finish:?} d={d}: {e}"));
+            println!(
+                "{finish:?} d={d:+}: {} faces, {volume:.6} against {expected:.6}, through {through:?}",
+                labels.len()
+            );
+            assert!(
+                ((volume - expected) / expected).abs() < 1e-9,
+                "{finish:?} d={d}: {volume} against {expected}"
+            );
+            let count = |label: &str| labels.iter().filter(|l| *l == label).count();
+            // At -19 the wall is still inside the side; the plain box's
+            // whole wall, as before.
+            let short = d == -19.0;
+            assert_eq!(count("2/wall.0"), usize::from(short), "{finish:?} d={d}: {labels:?}");
+            assert_eq!(count("1/-X.0"), 1, "{finish:?} d={d}: the side: {labels:?}");
+            assert_eq!(labels, reference_labels, "{finish:?} d={d}");
+            // Where it breaks out: past the side, the side; and the finish.
+            let mut expected_through = Vec::new();
+            if !short {
+                expected_through.push("1/-X.0");
+            }
+            if finish.is_some() {
+                let pieces = if short { 4 } else { 5 };
+                assert_eq!(count("3/finish.0"), pieces, "{finish:?} d={d}: {labels:?}");
+                expected_through.push("3/finish.0");
+            }
+            assert_eq!(through, expected_through, "{finish:?} d={d}");
+        }
+    }
+
+    // A slot right through the box's height, its floor pushed out of the
+    // back, would cut the box in two.
+    let error = on_kernel(|k| {
+        let slot = block(k)?.difference(span(k, [-30.0, -W / 2.0 - 1.0, -H], [10.0, 0.0, H])?)?;
+        let floor = FaceQuery::OnPlane {
+            point: [0.0, 0.0, 0.0],
+            normal: neg(Y),
+        };
+        slot.offset_where(&floor, -40.0).map(|_| ())
+    })
+    .unwrap_err();
+    assert_eq!(status_name(&error), Some("SHIM_ERR_SPLITS_SOLID"), "{error}");
 }

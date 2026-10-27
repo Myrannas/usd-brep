@@ -53,13 +53,16 @@
 #include <SmOffsetGeometryCreation.h>
 #include <SmPlane.h>
 #include <SmPoly.h>
+#include <SmPointClass.h>
 #include <SmPrimitiveCreation.h>
+#include <SmRegion.h>
 #include <SmRotationalSweepGeometry.h>
 #include <SmShell.h>
 #include <SmSphere.h>
 #include <SmSurfOfRevolution.h>
 #include <SmSurfTypes.h>
 #include <SmTess.h>
+#include <SmTol.h>
 #include <SmTopologyIntersector.h>
 #include <SmTopologySweep.h>
 #include <SmTorus.h>
@@ -1696,6 +1699,122 @@ bool lands_like(const SmFace* face, const Motion& motion, const Motion& candidat
     return same_motion(motion, candidate);
 }
 
+// Whether the edge is a straight segment, and its direction.
+bool straight(const SmEdge* edge, SmVector3d& direction) {
+    double t0 = 0.0;
+    double t1 = 0.0;
+    if (SmApiEdgeParameterRange(edge, t0, t1) != SM_SUCCESS) return false;
+    SmVector3d points[3];
+    for (int k = 0; k < 3; ++k) {
+        SmVector3d* point_out = &points[k];
+        SmVector3d* no_derivative = nullptr;
+        SmVector3d* no_second = nullptr;
+        if (SmApiEvaluateCurve(edge->GetCurve(), t0 + (t1 - t0) * k / 2.0, point_out, no_derivative, no_second) !=
+            SM_SUCCESS) {
+            return false;
+        }
+    }
+    const SmVector3d span = points[2] - points[0];
+    const double length = span.Length();
+    if (length <= 0.0) return false;
+    direction = span / length;
+    const SmVector3d off = points[1] - points[0];
+    return (off - direction * off.Dot(direction)).Length() <= 1e-9 * (1.0 + length);
+}
+
+// Where a vertex will land. When every face around it lands as one shift
+// would put it, that shift; otherwise the point the moved planes and
+// straight edges around it agree on: each planar face's plane after its
+// motion, and each straight edge whose two faces both land as its moved
+// copy would (a tangent line under a sliding fillet, a wall's edge left
+// in place), as a line. False when they don't pin one point.
+bool predict_vertex(const Motions& motions, const SmVertex* vertex, SmPoint3d& out) {
+    const SmPoint3d old = vertex->GetPoint();
+    SmTArray<SmFace*> around;
+    vertex->GetFaces(around);
+    for (ULONG j = 0; j < around.GetSize(); ++j) {
+        if (motion_of(motions, around[j]).kind == Motion::kOffset) return false;
+    }
+    for (ULONG j = 0; j < around.GetSize(); ++j) {
+        const Motion candidate = motion_of(motions, around[j]);
+        bool lands = true;
+        for (ULONG k = 0; k < around.GetSize() && lands; ++k) {
+            lands = lands_like(around[k], motion_of(motions, around[k]), candidate);
+        }
+        if (lands) {
+            out = moved_point(candidate, old);
+            return true;
+        }
+    }
+    std::vector<Row> rows;
+    for (ULONG j = 0; j < around.GetSize(); ++j) {
+        SmPoint3d point;
+        SmVector3d normal;
+        if (!plane_of(around[j]->GetSurface(), point, normal)) continue;
+        const Motion motion = motion_of(motions, around[j]);
+        if (!motion.turned) {
+            rows.push_back({normal, normal.Dot(point + motion.shift)});
+            continue;
+        }
+        const SmVector3d turned = turned_vector(motion, normal);
+        rows.push_back({turned, turned.Dot(moved_point(motion, point))});
+    }
+    SmTArray<SmEdge*> edges;
+    vertex->GetEdges(edges);
+    for (ULONG j = 0; j < edges.GetSize(); ++j) {
+        SmVector3d direction;
+        if (!straight(edges[j], direction)) continue;
+        const EdgeFaces sides = faces_of(edges[j]);
+        if (!sides.faces[0] || !sides.faces[1]) continue;
+        for (const SmFace* side : sides.faces) {
+            const Motion candidate = motion_of(motions, side);
+            if (!lands_like(sides.faces[0], motion_of(motions, sides.faces[0]), candidate) ||
+                !lands_like(sides.faces[1], motion_of(motions, sides.faces[1]), candidate)) {
+                continue;
+            }
+            const SmVector3d along = turned_vector(candidate, direction);
+            SmVector3d across = std::fabs(along.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
+            across = across - along * across.Dot(along);
+            across = across / across.Length();
+            const SmVector3d other = along * across;  // cross product
+            const SmPoint3d through = moved_point(candidate, old);
+            rows.push_back({across, across.Dot(through)});
+            rows.push_back({other, other.Dot(through)});
+            break;
+        }
+    }
+    // Least squares: the normal equations, solved by Cramer's rule.
+    double m[3][3] = {{0.0}};
+    double b[3] = {0.0};
+    for (const Row& row : rows) {
+        const double n[3] = {row.normal.x, row.normal.y, row.normal.z};
+        for (int r = 0; r < 3; ++r) {
+            b[r] += n[r] * row.value;
+            for (int c = 0; c < 3; ++c) m[r][c] += n[r] * n[c];
+        }
+    }
+    auto det = [](const double a[3][3]) {
+        return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+               a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    };
+    const double d = det(m);
+    if (std::fabs(d) < 1e-6) return false;
+    double p[3];
+    for (int c = 0; c < 3; ++c) {
+        double a[3][3];
+        for (int r = 0; r < 3; ++r) {
+            for (int k = 0; k < 3; ++k) a[r][k] = k == c ? b[r] : m[r][k];
+        }
+        p[c] = det(a) / d;
+    }
+    const SmPoint3d solved(p[0], p[1], p[2]);
+    for (const Row& row : rows) {
+        if (std::fabs(row.normal.Dot(solved) - row.value) > 1e-6 * (1.0 + std::fabs(row.value))) return false;
+    }
+    out = solved;
+    return true;
+}
+
 // SmBrep::LocalOperation's geometry, except for edges that move rigidly.
 //
 // An edge moves rigidly by v when every face at both of its ends lands where
@@ -2036,121 +2155,11 @@ private:
         }
     }
 
-    // Where a vertex will land. When every face around it lands as one shift
-    // would put it, that shift; otherwise the point the moved planes and
-    // straight edges around it agree on: each planar face's plane after its
-    // motion, and each straight edge whose two faces both land as its moved
-    // copy would (a tangent line under a sliding fillet, a wall's edge left
-    // in place), as a line. False when they don't pin one point.
     bool predict_vertex(const SmVertex* vertex, SmPoint3d& out) const {
-        const SmPoint3d old = vertex->GetPoint();
-        SmTArray<SmFace*> around;
-        vertex->GetFaces(around);
-        for (ULONG j = 0; j < around.GetSize(); ++j) {
-            if (motion_of(m_motions, around[j]).kind == Motion::kOffset) return false;
-        }
-        for (ULONG j = 0; j < around.GetSize(); ++j) {
-            const Motion candidate = motion_of(m_motions, around[j]);
-            bool lands = true;
-            for (ULONG k = 0; k < around.GetSize() && lands; ++k) {
-                lands = lands_like(around[k], motion_of(m_motions, around[k]), candidate);
-            }
-            if (lands) {
-                out = moved_point(candidate, old);
-                return true;
-            }
-        }
-        std::vector<Row> rows;
-        for (ULONG j = 0; j < around.GetSize(); ++j) {
-            SmPoint3d point;
-            SmVector3d normal;
-            if (!plane_of(around[j]->GetSurface(), point, normal)) continue;
-            const Motion motion = motion_of(m_motions, around[j]);
-            if (!motion.turned) {
-                rows.push_back({normal, normal.Dot(point + motion.shift)});
-                continue;
-            }
-            const SmVector3d turned = turned_vector(motion, normal);
-            rows.push_back({turned, turned.Dot(moved_point(motion, point))});
-        }
-        SmTArray<SmEdge*> edges;
-        vertex->GetEdges(edges);
-        for (ULONG j = 0; j < edges.GetSize(); ++j) {
-            SmVector3d direction;
-            if (!straight(edges[j], direction)) continue;
-            const EdgeFaces sides = faces_of(edges[j]);
-            if (!sides.faces[0] || !sides.faces[1]) continue;
-            for (const SmFace* side : sides.faces) {
-                const Motion candidate = motion_of(m_motions, side);
-                if (!lands_like(sides.faces[0], motion_of(m_motions, sides.faces[0]), candidate) ||
-                    !lands_like(sides.faces[1], motion_of(m_motions, sides.faces[1]), candidate)) {
-                    continue;
-                }
-                const SmVector3d along = turned_vector(candidate, direction);
-                SmVector3d across = std::fabs(along.x) < 0.9 ? SmVector3d(1.0, 0.0, 0.0) : SmVector3d(0.0, 1.0, 0.0);
-                across = across - along * across.Dot(along);
-                across = across / across.Length();
-                const SmVector3d other = along * across;  // cross product
-                const SmPoint3d through = moved_point(candidate, old);
-                rows.push_back({across, across.Dot(through)});
-                rows.push_back({other, other.Dot(through)});
-                break;
-            }
-        }
-        // Least squares: the normal equations, solved by Cramer's rule.
-        double m[3][3] = {{0.0}};
-        double b[3] = {0.0};
-        for (const Row& row : rows) {
-            const double n[3] = {row.normal.x, row.normal.y, row.normal.z};
-            for (int r = 0; r < 3; ++r) {
-                b[r] += n[r] * row.value;
-                for (int c = 0; c < 3; ++c) m[r][c] += n[r] * n[c];
-            }
-        }
-        auto det = [](const double a[3][3]) {
-            return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
-                   a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
-        };
-        const double d = det(m);
-        if (std::fabs(d) < 1e-6) return false;
-        double p[3];
-        for (int c = 0; c < 3; ++c) {
-            double a[3][3];
-            for (int r = 0; r < 3; ++r) {
-                for (int k = 0; k < 3; ++k) a[r][k] = k == c ? b[r] : m[r][k];
-            }
-            p[c] = det(a) / d;
-        }
-        const SmPoint3d solved(p[0], p[1], p[2]);
-        for (const Row& row : rows) {
-            if (std::fabs(row.normal.Dot(solved) - row.value) > 1e-6 * (1.0 + std::fabs(row.value))) return false;
-        }
-        out = solved;
-        return true;
+        return ::predict_vertex(m_motions, vertex, out);
     }
 
-    // Whether the edge is a straight segment, and its direction.
-    static bool straight(const SmEdge* edge, SmVector3d& direction) {
-        double t0 = 0.0;
-        double t1 = 0.0;
-        if (SmApiEdgeParameterRange(edge, t0, t1) != SM_SUCCESS) return false;
-        SmVector3d points[3];
-        for (int k = 0; k < 3; ++k) {
-            SmVector3d* point_out = &points[k];
-            SmVector3d* no_derivative = nullptr;
-            SmVector3d* no_second = nullptr;
-            if (SmApiEvaluateCurve(edge->GetCurve(), t0 + (t1 - t0) * k / 2.0, point_out, no_derivative, no_second) !=
-                SM_SUCCESS) {
-                return false;
-            }
-        }
-        const SmVector3d span = points[2] - points[0];
-        const double length = span.Length();
-        if (length <= 0.0) return false;
-        direction = span / length;
-        const SmVector3d off = points[1] - points[0];
-        return (off - direction * off.Dot(direction)).Length() <= 1e-9 * (1.0 + length);
-    }
+    static bool straight(const SmEdge* edge, SmVector3d& direction) { return ::straight(edge, direction); }
 
 public:
     // Puts the original brep's vertices back.
@@ -3739,10 +3748,348 @@ sm_status open_plugs(SmBrep& work, ULONG picked_count, const std::vector<Plug>& 
     return keeping_topology(work, [&] { return offset_faces(work, inner, push); });
 }
 
-// Offsets the picked faces through `obstacles` (see find_obstacles) and the
-// faces they swallow (see Plug), in place.
+// Breaking out. A plane pushed in far enough leaves the part: a pocket's
+// wall pushed through the wall between it and the part's side, or through a
+// round, a chamfer, a drafted or slanted side. The space it sweeps then
+// crosses the part's own outside, which is new topology: the local operation
+// only trims the faces it runs into where they're its neighbours. So what it
+// sweeps outside the part is filled for the offset, with a box over the face
+// and the blends moving with it, from where they are to where they go, from
+// past the face's new plane to just behind its old one. The box is cut back
+// to the planes of the faces the push trims (the face a pocket opens on),
+// which run on through it. The face then moves inside the filled part as it
+// would inside a bigger one, and the part as it was loses what the move
+// swept (see push_through): cut along the face's new plane and its
+// neighbours' surfaces, it opens out of the part where they run out of it.
+struct Filler {
+    // A frame on the picked plane, w = u x v its outward normal, and the box
+    // in it.
+    SmPoint3d origin;
+    SmVector3d u, v;
+    double low[3] = {0.0, 0.0, 0.0};
+    double high[3] = {0.0, 0.0, 0.0};
+    // Planes of trimmed faces that aren't the box's own walls, a point on
+    // each and its outward normal: the box is cut back to them.
+    std::vector<std::pair<SmPoint3d, SmVector3d>> cuts;
+};
+
+// Whether `p` lies outside the solid, clear of its faces: in the infinite
+// region or a void.
+bool outside_of(const SmBrep& brep, const SmPoint3d& p) {
+    SmPointClassification classified;
+    if (brep.Point3DClassify(p, SmTol::GetZoneTol3d(&brep), TRUE, classified) != SM_SUCCESS ||
+        classified.GetPointClass() != SM_PC_REGION) {
+        return false;
+    }
+    const SmRegion* region = static_cast<const SmRegion*>(classified.GetObject());
+    return region && (region == brep.GetInfiniteRegion() || region->IsVoid() == TRUE);
+}
+
+// Whether `p` lies inside a box from `low` to `high` in the frame (origin;
+// u, v, w), or within `slack` of it.
+bool in_frame_box(const SmPoint3d& p, const SmPoint3d& origin, const SmVector3d& u, const SmVector3d& v,
+                  const SmVector3d& w, const double low[3], const double high[3], double slack) {
+    const SmVector3d d = p - origin;
+    const double c[3] = {d.Dot(u), d.Dot(v), d.Dot(w)};
+    for (int k = 0; k < 3; ++k) {
+        if (c[k] < low[k] - slack || c[k] > high[k] + slack) return false;
+    }
+    return true;
+}
+
+// Where a vertex lands (predict_vertex), or else where `motion` takes it.
+SmPoint3d landing(const Motions& motions, const SmVertex* vertex, const Motion& motion) {
+    SmPoint3d landed;
+    return predict_vertex(motions, vertex, landed) ? landed : moved_point(motion, vertex->GetPoint());
+}
+
+// Points a moving face passes through, a quarter, a half, three quarters and
+// all the way along its move: along its edges, a straight edge's between
+// where its ends land, any other's moved with the face, and a point inside
+// it.
+void passed_points(const SmFace* face, const Motions& motions, std::vector<SmPoint3d>& out) {
+    const Motion motion = motion_of(motions, face);
+    std::vector<std::pair<SmPoint3d, SmPoint3d>> paths;  // from, to
+    SmTArray<SmEdge*> edges;
+    face->GetEdges(edges);
+    for (ULONG e = 0; e < edges.GetSize(); ++e) {
+        SmVector3d direction;
+        const SmVertex* start = edges[e]->GetStartVertex();
+        const SmVertex* end = start ? edges[e]->GetOtherVertex(start) : nullptr;
+        if (start && end && start != end && straight(edges[e], direction)) {
+            const SmPoint3d from[2] = {start->GetPoint(), end->GetPoint()};
+            const SmPoint3d to[2] = {landing(motions, start, motion), landing(motions, end, motion)};
+            for (int k = 0; k <= 4; ++k) {
+                const double a = k / 4.0;
+                paths.emplace_back(from[0] + (from[1] - from[0]) * a, to[0] + (to[1] - to[0]) * a);
+            }
+            continue;
+        }
+        std::vector<SmPoint3d> points;
+        edge_points(edges[e], 9, points);
+        for (const SmPoint3d& p : points) paths.emplace_back(p, moved_point(motion, p));
+    }
+    SmPoint3d interior;
+    if (face->CalculateAnInternalPoint(interior) == SM_SUCCESS) paths.emplace_back(interior, moved_point(motion, interior));
+    for (const auto& [from, to] : paths) {
+        for (int k = 1; k <= 4; ++k) out.push_back(from + (to - from) * (k / 4.0));
+    }
+}
+
+// The points the picked face passes through (passed_points) that lie
+// outside the part, and not where an obstacle is set aside: none unless one
+// plane is picked and pushed in, swallowing nothing. Where it swallows a
+// chamfer (see Plug) it meets the plane beyond instead, so its edges don't
+// land where the chamfer's plane would take them.
+std::vector<SmPoint3d> breaking_out(const SmBrep& brep, const SmTArray<SmFace*>& picked, double distance,
+                                    const Motions& motions, const std::vector<Obstacle>& obstacles,
+                                    const std::vector<Plug>& plugs) {
+    std::vector<SmPoint3d> out;
+    SmPoint3d on_plane;
+    SmVector3d plane_normal;
+    if (!(distance < 0.0) || picked.GetSize() != 1 || !plugs.empty() || !picked[0]->GetSurface() ||
+        !plane_of(picked[0]->GetSurface(), on_plane, plane_normal)) {
+        return out;
+    }
+    std::vector<SmPoint3d> passed;
+    passed_points(picked[0], motions, passed);
+    // A hole's box ends on its base's plane, which an edge sliding along
+    // that plane runs on.
+    const double tolerance = 10.0 * brep.GetTolerance();
+    for (const SmPoint3d& p : passed) {
+        bool set_aside = false;
+        for (const Obstacle& obstacle : obstacles) {
+            set_aside = set_aside || in_frame_box(p, obstacle.origin, obstacle.u, obstacle.v, obstacle.w, obstacle.low,
+                                                  obstacle.high, tolerance);
+        }
+        if (!set_aside && outside_of(brep, p)) out.push_back(p);
+    }
+    return out;
+}
+
+// The still faces across an edge from a moving one, and of them those the
+// push trims: that run back behind the picked face's plane (outward normal
+// `w`), as the face a pocket opens on does, where a face that stretches runs
+// on ahead of it. False if one can't be told.
+bool faces_beside(const SmBrep& brep, const Motions& motions, const SmVector3d& w,
+                  std::vector<const SmFace*>& beside, std::vector<const SmFace*>& trimmed) {
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    auto moving = [&](const SmFace* other) { return motion_of(motions, other).kind != Motion::kKept; };
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (!moving(faces[i])) continue;
+        SmTArray<SmEdge*> edges;
+        faces[i]->GetEdges(edges);
+        for (ULONG e = 0; e < edges.GetSize(); ++e) {
+            SmTArray<SmEdgeuse*> uses;
+            edges[e]->GetEdgeuses(uses);
+            const SmExtent1d interval = edges[e]->GetInterval();
+            for (ULONG k = 0; k < uses.GetSize(); ++k) {
+                const SmFace* other = uses[k]->GetFace();
+                if (!other || moving(other) || std::find(beside.begin(), beside.end(), other) != beside.end()) {
+                    continue;
+                }
+                beside.push_back(other);
+                SmPoint3d at;
+                SmVector3d into;
+                if (uses[k]->EvaluateBinormal(interval.Evaluate(0.5), TRUE, at, into) != SM_SUCCESS) return false;
+                if (into.Dot(w) < -1e-9) trimmed.push_back(other);
+            }
+        }
+    }
+    return true;
+}
+
+// The faces a picked plane pushed in breaks out through (see Filler), in
+// the brep's order: still faces, neither beside a moving one nor set aside,
+// that reach into the box around the points it passes through outside the
+// part.
+std::vector<const SmFace*> broken_through(const SmBrep& brep, const SmTArray<SmFace*>& picked, double distance,
+                                          const Motions& motions, const std::vector<Obstacle>& obstacles,
+                                          const std::vector<Plug>& plugs) {
+    std::vector<const SmFace*> out;
+    const std::vector<SmPoint3d> outside = breaking_out(brep, picked, distance, motions, obstacles, plugs);
+    SmPoint3d origin;
+    SmVector3d u, v, w;
+    std::vector<const SmFace*> beside;
+    std::vector<const SmFace*> trimmed;
+    if (outside.empty() || !frame_of(picked[0], origin, u, v, w) || !faces_beside(brep, motions, w, beside, trimmed)) {
+        return out;
+    }
+    // From the picked face to the furthest point outside, across what it
+    // passes through outside.
+    double low[3] = {HUGE_VAL, HUGE_VAL, 0.0};
+    double high[3] = {-HUGE_VAL, -HUGE_VAL, 0.0};
+    for (const SmPoint3d& p : outside) {
+        const SmVector3d d = p - origin;
+        const double c[3] = {d.Dot(u), d.Dot(v), d.Dot(w)};
+        for (int k = 0; k < 3; ++k) {
+            low[k] = std::min(low[k], c[k]);
+            high[k] = std::max(high[k], c[k]);
+        }
+    }
+    const double tolerance = 10.0 * brep.GetTolerance();
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        const SmFace* face = faces[i];
+        bool set_aside = motion_of(motions, face).kind != Motion::kKept ||
+                         std::find(beside.begin(), beside.end(), face) != beside.end();
+        for (const Obstacle& obstacle : obstacles) {
+            set_aside =
+                set_aside || std::find(obstacle.faces.begin(), obstacle.faces.end(), face) != obstacle.faces.end();
+        }
+        std::vector<SmPoint3d> points;
+        box_corners(face, points);
+        if (set_aside || points.empty()) continue;
+        double face_low[3] = {HUGE_VAL, HUGE_VAL, HUGE_VAL};
+        double face_high[3] = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+        for (const SmPoint3d& p : points) {
+            const SmVector3d d = p - origin;
+            const double c[3] = {d.Dot(u), d.Dot(v), d.Dot(w)};
+            for (int k = 0; k < 3; ++k) {
+                face_low[k] = std::min(face_low[k], c[k]);
+                face_high[k] = std::max(face_high[k], c[k]);
+            }
+        }
+        bool meets = true;
+        for (int k = 0; k < 3; ++k) {
+            meets = meets && face_low[k] <= high[k] + tolerance && face_high[k] >= low[k] - tolerance;
+        }
+        if (meets) out.push_back(face);
+    }
+    return out;
+}
+
+// The filler a picked plane pushed in needs when it breaks out (see Filler):
+// none unless it does, the faces it trims are planes, and everything it
+// passes through lies on their inner side.
+void find_fillers(const SmBrep& brep, const SmTArray<SmFace*>& picked, double distance, const Motions& motions,
+                  const std::vector<Obstacle>& obstacles, const std::vector<Plug>& plugs, std::vector<Filler>& out) {
+    if (breaking_out(brep, picked, distance, motions, obstacles, plugs).empty()) return;
+    Filler filler;
+    SmVector3d w;
+    std::vector<const SmFace*> beside;
+    std::vector<const SmFace*> trimmed;
+    if (!frame_of(picked[0], filler.origin, filler.u, filler.v, w) ||
+        !faces_beside(brep, motions, w, beside, trimmed)) {
+        return;
+    }
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    auto moving = [&](const SmFace* other) { return motion_of(motions, other).kind != Motion::kKept; };
+    std::vector<SmPoint3d> passed;
+    passed_points(picked[0], motions, passed);
+    const double tolerance = 10.0 * brep.GetTolerance();
+    std::vector<std::pair<SmPoint3d, SmVector3d>> planes;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (std::find(trimmed.begin(), trimmed.end(), faces[i]) == trimmed.end()) continue;
+        SmPoint3d point;
+        SmVector3d normal;
+        double outward[3];
+        if (!plane_of(faces[i]->GetSurface(), point, normal) || !outward_plane(faces[i], outward)) return;
+        const SmVector3d n(outward[0], outward[1], outward[2]);
+        for (const SmPoint3d& p : passed) {
+            if ((p - point).Dot(n) > tolerance) return;
+        }
+        planes.emplace_back(point, n);
+    }
+    // The box's u along the first such plane's normal that's square to the
+    // face, so the box ends on that plane.
+    for (const auto& plane : planes) {
+        if (std::fabs(plane.second.Dot(w)) < 1e-9) {
+            filler.u = plane.second;
+            filler.v = w * filler.u;  // cross product
+            break;
+        }
+    }
+
+    // Over every moving face, where it is and where it goes, and where its
+    // vertices land.
+    double low[3] = {HUGE_VAL, HUGE_VAL, HUGE_VAL};
+    double high[3] = {-HUGE_VAL, -HUGE_VAL, -HUGE_VAL};
+    auto add = [&](const SmPoint3d& p) {
+        const SmVector3d d = p - filler.origin;
+        const double c[3] = {d.Dot(filler.u), d.Dot(filler.v), d.Dot(w)};
+        for (int k = 0; k < 3; ++k) {
+            low[k] = std::min(low[k], c[k]);
+            high[k] = std::max(high[k], c[k]);
+        }
+    };
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (!moving(faces[i])) continue;
+        const Motion motion = motion_of(motions, faces[i]);
+        std::vector<SmPoint3d> points;
+        face_points(faces[i], points);
+        box_corners(faces[i], points);
+        for (const SmPoint3d& p : points) {
+            add(p);
+            add(moved_point(motion, p));
+        }
+        SmTArray<SmVertex*> vertices;
+        faces[i]->GetVertices(vertices);
+        for (ULONG k = 0; k < vertices.GetSize(); ++k) add(landing(motions, vertices[k], motion));
+    }
+    const double margin = 0.5 + 0.02 * std::max({high[0] - low[0], high[1] - low[1], high[2] - low[2], 0.0});
+    for (int k = 0; k < 3; ++k) {
+        filler.low[k] = low[k] - margin;
+        filler.high[k] = high[k] + margin;
+    }
+    // Just behind the face, so the box's end lies inside the part there.
+    filler.high[2] = -std::min(0.1, 0.01 * -distance);
+    for (const auto& plane : planes) {
+        const double at[2] = {(plane.first - filler.origin).Dot(filler.u), (plane.first - filler.origin).Dot(filler.v)};
+        const double along[2] = {plane.second.Dot(filler.u), plane.second.Dot(filler.v)};
+        bool wall = false;
+        for (int k = 0; k < 2 && !wall; ++k) {
+            if (along[k] > 1.0 - 1e-12) {
+                filler.high[k] = at[k];
+                wall = true;
+            } else if (along[k] < -1.0 + 1e-12) {
+                filler.low[k] = at[k];
+                wall = true;
+            }
+        }
+        if (!wall) filler.cuts.push_back(plane);
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (!(filler.high[k] - filler.low[k] > tolerance)) return;
+    }
+    out.push_back(filler);
+}
+
+// The filler as a solid: its box, less what lies beyond each plane it's cut
+// back to.
+sm_status filler_solid(const Filler& filler, std::unique_ptr<SmBrep>& out) {
+    sm_status status = frame_box(filler.origin, filler.u, filler.v, filler.low, filler.high, out);
+    if (status != SM_SUCCESS || filler.cuts.empty()) return status;
+    SmExtent3d bounds;
+    if (out->CalculateBoundingBox(bounds) != SM_SUCCESS) return SM_ERR;
+    const double size = bounds.GetSize().Length();
+    for (const auto& [point, normal] : filler.cuts) {
+        // A box on the plane, reaching past the filler every way.
+        const double reach = 2.0 * (size + (point - bounds.GetMid()).Length()) + 1.0;
+        SmVector3d a;
+        SmVector3d b;
+        plane_axes(normal, a, b);
+        const double low[3] = {-reach, -reach, 0.0};
+        const double high[3] = {reach, reach, reach};
+        std::unique_ptr<SmBrep> beyond;
+        if ((status = frame_box(point, a, b, low, high, beyond)) != SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanDifference, out, std::move(beyond))) != SM_SUCCESS) {
+            return status;
+        }
+        if (out->GetNumFaces() == 0) return SM_SHIM_ERR_OBSTRUCTED;
+    }
+    return SM_SUCCESS;
+}
+
+// Offsets the picked faces through `obstacles` (see find_obstacles), the
+// faces they swallow (see Plug) and the part's own outside (see Filler), in
+// place.
 sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double distance,
-                       const std::vector<Obstacle>& obstacles, const std::vector<Plug>& plugs) {
+                       const std::vector<Obstacle>& obstacles, const std::vector<Plug>& plugs,
+                       const std::vector<Filler>& fillers) {
     for (const Obstacle& obstacle : obstacles) {
         if (obstacle.side == 0 || !box_holds_only(brep, obstacle)) return SM_SHIM_ERR_OBSTRUCTED;
     }
@@ -3774,11 +4121,11 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
         bosses.emplace_back(&obstacle, std::move(part));
     }
     // A hole on a picked face that the push swallows whole has nothing to
-    // come back as; any other, and the part around a plug, needs the part as
-    // it is to come back from.
+    // come back as; any other, and the part around a plug or a filler, needs
+    // the part as it is to come back from.
     std::unique_ptr<SmBrep> holed;
     const double tolerance = 10.0 * brep.GetTolerance();
-    if (!plugs.empty() && (status = copy_of(*work, holed)) != SM_SUCCESS) return status;
+    if ((!plugs.empty() || !fillers.empty()) && (status = copy_of(*work, holed)) != SM_SUCCESS) return status;
     for (const Obstacle& obstacle : obstacles) {
         if (obstacle.side > 0) continue;
         const bool gone = obstacle.on_picked && swallows(obstacle, distance, tolerance, true);
@@ -3790,6 +4137,14 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
         if ((status = frame_box(obstacle.origin, obstacle.u, obstacle.v, obstacle.low, obstacle.high, box)) !=
                 SM_SUCCESS ||
             (status = boolean_into(SmApiBooleanUnion, work, std::move(box))) != SM_SUCCESS) {
+            return status;
+        }
+    }
+    // The outside the push breaks out into, filled.
+    for (const Filler& filler : fillers) {
+        std::unique_ptr<SmBrep> solid;
+        if ((status = filler_solid(filler, solid)) != SM_SUCCESS ||
+            (status = boolean_into(SmApiBooleanUnion, work, std::move(solid))) != SM_SUCCESS) {
             return status;
         }
     }
@@ -3881,7 +4236,10 @@ sm_status push_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double dis
     }
     if ((status = merge_unmarked(*work)) != SM_SUCCESS) return status;
     unmark_all(*work);
+    // Breaking out can take all there was, or cut it in two.
+    if (!fillers.empty() && work->GetNumFaces() == 0) return SM_SHIM_ERR_EMPTIES_SOLID;
     if ((status = check_solid(*work)) != SM_SUCCESS) return status;
+    if (!fillers.empty() && shell_count(*work) > shell_count(brep)) return SM_SHIM_ERR_SPLITS_SOLID;
     // A boss whose face pulled back from under it (behind a round that moved
     // with the pushed face) would come back on its own.
     if (shell_count(*work) != shell_count(brep)) return SM_SHIM_ERR_OBSTRUCTED;
@@ -4063,14 +4421,16 @@ sm_status offset_through(SmBrep& brep, const SmTArray<SmFace*>& picked, double d
     Motions motions;
     std::vector<Obstacle> obstacles;
     std::vector<Plug> plugs;
+    std::vector<Filler> fillers;
     if (plan_offset(picked, distance, brep.GetTolerance(), motions) == SM_SUCCESS) {
         find_obstacles(brep, picked, distance, motions, obstacles);
         find_plugs(brep, picked, distance, motions, obstacles, plugs);
+        find_fillers(brep, picked, distance, motions, obstacles, plugs, fillers);
     }
-    if (obstacles.empty() && plugs.empty()) {
+    if (obstacles.empty() && plugs.empty() && fillers.empty()) {
         return keeping_topology(brep, [&] { return offset_faces(brep, picked, distance); });
     }
-    return push_through(brep, picked, distance, obstacles, plugs);
+    return push_through(brep, picked, distance, obstacles, plugs, fillers);
 }
 
 }  // namespace
@@ -4506,6 +4866,32 @@ sm_status sm_brep_offset_obstacles(const sm_brep* brep, const uint32_t* faces, s
             }
         }
         *out_count = written;
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_offset_breakout(const sm_brep* brep, const uint32_t* faces, size_t count, double distance,
+                                  uint32_t* out_faces, size_t capacity, size_t* out_count) {
+    if (!brep || !out_count || (count > 0 && !faces) || (capacity > 0 && !out_faces)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (!std::isfinite(distance) || count == 0) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
+    return guarded([&] {
+        const SmBrep& source = *brep_of(brep);
+        SmTArray<SmFace*> picked;
+        if (!picked_faces(source, faces, count, picked)) return SM_SHIM_ERR_BAD_FACE;
+        std::vector<const SmFace*> through;
+        Motions motions;
+        if (distance != 0.0 && plan_offset(picked, distance, source.GetTolerance(), motions) == SM_SUCCESS) {
+            std::vector<Obstacle> obstacles;
+            std::vector<Plug> plugs;
+            find_obstacles(source, picked, distance, motions, obstacles);
+            find_plugs(source, picked, distance, motions, obstacles, plugs);
+            through = broken_through(source, picked, distance, motions, obstacles, plugs);
+        }
+        const FaceIndex index = index_faces(source);
+        for (size_t i = 0; i < through.size() && i < capacity; ++i) {
+            out_faces[i] = static_cast<uint32_t>(face_id(index, through[i]));
+        }
+        *out_count = through.size();
         return SM_SUCCESS;
     });
 }

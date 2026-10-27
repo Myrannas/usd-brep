@@ -51,6 +51,8 @@ static const sm_status SM_SHIM_ERR_DRAFT_CLOSES = 2034;        /* a draft's side
 static const sm_status SM_SHIM_ERR_BAD_PATH = 2035;            /* a pipe's path turns back on itself, or a bend overlaps itself */
 static const sm_status SM_SHIM_ERR_ARC_CORNER = 2036;          /* an arc of a pipe's path meets a curve beside it at an angle */
 static const sm_status SM_SHIM_ERR_BAD_SHELL = 2037;           /* a shell's input isn't a manifold solid, or its result isn't one */
+static const sm_status SM_SHIM_ERR_SPLITS_SOLID = 2038;        /* a face pushed out of the solid would cut it in two */
+static const sm_status SM_SHIM_ERR_EMPTIES_SOLID = 2039;       /* a face pushed out of the solid would leave nothing of it */
 
 /* Opaque handles. sm_brep is an SmBrep owned by the caller; sm_mesh is
  * tessellation output copied into flat arrays, independent of the brep. */
@@ -582,6 +584,18 @@ sm_status sm_brep_merge_faces(sm_brep *brep);
  * runs along that plane's normal and nothing else stands near the chamfer.
  * Pushing through merges back only the faces its own cuts split: an edge
  * that already joined two faces on one surface (an imprint's) stays.
+ * One planar face pushed in past the part's own outside (a pocket's wall
+ * through the wall beside it, a round or chamfer on the part's edge, a
+ * slanted side) breaks out of it: what it sweeps outside the part is filled
+ * for the offset, and the part loses what the move swept, which opens it out
+ * where the face and its neighbours run out of it. The face is gone where it
+ * now lies outside, its neighbours run on to the outside, and the faces it
+ * breaks through keep their labels around the opening. That needs the faces
+ * it trims (the face a pocket opens on) to be planes it stays behind;
+ * SM_SHIM_ERR_SPLITS_SOLID when it would cut the solid in two and
+ * SM_SHIM_ERR_EMPTIES_SOLID when it would leave nothing of it (see
+ * sm_brep_offset_breakout). It isn't tried for several faces at once, or
+ * where the face swallows a chamfer, which fail as before.
  * A picked face beside an unpicked face on its own surface (two pieces of
  * one face, as an imprint splits it) steps away from it instead: the picked
  * faces are swept along the move into prisms, which are joined (pulled out)
@@ -624,6 +638,15 @@ sm_status sm_brep_offset_faces_unchecked(sm_brep *brep, const uint32_t *faces, s
 sm_status sm_brep_offset_obstacles(const sm_brep *brep, const uint32_t *faces, size_t count, double distance,
                                    uint32_t *out_faces, uint32_t *out_obstacles, size_t capacity,
                                    size_t *out_count);
+
+/* The faces an offset of the faces by `distance` breaks out of the part
+ * through (see sm_brep_offset_faces): when one planar face pushed in passes
+ * outside the part, away from what stands in its way, the faces neither
+ * moving nor beside a moving one that reach across what it passes through
+ * there. Writes up to `capacity` face indices, in the brep's order, and sets
+ * `count` to their number; none when it stays inside. */
+sm_status sm_brep_offset_breakout(const sm_brep *brep, const uint32_t *faces, size_t count, double distance,
+                                  uint32_t *out_faces, size_t capacity, size_t *out_count);
 
 /* What a face is to sm_brep_move_faces. */
 enum sm_move_role {

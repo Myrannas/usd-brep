@@ -685,3 +685,78 @@ moved rather than offset, so it needed no kernel change.
   labels, winds outward and has its volume within 2e-9 of the shape's own
   formula (planes to 1e-15).
 
+## Notes from breaking out (no patch needed)
+
+A pocket's wall pushed toward the part's side past the wall between them
+leaves the part: the space it sweeps crosses the part's own outside, the
+wall's face is gone where it now lies outside, and the side gets an
+opening. That is new topology, which the local operation can't make
+(`SHIM_ERR_CHANGED_TOPOLOGY`, or the kernel's own failure). The same
+happens through a round or a chamfer on the part's edge, and partly out of
+a slanted or drafted side. It needed no kernel change: it reuses the
+push-through's booleans with one more thing set aside.
+
+- **Detection** (`breaking_out`). The picked face's points are moved a
+  quarter, half, three quarters and all the way: five along each straight
+  edge, between where its ends are and where `predict_vertex` lands them
+  (`predict_vertex` and `straight` are now free functions, which
+  `RigidMoveGeometry` calls as before), nine along any other edge, and one
+  inside it. A point the brep classifies (`Point3DClassify`) in the
+  infinite region or a void, and not in an obstacle's box, is outside. The
+  boxes are taken ten times the brep's tolerance wider, since a hole's box
+  ends on its base's plane, along which the face's edges slide. It's only
+  tried for one planar face pushed in that swallows no chamfer: where a
+  face swallows one (a `Plug`), its edges' predicted landings run along the
+  chamfer's plane, outside the part, though the face meets the plane
+  beyond.
+- **The filler** (`find_fillers`, `filler_solid`). The still faces across
+  an edge from a moving face whose edgeuse binormal points back against the
+  face's normal are the ones the push trims (the side a pocket opens on).
+  Each must be a plane with every point the face passes through on its
+  inner side, or nothing is filled and the offset fails as before. The
+  filler is a box in the face's frame, its u along the first such plane's
+  normal square to the face, over every moving face and blend where they
+  are and where they go and over their vertices' landings, with a margin of
+  0.5 mm and 2%, from past the face's new plane to just behind its old one
+  (0.1 mm, or 1% of the move). Trimmed planes along ±u or ±v are its walls;
+  any other is cut off it with a half-space box.
+- **The push** (`push_through`). The filler is joined to the working copy
+  after the hole boxes, and a copy of the part as it was is kept, as for a
+  plug. The face moves inside the filled part as inside a bigger one, the
+  part as it was loses what the move swept, and it opens where the face
+  and its neighbours run out of it. The result is checked as any
+  push-through's is (manifold, outward, loops apart, a trusted volume),
+  with `SHIM_ERR_EMPTIES_SOLID` (2039) when nothing is left and
+  `SHIM_ERR_SPLITS_SOLID` (2038) when it has more shells than before.
+  `sm_brep_offset_breakout` (`Brep::offset_breakout`) lists the faces it
+  breaks through, for callers' words.
+- **Names.** The pushed face keeps its label where it stays and is gone
+  where it's outside; its neighbours run on keeping theirs; the face it
+  breaks through keeps its label round the opening, and a round it cuts
+  through comes back in two pieces that each keep it.
+- **Unchanged otherwise.** With nothing outside, the offset takes the path
+  it did: the sample crate's lid pushed in 10 and pulled out 10, its +X side
+  in 30 past the bolts, its +Y side in 80 and 127.8 through its hand-holds
+  and Vent, and a pocket's wall in 10 come out bit for bit as at `54dde24`
+  (positions, triangles and names hashed, through game-cad's backend). The
+  detection costs 1 to 8 ms a build there: 3.1 to 4.2 ms on the pocket,
+  115 to 122 ms on the crate's side.
+- **Limits.** One planar face; several picked at once, or a face that
+  swallows a chamfer, fail as before. The faces it trims must be planes it
+  stays behind. Move Face (`sm_brep_move_faces`) pushes through nothing, so
+  a moved face can't break out either.
+- Results (`rust/smlib/tests/cases.rs`): a 100 × 60 × 40 box with a pocket
+  20 tall and 30 deep in its front, its left wall 20 in from the -X side,
+  pushed toward it. At -19 the plain box's wall stays inside (204600
+  mm³); with the vertical edges rounded or chamfered 8, it breaks out
+  through the round or chamfer alone, notching it, and the part of the
+  wall still inside stays (202569.489; 199970). At -21 and -33 it opens
+  out of the side (204000; rounded, 202077.168, the round cut in two;
+  chamfered, 199520). Each is the volume of the box with the pocket cut
+  that wide, to 1e-9, with its labels. A slot through the box's height
+  with its back wall pushed out of the box's back would cut it in two
+  (`SHIM_ERR_SPLITS_SOLID`), and a plain box's top pushed past its bottom
+  leaves nothing
+  (`SHIM_ERR_EMPTIES_SOLID`, which
+  `offset_face_fails_cleanly_when_a_face_would_vanish` now expects).
+

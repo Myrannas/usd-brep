@@ -1101,6 +1101,24 @@ impl Brep {
     /// entirely on one side of a planar face, or something else stands in
     /// its way; or when it would come back on its own or sealed inside.
     ///
+    /// One planar face pushed in past the part's own outside breaks out of
+    /// it: a pocket's wall pushed through the wall between it and the side,
+    /// through a round or a chamfer on the part's edge, or a slanted or
+    /// drafted side. What it sweeps outside the part is filled for the
+    /// offset, with a box cut back to the planes of the faces the push trims
+    /// (the face a pocket opens on), and the part as it was loses what the
+    /// move swept: it opens out where the face and its neighbours run out of
+    /// it. The face is gone where it now lies outside and stays where it
+    /// doesn't, its neighbours run on to the outside keeping their
+    /// [`Label`]s, and the faces it breaks through keep theirs around the
+    /// opening, a face it splits in pieces that each keep it.
+    /// [`offset_breakout`](Brep::offset_breakout) lists those faces. It needs
+    /// the faces it trims to be planes everything it sweeps stays behind,
+    /// or it fails as before; `SHIM_ERR_SPLITS_SOLID` when it would cut the
+    /// solid in two, `SHIM_ERR_EMPTIES_SOLID` when it would leave nothing.
+    /// It isn't tried for several faces at once, or where the face swallows
+    /// a chamfer (below), which fail as before.
+    ///
     /// A face pushed in past a chamfer beside it swallows the chamfer and
     /// meets the plane beyond directly, as if the edge had never been
     /// chamfered: a lid past the chamfer along its edge, a hole widened or a
@@ -1225,6 +1243,40 @@ impl Brep {
             obstacles[obstacle].push(face as usize);
         }
         Ok(obstacles)
+    }
+
+    /// The faces offsetting `faces` by `distance` breaks out of the part
+    /// through: when one planar face pushed in passes outside the part, away
+    /// from the features [`offset_obstacles`](Brep::offset_obstacles) lists,
+    /// the faces neither moving nor beside a moving one that reach across
+    /// what it passes through there, such as the side a pocket's wall is
+    /// pushed through and the round on its edge (see
+    /// [`offset_faces`](Brep::offset_faces)). Their indices, in face order;
+    /// none when it stays inside the part.
+    pub fn offset_breakout(&self, faces: &[usize], distance: f64) -> Result<Vec<usize>, Error> {
+        const OP: &str = "offset breakout";
+        let indices = offset_indices(OP, faces, distance)?;
+        let query = |out_faces: *mut u32, capacity: usize| {
+            let mut count = 0;
+            // SAFETY: self is a live brep on the kernel thread; indices holds
+            // indices.len() values; out_faces holds `capacity` values.
+            let status = unsafe {
+                sys::sm_brep_offset_breakout(
+                    self.raw.as_ptr(),
+                    indices.as_ptr(),
+                    indices.len(),
+                    distance,
+                    out_faces,
+                    capacity,
+                    &mut count,
+                )
+            };
+            Error::check(OP, status).map(|()| count)
+        };
+        let count = query(ptr::null_mut(), 0)?;
+        let mut through = vec![0u32; count];
+        query(through.as_mut_ptr(), count)?;
+        Ok(through.into_iter().map(|face| face as usize).collect())
     }
 
     /// Moves the faces at `faces` (indices in [`faces`](Brep::faces)) by a
