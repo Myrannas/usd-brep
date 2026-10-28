@@ -46,3 +46,18 @@ impl ImprintEdge {
         }
     }
 }
+
+/// A curve in a face's (u, v), for [`Brep::imprint_uv`](crate::Brep::imprint_uv):
+/// a clamped B-spline of `degree`, each control point's u, v and weight
+/// (not multiplied through), and `points.len() + degree + 1` knots.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UvCurve {
+    /// The face's index in [`faces`](crate::Brep::faces), before the call.
+    pub face: usize,
+    /// Its degree, at least 1.
+    pub degree: u32,
+    /// Its knots, clamped.
+    pub knots: Vec<f64>,
+    /// Its control points: u, v and weight.
+    pub points: Vec<[f64; 3]>,
+}

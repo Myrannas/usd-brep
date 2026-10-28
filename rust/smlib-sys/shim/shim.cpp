@@ -8745,3 +8745,147 @@ sm_status sm_brep_shell(const sm_brep* brep, double thickness, const uint32_t* o
 void sm_shell_faces_free(sm_shell_face* faces) { delete[] faces; }
 
 }  // extern "C"
+
+// Curves imprinted from faces' (u, v): what a wrapped sketch lays on the
+// part, each piece in the parameters of the face it lies on.
+
+namespace {
+
+// A 2D B-spline from a sm_uv_curve, or null when its counts don't agree.
+SmBSplineCurve* uv_curve_of(const sm_uv_curve& raw) {
+    if (raw.degree < 1 || raw.point_count < raw.degree + 1 || raw.knot_count != raw.point_count + raw.degree + 1 ||
+        !raw.knots || !raw.points) {
+        return nullptr;
+    }
+    const SmContext* context = SmApiGetOrCreateContext();
+    std::unique_ptr<SmBSplineCurve> curve(new (*context) SmBSplineCurve(2));
+    if (curve->SetExpert(2, raw.degree, SM_CF_UNSPECIFIED, SM_EK_CLAMPPED, static_cast<ULONG>(raw.knot_count), raw.knots,
+                         SM_CP_EUCLIDIAN_RATIONAL, 3, raw.points) != SM_SUCCESS) {
+        return nullptr;
+    }
+    return curve.release();
+}
+
+}  // namespace
+
+extern "C" {
+
+sm_status sm_brep_face_uv(const sm_brep* brep, size_t face, sm_vec3 point, double uv[2], double* distance) {
+    if (!brep || !uv || !distance) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        const SmFace* on = face_at(*brep_of(brep), face);
+        if (!on || !on->GetSurface()) return SM_SHIM_ERR_BAD_FACE;
+        SmPoint3d closest;
+        SmTArray<SmPoint2d> uvs;
+        double gap = 0.0;
+        const SmApiStatus status =
+            SmApiSurfaceClosestPoint(on->GetSurface(), SmPoint3d(point.x, point.y, point.z), closest, uvs, gap);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        if (uvs.GetSize() == 0) return SM_ERR;
+        uv[0] = uvs[0].x;
+        uv[1] = uvs[0].y;
+        *distance = gap;
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_face_point(const sm_brep* brep, size_t face, const double uv[2], sm_vec3* out) {
+    if (!brep || !uv || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        const SmFace* on = face_at(*brep_of(brep), face);
+        if (!on || !on->GetSurface()) return SM_SHIM_ERR_BAD_FACE;
+        SmVector3d point;
+        const SmApiStatus status = SmApiEvaluateSurfacePoint(on->GetSurface(), SmVector2d(uv[0], uv[1]), point);
+        if (status != SM_SUCCESS) return static_cast<sm_status>(status);
+        out->x = point.x;
+        out->y = point.y;
+        out->z = point.z;
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_imprint_uv(sm_brep* brep, const sm_uv_curve* curves, size_t count, sm_imprint_edge** edges,
+                             size_t* edge_count) {
+    if (!brep || (count > 0 && !curves) || !edges || !edge_count) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmBrep& target = *brep_of(brep);
+        const bool was_solid = is_manifold_solid(target);
+        // Faces are found before any is split: a split face keeps its
+        // pointer for one piece.
+        std::vector<SmFace*> faces;
+        for (size_t i = 0; i < count; ++i) {
+            SmFace* face = face_at(target, curves[i].face);
+            if (!face || !face->GetSurface()) return SM_SHIM_ERR_BAD_FACE;
+            faces.push_back(face);
+        }
+        mark_edges(target);
+        std::unordered_set<const SmEdge*> along;
+        sm_status failure = SM_SUCCESS;
+        {
+            SmTemporaryChangeValue<SmBoolean> editing(target.m_bEditingEnabled, TRUE);
+            std::vector<bool> done(count, false);
+            for (size_t i = 0; i < count && failure == SM_SUCCESS; ++i) {
+                if (done[i]) continue;
+                SmFace* face = faces[i];
+                const SmSurface* surface = face->GetSurface();
+                SmTArray<SmCurve*> lifted;
+                SmTArray<SmCurve*> uvs;
+                SmObjsDelete<SmCurve*> clean_lifted(&lifted);
+                SmObjsDelete<SmCurve*> clean_uvs(&uvs);
+                for (size_t j = i; j < count; ++j) {
+                    if (faces[j] != face) continue;
+                    done[j] = true;
+                    SmBSplineCurve* uv = uv_curve_of(curves[j]);
+                    if (!uv) {
+                        failure = SM_ERR_INVALID_INPUT;
+                        break;
+                    }
+                    uvs.Add(uv);
+                    SmTArray<SmBSplineCurve*> up;
+                    const SmApiStatus status = SmApiLiftUVCurveFromSrf(uv, surface, &up);
+                    if (status != SM_SUCCESS || up.GetSize() != 1) {
+                        for (ULONG k = 0; k < up.GetSize(); ++k) delete up[k];
+                        failure = status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+                        break;
+                    }
+                    lifted.Add(up[0]);
+                }
+                if (failure != SM_SUCCESS) break;
+                SmTArray<SmFace*> made;
+                SmTArray<SmEdge*> on;
+                double tolerance = target.GetTolerance().val;
+                if (!(tolerance > 0.0)) tolerance = SM_ZONE_TOL_3D;
+                const SmStatus status = target.MergeCurvesOnSurface(*surface, tolerance, lifted, &uvs, made, on);
+                if (status != SM_SUCCESS) {
+                    failure = static_cast<sm_status>(status);
+                    break;
+                }
+                for (ULONG k = 0; k < on.GetSize(); ++k) along.insert(on[k]);
+            }
+        }
+        std::vector<sm_imprint_edge> listed;
+        if (failure == SM_SUCCESS) {
+            SmTArray<SmEdge*> all;
+            target.GetEdges(all);
+            for (ULONG i = 0; i < all.GetSize(); ++i) {
+                const bool is_new = all[i]->FindAttribute(OLD_EDGE_ATTRIBUTE_ID) == NULL;
+                if (!is_new && !along.count(all[i])) continue;
+                sm_imprint_edge edge;
+                std::memset(&edge, 0, sizeof edge);
+                edge.edge = i;
+                edge.is_new = is_new ? 1 : 0;
+                listed.push_back(edge);
+            }
+        }
+        unmark_edges(target);
+        if (failure != SM_SUCCESS) return failure;
+        if (was_solid && !is_manifold_solid(target)) return SM_SHIM_ERR_BROKE_SOLID;
+        std::unique_ptr<sm_imprint_edge[]> array(new sm_imprint_edge[listed.size()]);
+        std::copy(listed.begin(), listed.end(), array.get());
+        *edges = array.release();
+        *edge_count = listed.size();
+        return SM_SUCCESS;
+    });
+}
+
+}  // extern "C"

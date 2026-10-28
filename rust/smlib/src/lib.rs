@@ -66,7 +66,7 @@ pub use faces::{
     ScaleReport, SurfaceKind, Sweep, SweptFace,
 };
 pub use fillet::{Continuity, CrossSection, EdgeBlend, FilletOptions};
-pub use imprint::{Imprint, ImprintEdge};
+pub use imprint::{Imprint, ImprintEdge, UvCurve};
 pub use kernel::Kernel;
 pub use label::{Label, LabelMatch, MAX_ROLE_LEN};
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};

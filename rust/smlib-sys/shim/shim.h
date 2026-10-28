@@ -1021,6 +1021,42 @@ void sm_imprint_free(sm_imprint_edge *edges, uint8_t *inside);
  * SM_SHIM_ERR_BAD_EDGE when an index is out of range or repeated. */
 sm_status sm_brep_merge_faces_keeping(sm_brep *brep, const uint32_t *keep, size_t count);
 
+/* A curve in a face's (u, v) parameters, for sm_brep_imprint_uv: a clamped
+ * B-spline of dimension 2 and `degree`, with `point_count` control points,
+ * each u, v and its weight (Euclidean, not multiplied through), and
+ * point_count + degree + 1 knots. `face` is the face's index in the brep's
+ * face list as it is before the call. */
+typedef struct sm_uv_curve {
+    size_t face;
+    uint32_t degree;
+    const double *knots;
+    size_t knot_count;
+    const double *points;
+    size_t point_count;
+} sm_uv_curve;
+
+/* The (u, v) on face `face`'s surface of the point nearest `point`
+ * (SmApiSurfaceClosestPoint), and its distance from it. */
+sm_status sm_brep_face_uv(const sm_brep *brep, size_t face, sm_vec3 point, double uv[2], double *distance);
+
+/* The point at (u, v) on face `face`'s surface. */
+sm_status sm_brep_face_point(const sm_brep *brep, size_t face, const double uv[2], sm_vec3 *out);
+
+/* Splits faces along curves lying on them, given in each face's (u, v):
+ * each curve is lifted to 3D on its face's surface (SmApiLiftUVCurveFromSrf)
+ * and merged into the face with its (u, v) curve (SmBrep::MergeCurvesOnSurface,
+ * as SmPlaneCutter merges its sections), a face's curves together, in the
+ * order given. A curve needn't stop at its face's boundary: what lies
+ * outside the face is left out. Faces and edges keep their labels on every
+ * piece; the new edges have none.
+ *
+ * *edges lists every edge of the result the curves made (is_new 1) or lie
+ * along (0), by index, with no tool faces. SM_SHIM_ERR_BAD_FACE when a face
+ * index is out of range; SM_SHIM_ERR_BROKE_SOLID when a manifold solid
+ * comes back otherwise. Free *edges with sm_imprint_free. */
+sm_status sm_brep_imprint_uv(sm_brep *brep, const sm_uv_curve *curves, size_t count, sm_imprint_edge **edges,
+                             size_t *edge_count);
+
 #ifdef __cplusplus
 }
 #endif

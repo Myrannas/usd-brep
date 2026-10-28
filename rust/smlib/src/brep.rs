@@ -14,7 +14,7 @@ use crate::faces::{
     ScaleReport, Sweep,
 };
 use crate::fillet::{EdgeBlend, FilletOptions};
-use crate::imprint::{Imprint, ImprintEdge};
+use crate::imprint::{Imprint, ImprintEdge, UvCurve};
 use crate::kernel::Kernel;
 use crate::label::{Label, NO_LABEL};
 use crate::mesh::{Mesh, TessellationParams, slice};
@@ -1507,6 +1507,59 @@ impl Brep {
             edges,
             inside,
         })
+    }
+
+    /// The (u, v) on face `face`'s surface of the point nearest `point`,
+    /// and how far that is from it.
+    pub fn face_uv(&self, face: usize, point: [f64; 3]) -> Result<([f64; 2], f64), Error> {
+        let mut uv = [0.0; 2];
+        let mut distance = 0.0;
+        // SAFETY: self is a live brep on the kernel thread; uv holds two.
+        let status = unsafe { sys::sm_brep_face_uv(self.raw.as_ptr(), face, vec3(point), uv.as_mut_ptr(), &mut distance) };
+        Error::check("SmApiSurfaceClosestPoint", status)?;
+        Ok((uv, distance))
+    }
+
+    /// The point at (u, v) on face `face`'s surface.
+    pub fn face_point(&self, face: usize, uv: [f64; 2]) -> Result<[f64; 3], Error> {
+        let mut out = vec3([0.0; 3]);
+        // SAFETY: self is a live brep on the kernel thread; uv holds two.
+        let status = unsafe { sys::sm_brep_face_point(self.raw.as_ptr(), face, uv.as_ptr(), &mut out) };
+        Error::check("SmApiEvaluateSurfacePoint", status)?;
+        Ok([out.x, out.y, out.z])
+    }
+
+    /// Splits faces along curves lying on them, each given in its face's
+    /// (u, v) (`SmBrep::MergeCurvesOnSurface`, each lifted to 3D on the
+    /// surface): what a wrapped sketch lays on the part. A curve needn't
+    /// stop at its face's boundary. [`Imprint::edges`] lists the edges the
+    /// curves made or lie along; [`Imprint::inside`] is empty.
+    pub fn imprint_uv(self, curves: &[UvCurve]) -> Result<Imprint, Error> {
+        const OP: &str = "SmBrep::MergeCurvesOnSurface";
+        let raw: Vec<sys::sm_uv_curve> = curves
+            .iter()
+            .map(|curve| sys::sm_uv_curve {
+                face: curve.face,
+                degree: curve.degree,
+                knots: curve.knots.as_ptr(),
+                knot_count: curve.knots.len(),
+                points: curve.points.as_ptr().cast(),
+                point_count: curve.points.len(),
+            })
+            .collect();
+        let mut edges = ptr::null_mut();
+        let mut edge_count = 0;
+        // SAFETY: self is a live brep on the kernel thread; raw borrows
+        // curves, which outlive the call; edges is written only on success.
+        let status = unsafe { sys::sm_brep_imprint_uv(self.raw.as_ptr(), raw.as_ptr(), raw.len(), &mut edges, &mut edge_count) };
+        Error::check(OP, status)?;
+        // SAFETY: on success edges holds edge_count entries, copied then freed.
+        let edges = unsafe {
+            let copied = slice(edges, edge_count).iter().map(ImprintEdge::from_raw).collect();
+            sys::sm_imprint_free(edges, ptr::null_mut());
+            copied
+        };
+        Ok(Imprint { brep: self, edges, inside: Vec::new() })
     }
 
     /// The indices in [`faces`](Brep::faces) of the faces `query` picks.
