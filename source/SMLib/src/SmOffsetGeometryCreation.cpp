@@ -732,8 +732,25 @@ SmStatus SmOffsetGeometryCreation::ReplaceEdgeCurves
       SER(rp3DCurve->EvaluatePoint(rp3DCurve->GetNaturalInterval().GetMin(),sCurveStart));
       SER(rp3DCurve->EvaluatePoint(rp3DCurve->GetNaturalInterval().GetMax(),sCurveEnd));
 
+      // Ends that agree don't make the same curve: an offset face's lifted
+      // trim curve and its intersection with a neighbour can share their
+      // ends and part between them (a dome whose normal is upright at its
+      // corners). So the shortcuts below hold only where the candidate's
+      // inside lies on the edge too.
+      SmBoolean bSameInside = TRUE;
+      for (int iSample = 1; iSample < 8 && bSameInside; iSample++)
+        {
+          SmPoint3d sInside;
+          SER(rp3DCurve->EvaluatePoint(rp3DCurve->GetNaturalInterval().Evaluate(iSample / 8.0), sInside));
+          SmBoolean bFound = FALSE;
+          double dParameter = 0.0, dDistance = 0.0;
+          pEdge->ClosestPoint(sInside, bFound, dParameter, dDistance);
+          if (!bFound || dDistance > pEdge->GetTolerance()) { bSameInside = FALSE; }
+        }
+
       // low work - Edgesuse->Curve and 3DCurve start and end Points are within tol
-      if(   (sEdgeuseStart.DistanceBetween(sCurveStart) < pEdge->GetTolerance()) 
+      if(   bSameInside
+         && (sEdgeuseStart.DistanceBetween(sCurveStart) < pEdge->GetTolerance()) 
          && (sEdgeuseEnd.DistanceBetween(sCurveEnd)     < pEdge->GetTolerance())) 
         {
           // No change in ends of curve - don't bother using the inputs - delete them and get out.
@@ -745,7 +762,8 @@ SmStatus SmOffsetGeometryCreation::ReplaceEdgeCurves
         } // end low work - input curves are same as existing Edgeuse->Curve
 
       // low work - Edgeuse->Curve and 3DCurve start and end Points are within tol with reverse parameterization.
-      if(   (sEdgeuseStart.DistanceBetween(sCurveEnd) < pEdge->GetTolerance()) 
+      if(   bSameInside
+         && (sEdgeuseStart.DistanceBetween(sCurveEnd) < pEdge->GetTolerance()) 
          && (sEdgeuseEnd.DistanceBetween(sCurveStart) < pEdge->GetTolerance()))
         {
           // No change in ends of curve - just delete the curves and get out
