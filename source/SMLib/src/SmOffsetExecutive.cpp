@@ -7,6 +7,7 @@
 **********************************************************************/
 
 #include "StdAfx.h"
+#include <unordered_set>
 
 #include <SmOffsetExecutive.h>
 #include <SmSurfaceCache.h>
@@ -19,11 +20,6 @@
 #include <SmPlane.h>
 #include <SmTrimmingTools.h>
 #include <SmAssertArray.h>
-
-#include <algorithm>
-#include <unordered_map>
-#include <utility>
-#include <vector>
 
 #ifdef SM_DEBUG_CODE
 #include <SmTopologyTraverser.h>
@@ -1058,38 +1054,46 @@ SmBoolean bDebugMe2 = FALSE;
 } // end SmOffsetExecutive::DoSolidOffset
 
 /*******************************************************************//**
-PURPOSE: DoExtendedOffset() helper: puts edgeuses of a Brep in the Brep's
-   own order, its edges in turn and each edge's edgeuses in turn, so that
-   they don't follow their addresses.
+PURPOSE: Static helper: order edgeuses by their Brep (faces, faceuses,
+   loops, reversed), not by their heap addresses, so that the extended
+   offset gives the same result in every process.
 
-NOTES: Edgeuses that aren't the Brep's go last, in their given order.
+NOTES: Edgeuses not found in crBrep go last, in their input order.
 ***********************************************************************/
-static void sm_SortInBrepOrder
-  (const SmBrep         * pBrep,       // in : Brep whose order to follow
-   SmTArray<SmEdgeuse*> & rEdgeuses)   // i/o: edgeuses of pBrep to sort
+static void sm_OrderEdgeusesByBrep
+  (const SmBrep         & crBrep,      // in : Brep that owns the edgeuses
+   SmTArray<SmEdgeuse*> & rEdgeuses)   // i/o: edgeuses to order
 {
-  SmTArray<SmEdge*>    sEdges;
-  SmTArray<SmEdgeuse*> sUses;
-  std::unordered_map<const SmEdgeuse*, ULONG> sRanks;
-  pBrep->GetEdges(sEdges);
-  for (ULONG ii = 0; ii < sEdges.GetSize(); ii++)
+  std::unordered_set<SmEdgeuse*> sUnplaced;
+  for (ULONG ii=0; ii<rEdgeuses.GetSize(); ii++)
+    { sUnplaced.insert(rEdgeuses[ii]); }
+
+  SmTArray<SmEdgeuse*> sBrepOrder, sFaceuseEdgeuses;
+  SmTArray<SmFace*> sFaces;
+  crBrep.GetFaces(sFaces);
+  for (ULONG ii=0; ii<sFaces.GetSize(); ii++)
     {
-      sEdges[ii]->GetEdgeuses(sUses);
-      for (ULONG jj = 0; jj < sUses.GetSize(); jj++)
-        { sRanks.emplace(sUses[jj], (ULONG)sRanks.size()); }
+      SmFaceuse *pFaceuses[2] = { NULL, NULL };
+      sFaces[ii]->GetFaceuses(pFaceuses[0], pFaceuses[1]);
+      for (SmFaceuse *pFU : pFaceuses)
+        {
+          if (pFU == NULL) { continue; }
+          pFU->GetEdgeuses(sFaceuseEdgeuses);
+          sBrepOrder.Append(sFaceuseEdgeuses);
+        }
     }
-  std::vector<std::pair<ULONG, SmEdgeuse*>> sRanked;
-  for (ULONG ii = 0; ii < rEdgeuses.GetSize(); ii++)
+
+  SmTArray<SmEdgeuse*> sOrdered;
+  for (ULONG ii=sBrepOrder.GetSize(); ii-- > 0; )
     {
-      const auto sFound = sRanks.find(rEdgeuses[ii]);
-      const ULONG lRank = sFound == sRanks.end() ? (ULONG)(sRanks.size() + ii) : sFound->second;
-      sRanked.emplace_back(lRank, rEdgeuses[ii]);
+      if (sUnplaced.erase(sBrepOrder[ii]) > 0) { sOrdered.Add(sBrepOrder[ii]); }
     }
-  std::sort(sRanked.begin(), sRanked.end(),
-            [](const std::pair<ULONG, SmEdgeuse*> & a, const std::pair<ULONG, SmEdgeuse*> & b) { return a.first < b.first; });
-  for (ULONG ii = 0; ii < rEdgeuses.GetSize(); ii++)
-    { rEdgeuses[ii] = sRanked[ii].second; }
-}
+  for (ULONG ii=0; ii<rEdgeuses.GetSize(); ii++)
+    {
+      if (sUnplaced.count(rEdgeuses[ii]) > 0) { sOrdered.Add(rEdgeuses[ii]); }
+    }
+  rEdgeuses = sOrdered;
+} // end sm_OrderEdgeusesByBrep
 
 /*******************************************************************//**
 PURPOSE: This is the main top level method to offset a solid brep
@@ -1456,13 +1460,7 @@ SmBoolean bDebugMeAll = FALSE ;
   SmTArray<SmEdgeuse*> sOffSetEUS, sRadialEUS;
   SmTArray<SmEdge*>    sNewEdges;
   m_vEUToEU.GetAllFirsts(sOffsetEdgeuses);
-
-  // A local operation or a solid offset (a shell's) mates edges in the
-  // original Brep's order: the map's own order follows the edgeuses'
-  // addresses, and it decides which edge is mated first and which of an
-  // edge's sides is the target.
-  if (m_eOffsetOperation == SM_OO_LOCAL_OPERATION || m_eOffsetOperation == SM_OO_SOLID_OFFSET)
-    { sm_SortInBrepOrder(m_pOriginalBrep, sOffsetEdgeuses); }
+  sm_OrderEdgeusesByBrep(*m_pOriginalBrep, sOffsetEdgeuses);
 
 #ifdef SM_VALIDATE_TOPOLOGY
       m_pOffsetBrep->ValidatePointers();
@@ -2080,6 +2078,47 @@ SmStatus SmOffsetExecutive::ReplaceImplicitOffsets
 
 } // end SmOffsetExecutive::ReplaceImplicitOffsets
 
+// Forget the pairs of a relation whose second is gone (or, with cpLive, is not
+// live). The pointers are only compared, never followed.
+template <class FIRST, class SECOND>
+static void sm_ForgetSeconds(SmRelation<FIRST,SECOND> & rRelation,
+                             const std::unordered_set<SECOND*> & crGone,
+                             const std::unordered_set<SECOND*> * cpLive)
+{
+    SmTArray<SECOND*> sSeconds;
+    rRelation.GetAllSeconds(sSeconds);
+    for (ULONG i=0; i<sSeconds.GetSize(); i++)
+    {
+        SECOND *pSecond = sSeconds[i];
+        if (crGone.count(pSecond) == 0 && (cpLive == NULL || cpLive->count(pSecond) != 0)) { continue; }
+        SmTArray<FIRST*> sFirsts;
+        rRelation.GetFirsts(pSecond, sFirsts);
+        for (ULONG j=0; j<sFirsts.GetSize(); j++)
+        {
+            rRelation.RemovePair(sFirsts[j], pSecond);
+        }
+    }
+}
+
+// Forget the pairs of a relation whose first is gone.
+template <class FIRST, class SECOND>
+static void sm_ForgetFirsts(SmRelation<FIRST,SECOND> & rRelation, const std::unordered_set<FIRST*> & crGone)
+{
+    SmTArray<FIRST*> sFirsts;
+    rRelation.GetAllFirsts(sFirsts);
+    for (ULONG i=0; i<sFirsts.GetSize(); i++)
+    {
+        FIRST *pFirst = sFirsts[i];
+        if (crGone.count(pFirst) == 0) { continue; }
+        SmTArray<SECOND*> sSeconds;
+        rRelation.GetSeconds(pFirst, sSeconds);
+        for (ULONG j=0; j<sSeconds.GetSize(); j++)
+        {
+            rRelation.RemovePair(pFirst, sSeconds[j]);
+        }
+    }
+}
+
 /*******************************************************************//**
 PURPOSE: Remove Excess Faces of the Result by measurement to the original.
 
@@ -2142,8 +2181,49 @@ SmStatus SmOffsetExecutive::RemoveExcessFaces(SmBrep * pResult)
         }
     }
 
+    // The faces about to be removed and their edgeuses, which RemoveFaces deletes
+    std::unordered_set<SmFace*> sGoneFaces;
+    std::unordered_set<SmEdgeuse*> sGone;
+    for (ULONG i=0; i<sDeleteFaces.GetSize(); i++)
+    {
+        sGoneFaces.insert(sDeleteFaces[i]);
+        SmTArray<SmEdge*> sFaceEdges;
+        sDeleteFaces[i]->GetEdges(sFaceEdges);
+        for (ULONG j=0; j<sFaceEdges.GetSize(); j++)
+        {
+            SmTArray<SmEdgeuse*> sUses;
+            sFaceEdges[j]->GetEdgeuses(sUses);
+            for (ULONG kk=0; kk<sUses.GetSize(); kk++)
+            {
+                if (sUses[kk]->GetFace() == sDeleteFaces[i])
+                {
+                    sGone.insert(sUses[kk]);
+                }
+            }
+        }
+    }
+
     // Clean up those faces we have collected.
     pResult->RemoveFaces(sDeleteFaces);   // increments unlocked mark value
+
+    // Forget the deleted faces and edgeuses, so later lookups in the relations (lamina side walls,
+    // PiecewiseMerge) cannot return them. For m_vEUToEU also forget any edgeuse no result edge has.
+    if (!sGoneFaces.empty())
+    {
+        std::unordered_set<SmEdgeuse*> sLive;
+        SmTArray<SmEdge*> sResultEdges;
+        pResult->GetEdges(sResultEdges);
+        for (ULONG i=0; i<sResultEdges.GetSize(); i++)
+        {
+            sResultEdges[i]->GetEdgeuses(sLive);
+        }
+        sm_ForgetSeconds(m_vEUToEU, sGone, &sLive);
+        sm_ForgetSeconds(m_vFUToF, sGoneFaces, (const std::unordered_set<SmFace*> *)NULL);
+        sm_ForgetSeconds(m_vEToF, sGoneFaces, (const std::unordered_set<SmFace*> *)NULL);
+        sm_ForgetSeconds(m_vVToF, sGoneFaces, (const std::unordered_set<SmFace*> *)NULL);
+        sm_ForgetSeconds(m_vBlendToFaces, sGoneFaces, (const std::unordered_set<SmFace*> *)NULL);
+        sm_ForgetFirsts(m_vBlendToFaces, sGoneFaces);
+    }
 
     return SM_SUCCESS;
 
