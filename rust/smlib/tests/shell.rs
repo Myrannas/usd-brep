@@ -12,7 +12,7 @@ use std::sync::mpsc;
 
 use smlib::{
     Brep, EdgeBlend, EdgeQuery, Error, FaceGeometry, FilletOptions, Kernel, Label, Mesh, ShellFace,
-    Status, Surface, TessellationParams,
+    Surface, TessellationParams,
 };
 
 type Job = Box<dyn FnOnce(&Kernel) + Send>;
@@ -99,7 +99,7 @@ fn hollow(make: fn(&Kernel) -> Brep, thickness: f64, open: Vec<[f64; 3]>) -> Hol
             roles: shell.faces,
             faces: shell.brep.faces().unwrap(),
             manifold: shell.brep.is_manifold().unwrap(),
-            volume: shell.brep.volume(1e-9).unwrap(),
+            volume: shell.brep.volume(1e-8).unwrap(),
             mesh: shell
                 .brep
                 .tessellate(&TessellationParams::default())
@@ -241,10 +241,15 @@ fn a_wall_as_thick_as_a_round_fails() {
 }
 
 #[test]
-fn opening_a_face_rounded_into_its_neighbours_fails() {
-    // The top's rim rounded 4: the offset comes back with faces whose own
-    // integrals disagree with their edges, which the shim refuses.
-    let failed = on_kernel(|k| {
+fn opening_a_face_rounded_into_its_neighbours() {
+    // The top's rim rounded 4, opened at the top. Until 1.0.1 the offset
+    // left a gap where the opening met the rounds, and came back with faces
+    // whose integrals disagreed with their edges, which the shim refused.
+    // Now each inside round, 4 - t, stops where it turns level, and a new
+    // upright face on the round's axis closes the wall up to the opening, so
+    // the wall there is the round's 4 thick. The cavity is the inset box
+    // less, along the rim, the strip between the inside round and that face.
+    let shells = on_kernel(|k| {
         let rim = EdgeQuery::MidpointOnPlane {
             point: [0.0, 0.0, 40.0],
             normal: [0.0, 0.0, 1.0],
@@ -252,30 +257,59 @@ fn opening_a_face_rounded_into_its_neighbours_fails() {
         let solid = block(k)
             .fillet(&[EdgeBlend::round(rim, 4.0)], &FilletOptions::default())
             .unwrap();
-        let top = facing(&solid.faces().unwrap(), [0.0, 0.0, 1.0]);
-        solid.shell(2.0, &top).err()
-    });
-    assert_eq!(
-        failed,
-        Some(Error::Kernel {
-            operation: "SmApiShellBrepFull",
-            status: Status(2037),
+        let outer = solid.volume(1e-8).unwrap();
+        let sources = solid.faces().unwrap();
+        let top = facing(&sources, [0.0, 0.0, 1.0]);
+        [1.0, 2.0, 3.0].map(|t| {
+            let shell = solid.shell(t, &top).unwrap();
+            let faces = shell.brep.faces().unwrap();
+            let kept = faces.iter().zip(&shell.faces).all(|(face, role)| match *role {
+                ShellFace::Outer { face: source } | ShellFace::Rim { face: source } => {
+                    face.label == sources[source].label
+                }
+                ShellFace::Inner { .. } | ShellFace::New => face.label.is_none(),
+            });
+            let new = shell.faces.iter().filter(|role| **role == ShellFace::New).count();
+            (
+                t,
+                outer,
+                shell.brep.is_manifold().unwrap(),
+                shell.brep.volume(1e-8).unwrap(),
+                kept,
+                new,
+                shell
+                    .brep
+                    .tessellate(&TessellationParams::default())
+                    .unwrap(),
+            )
         })
-    );
+    });
+    for (t, outer, manifold, volume, kept, new, mesh) in shells {
+        let r = 4.0 - t;
+        let strip = 4.0 * r - PI * r * r / 4.0;
+        let middle = (4.0 * r * (t + 4.0) / 2.0 - PI * r * r / 4.0 * (4.0 - 4.0 * r / (3.0 * PI))) / strip;
+        let rim = 2.0 * ((100.0 - 2.0 * middle) + (60.0 - 2.0 * middle));
+        let cavity = (100.0 - 2.0 * t) * (60.0 - 2.0 * t) * (40.0 - t) - strip * rim;
+        assert!(manifold, "{t}");
+        assert!(close(volume, outer - cavity), "{t}: {volume} vs {}", outer - cavity);
+        assert!(kept, "{t}: labels");
+        assert_eq!(new, 4, "{t}: an upright face along each round");
+        assert_mesh(&mesh, volume);
+    }
 }
 
 #[test]
 fn the_same_shell_comes_out_the_same() {
     // SMLib's offset mated edges in the order of their addresses (patch
-    // 0afdfdb puts them in the brep's): the same shell gave different volumes
-    // from one process to the next.
+    // 0afdfdb put them in the brep's, as 1.0.1 does): the same shell gave
+    // different volumes from one process to the next.
     let results = on_kernel(|k| {
         let solid = rounded(k);
         let top = facing(&solid.faces().unwrap(), [0.0, 0.0, 1.0]);
         (0..3)
             .map(|_| {
                 let shell = solid.shell(5.0, &top).unwrap();
-                (shell.brep.volume(1e-9).unwrap(), shell.brep.face_count())
+                (shell.brep.volume(1e-8).unwrap(), shell.brep.face_count())
             })
             .collect::<Vec<_>>()
     });

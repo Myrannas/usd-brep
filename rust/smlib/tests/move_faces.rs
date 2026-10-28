@@ -19,7 +19,7 @@ use smlib::{
 const L: f64 = 100.0;
 const W: f64 = 60.0;
 const H: f64 = 40.0;
-const PRECISE: f64 = 1e-9;
+const PRECISE: f64 = 1e-8;
 
 type Job = Box<dyn FnOnce(&Kernel) + Send>;
 

@@ -154,7 +154,7 @@ fn a_rigid_transform_keeps_labels_surfaces_and_volume() {
     on_kernel(|k| {
         let before = part(k);
         let faces = before.faces().unwrap();
-        let volume = before.volume(1e-9).unwrap();
+        let volume = before.volume(1e-8).unwrap();
         let rotation = about_z(30.0);
         let translation = [100.0, 0.0, 50.0];
 
@@ -180,7 +180,7 @@ fn a_rigid_transform_keeps_labels_surfaces_and_volume() {
         );
         // The integrator adapts its steps to where the faces are, so the
         // volume agrees to its accuracy, not bit for bit.
-        let error = relative(moved.volume(1e-9).unwrap(), volume);
+        let error = relative(moved.volume(1e-8).unwrap(), volume);
         println!("volume moved: {error:e} relative");
         assert!(error < 1e-8, "{error:e}");
         for (was, is) in faces.iter().zip(&after) {
@@ -313,7 +313,7 @@ fn translate_and_rotate_about_a_line() {
             &block,
             [[5.0, -3.0, 2.0], [45.0, 17.0, 12.0]],
         );
-        assert!(relative(block.volume(1e-9).unwrap(), 8000.0) < 1e-9);
+        assert!(relative(block.volume(1e-8).unwrap(), 8000.0) < 1e-9);
     });
 }
 
@@ -353,7 +353,7 @@ fn a_uniform_scale_keeps_surfaces_analytic() {
         for (name, make) in [("part", part as fn(&Kernel) -> Brep), ("ring", ring)] {
             let before = make(k);
             let faces = before.faces().unwrap();
-            let volume = before.volume(1e-9).unwrap();
+            let volume = before.volume(1e-8).unwrap();
             let [min, max] = before.bounding_box().unwrap();
             let mut scaled = make(k);
             scaled.scale_about(centre, 2.0).unwrap();
@@ -368,7 +368,7 @@ fn a_uniform_scale_keeps_surfaces_analytic() {
             assert_eq!(edge_labels(&scaled), edge_labels(&before), "{name}");
             // Doubling is exact in binary, and the tolerances double too, so
             // the volume integrates to exactly eight times the old one.
-            let error = relative(scaled.volume(1e-9).unwrap(), 8.0 * volume);
+            let error = relative(scaled.volume(1e-8).unwrap(), 8.0 * volume);
             println!("{name} ×2: volume {error:e} from ×8");
             assert!(error < 1e-8, "{name}: {error:e}");
             assert_eq!(
@@ -412,9 +412,9 @@ fn a_uniform_scale_keeps_surfaces_analytic() {
         // Shrinking works the same way, and the scaled part takes later
         // operations: a boolean and a fillet.
         let mut shrunk = part(k);
-        let volume = shrunk.volume(1e-9).unwrap();
+        let volume = shrunk.volume(1e-8).unwrap();
         shrunk.scale_about([0.0; 3], 0.5).unwrap();
-        assert!(relative(shrunk.volume(1e-9).unwrap(), volume / 8.0) < 1e-8);
+        assert!(relative(shrunk.volume(1e-8).unwrap(), volume / 8.0) < 1e-8);
         let cut = shrunk
             .difference(Brep::cylinder(k, [60.0, -60.0, -100.0], 5.0, 200.0).unwrap())
             .unwrap();
@@ -439,7 +439,7 @@ fn a_uniform_scale_keeps_surfaces_analytic() {
 fn a_non_uniform_scale_stretches_the_part() {
     on_kernel(|k| {
         let before = part(k);
-        let volume = before.volume(1e-9).unwrap();
+        let volume = before.volume(1e-8).unwrap();
         let mut stretched = part(k);
         stretched
             .scale_axes_keeping([0.0; 3], [2.0, 1.0, 1.0], false)
@@ -448,7 +448,7 @@ fn a_non_uniform_scale_stretches_the_part() {
         assert!(stretched.is_manifold().unwrap());
         assert_eq!(face_labels(&faces), face_labels(&before.faces().unwrap()));
         assert_eq!(edge_labels(&stretched), edge_labels(&before));
-        assert!(relative(stretched.volume(1e-9).unwrap(), 2.0 * volume) < 1e-6);
+        assert!(relative(stretched.volume(1e-8).unwrap(), 2.0 * volume) < 1e-6);
         // A NURBS's bounding box is its control points', so measure the mesh.
         let mesh = stretched
             .tessellate(&TessellationParams::default())
@@ -501,7 +501,7 @@ fn a_stretch_along_the_cylinders_keeps_them_analytic() {
     on_kernel(|k| {
         let before = part(k);
         let faces = before.faces().unwrap();
-        let volume = before.volume(1e-9).unwrap();
+        let volume = before.volume(1e-8).unwrap();
         let mut stretched = part(k);
         let report = stretched
             .scale_axes_keeping([0.0; 3], [1.0, 1.0, 2.0], false)
@@ -523,7 +523,7 @@ fn a_stretch_along_the_cylinders_keeps_them_analytic() {
         assert_eq!(kinds(&after), expected);
         assert_eq!(face_labels(&after), face_labels(&faces));
         assert_eq!(edge_labels(&stretched), edge_labels(&before));
-        assert!(relative(stretched.volume(1e-9).unwrap(), 2.0 * volume) < 1e-8);
+        assert!(relative(stretched.volume(1e-8).unwrap(), 2.0 * volume) < 1e-8);
         for (was, is) in faces.iter().zip(&after) {
             if let (Surface::Cylinder { radius, .. }, Surface::Cylinder { radius: r, .. }) =
                 (&was.surface, &is.surface)
@@ -558,7 +558,7 @@ fn a_stretch_across_the_cylinders_keeps_the_planes() {
     on_kernel(|k| {
         let before = part(k);
         let faces = before.faces().unwrap();
-        let volume = before.volume(1e-9).unwrap();
+        let volume = before.volume(1e-8).unwrap();
         let planes = kinds(&faces)
             .iter()
             .filter(|&&kind| kind == "plane")
@@ -585,7 +585,7 @@ fn a_stretch_across_the_cylinders_keeps_the_planes() {
             assert!(report.curves_stretched > 0, "{report:?}");
             assert_eq!(face_labels(&after), face_labels(&faces));
             assert_eq!(edge_labels(&stretched), edge_labels(&before));
-            let error = relative(stretched.volume(1e-9).unwrap(), 2.0 * volume);
+            let error = relative(stretched.volume(1e-8).unwrap(), 2.0 * volume);
             assert!(error < 1e-8, "{error:e}");
 
             // Later operations take it: a hole down through a stretched
@@ -635,7 +635,7 @@ fn a_scale_keeps_its_trims_so_tessellating_is_repeatable() {
             let mut solid = part(k);
             solid.scale_axes_keeping([0.0; 3], factors, true).unwrap();
             if volume_first {
-                solid.volume(1e-9).unwrap();
+                solid.volume(1e-8).unwrap();
             }
             solid.tessellate(&params).unwrap()
         };
@@ -663,8 +663,8 @@ fn keeping_analytics_under_equal_factors_keeps_every_surface() {
                 kinds(&before.faces().unwrap())
             );
             let error = relative(
-                scaled.volume(1e-9).unwrap(),
-                8.0 * before.volume(1e-9).unwrap(),
+                scaled.volume(1e-8).unwrap(),
+                8.0 * before.volume(1e-8).unwrap(),
             );
             assert!(error < 1e-8, "{error:e}");
         }
@@ -688,7 +688,7 @@ fn ellipses_swept_along_a_line_read_back_from_a_file() {
             kinds(&back.faces().unwrap()),
             kinds(&stretched.faces().unwrap())
         );
-        let error = relative(back.volume(1e-9).unwrap(), stretched.volume(1e-9).unwrap());
+        let error = relative(back.volume(1e-8).unwrap(), stretched.volume(1e-8).unwrap());
         assert!(error < 1e-9, "{error:e}");
     });
 }

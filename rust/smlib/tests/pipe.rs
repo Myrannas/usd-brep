@@ -103,7 +103,7 @@ fn pipe(frame: Frame, path: Vec<PlaneCurve>, inner: Option<f64>) -> Piped {
                 .collect(),
             normals: faces.iter().map(|f| f.normal).collect(),
             manifold: solid.is_manifold().unwrap(),
-            volume: solid.volume(1e-9).unwrap(),
+            volume: solid.volume(1e-8).unwrap(),
             mesh: solid.tessellate(&TessellationParams::default()).unwrap(),
         }
     })
@@ -332,12 +332,12 @@ fn a_pipe_joins_a_block() {
             line([30.0, 20.0], [30.0, -5.0]),
         ];
         let handle = Brep::pipe(k, &frame, &path, 4.0, None).unwrap().solid;
-        let pipe_volume = handle.volume(1e-9).unwrap();
+        let pipe_volume = handle.volume(1e-8).unwrap();
         let block = Brep::cuboid(k, [-20.0, -20.0, -30.0], [70.0, 40.0, 30.0]).unwrap();
         let part = block.union(handle).unwrap();
         (
             part.is_manifold().unwrap(),
-            part.volume(1e-9).unwrap(),
+            part.volume(1e-8).unwrap(),
             pipe_volume,
         )
     });

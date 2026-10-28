@@ -719,9 +719,10 @@ fn kept_surface_caches_leave_faces_as_they_were() {
 }
 
 /// A prism with drafted walls and every edge rounded, notched by a cylinder
-/// at (x, 20) through its front wall and top front round: NURBS faces (the
-/// walls are planar NURBS, the rounds curved ones) that keep their surfaces
-/// while the notch moves.
+/// at (x, 20) through its front wall and top front round: faces that keep
+/// their surfaces while the notch moves. The walls are planar NURBS; the
+/// rounds were curved ones until 1.0.1 recognised the walls as planes, and
+/// are cylinders and spheres since.
 fn notched_prism(k: &Kernel, x: f64) -> Result<Brep, Error> {
     let base = [
         [-30.0, -20.0, 0.0],
@@ -773,7 +774,7 @@ fn kept_surface_caches_are_copied_for_faces_tessellated_again() {
         }
         (caches_kept, nurbs)
     });
-    assert!(nurbs.iter().all(|&n| n >= 20), "NURBS faces: {nurbs:?}");
+    assert!(nurbs.iter().all(|&n| n >= 4), "NURBS faces: {nurbs:?}");
     // The first step builds every cache and keeps none; the second keeps
     // copies of the caches it builds for surfaces the first built too; from
     // the third, faces take copies and the store keeps what they copied.

@@ -1588,11 +1588,14 @@ fn edges_read_after_an_offset_and_a_fillet() {
 
 #[test]
 fn offset_faces_refuses_rather_than_return_a_wrong_solid() {
-    // Moves the kernel gets wrong today. Each must either come back exact or
-    // fail with a clean error, never as a broken or inconsistent solid:
+    // Moves the kernel got wrong. Each must either come back exact or fail
+    // with a clean error, never as a broken or inconsistent solid:
     //
     // - fillets sliding along drafted walls: the executive's result
-    //   tessellates right but its own volume is 20-30% off;
+    //   tessellated right but its own volume was 20-30% off, until 1.0.1
+    //   integrated each trim curve's knot spans apart; it is exact now, but
+    //   its volume can't be integrated to 1e-8 (SM_ERR), so these measure
+    //   to 1e-7;
     // - a box cut by a sphere, its sphere faces moved in, or its top moved
     //   up: the executive leaves the solid open.
     type Make = Box<dyn FnOnce(&Kernel) -> Result<Brep, Error> + Send>;
@@ -1628,11 +1631,11 @@ fn offset_faces_refuses_rather_than_return_a_wrong_solid() {
     ];
     for (name, moved, reference) in cases {
         let outcome = on_kernel(move |k| {
-            let reference = reference(k).unwrap().volume(PRECISE).unwrap();
+            let reference = reference(k).unwrap().volume(1e-7).unwrap();
             moved(k).map(|b| {
                 (
                     b.is_manifold().unwrap(),
-                    b.volume(PRECISE).unwrap(),
+                    b.volume(1e-7).unwrap(),
                     reference,
                 )
             })

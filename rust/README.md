@@ -34,8 +34,8 @@ reading every edge's geometry.
 - Both consume the brep and fail with `SHIM_ERR_BROKE_SOLID` when a manifold
   solid comes back non-manifold, which the kernel can do while reporting
   success.
-- There is no undo: `SmApiRemoveFillet` is a no-op (`KNOWN_ISSUES.md`), so
-  rebuild from the unfilleted solid. The default 15° surface angle avoids
+- There is no undo: rebuild from the unfilleted solid (`SmApiRemoveFillet`
+  works since 1.0.1, but isn't bound). The default 15° surface angle avoids
   the inside-out triangles next to fillets listed there; the tests check
   every triangle's winding.
 

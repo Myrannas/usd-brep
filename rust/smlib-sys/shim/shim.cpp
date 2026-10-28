@@ -556,19 +556,18 @@ SmFace* face_at(const SmBrep& brep, size_t index) {
 // stray from its plane.
 const double PLANAR_TOLERANCE = 1e-7;
 
-// The normal of a planar face pointing out of the solid, if it's planar. A
-// plane's normal is the same everywhere, so it's evaluated mid-domain and then
-// oriented as outward_normal orients it. SmSurface::IsPlanar bounds the
-// surface with a box no thinner than about 1e-5, so a NURBS surface whose
-// control points share a plane (a tapered extrusion's walls) is checked
-// directly (plane_of).
+// The plane a surface lies on, if it is planar (below).
 bool plane_of(const SmSurface* surface, SmPoint3d& point, SmVector3d& normal);
 
+// The normal of a planar face pointing out of the solid, if it's planar. A
+// plane's normal is the same everywhere, so it's evaluated mid-domain and then
+// oriented as outward_normal orients it. Since 1.0.1 SmSurface::IsPlanar
+// bounds the surface without padding, so it confirms a NURBS surface whose
+// control points share a plane (a tapered extrusion's walls) at this
+// tolerance, where it stopped at about 1e-5 and needed plane_of.
 bool outward_plane(const SmFace* face, double normal[3]) {
     const SmSurface* surface = face->GetSurface();
-    SmPoint3d on_plane;
-    SmVector3d plane_normal;
-    if (!surface || (!surface->IsPlanar(PLANAR_TOLERANCE) && !plane_of(surface, on_plane, plane_normal))) return false;
+    if (!surface || !surface->IsPlanar(PLANAR_TOLERANCE)) return false;
     const SmExtent2d domain = face->GetUVDomain();
     const SmVector2d middle(0.5 * (domain.GetUMin() + domain.GetUMax()), 0.5 * (domain.GetVMin() + domain.GetVMax()));
     SmVector3d direction;
@@ -902,11 +901,11 @@ sm_status largest_gap(SmBrep& brep, double& out) {
 
 // The volume each face contributes about `origin`, as SmApiBrepComputeVolume
 // sums it (SmBrep::ComputePreciseProperties, from the faces' trim curves),
-// but integrating the volume alone. The integrator's step control follows
-// the face's area whatever is asked for, so each face's volume comes out
-// exactly as it does with every property requested. A face with solid on
-// both sides contributes from both; one with the same region on both sides
-// contributes nothing, as there.
+// but integrating the volume alone. Since 1.0.1 the integrator holds each
+// property asked for to the accuracy, and SmApiBrepComputeVolume asks for
+// every moment, so this is cheaper and agrees with it to the accuracy, not
+// bit for bit. A face with solid on both sides contributes from both; one
+// with the same region on both sides contributes nothing, as there.
 sm_status face_volumes(const SmTArray<SmFace*>& faces, const SmPoint3d& origin, double estimated_area, double accuracy,
                        std::vector<double>& out) {
     out.assign(faces.GetSize(), 0.0);
@@ -1234,7 +1233,8 @@ sm_status keeping_topology(SmBrep& brep, F&& operation) {
 // The plane a surface lies on, if it is planar: SmPlane, or a NURBS surface
 // whose control points all lie on one plane (such as a tapered extrusion's
 // walls), which makes it exactly flat. SmSurface::IsPlanar only bounds the
-// surface with a box, about 1e-5 thick at best, so it just proposes the plane.
+// surface with a box, so it just proposes the plane and the control points
+// decide.
 bool plane_of(const SmSurface* surface, SmPoint3d& point, SmVector3d& normal) {
     if (surface->GetType() == SmPlane_TYPE) {
         const SmAxis2Placement& placement = static_cast<const SmPlane*>(surface)->GetPosition();

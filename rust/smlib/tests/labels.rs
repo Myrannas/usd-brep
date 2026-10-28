@@ -346,7 +346,7 @@ fn sweeps_report_their_caps_and_sides() {
             let sweep = block.sweep_face(top, distance).unwrap();
             let roles = sweep.faces.clone();
             let prism_faces = measure(&sweep.prism);
-            let prism_volume = sweep.prism.volume(1e-9).unwrap();
+            let prism_volume = sweep.prism.volume(1e-8).unwrap();
             let mut prism = sweep.prism;
             for (index, role) in roles.iter().enumerate() {
                 let label = match role {
@@ -364,7 +364,7 @@ fn sweeps_report_their_caps_and_sides() {
             let mut part = part.unwrap();
             part.merge_faces().unwrap();
             assert!(part.is_manifold().unwrap());
-            let volume = part.volume(1e-9).unwrap();
+            let volume = part.volume(1e-8).unwrap();
             (
                 (roles, prism_faces, prism_volume),
                 source,

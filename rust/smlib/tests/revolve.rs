@@ -146,7 +146,7 @@ fn revolve(loops: Vec<Vec<BoundaryCurve>>, angle_deg: f64) -> Revolved {
                 .map(|i| solid.face_centroid(i).unwrap().centroid)
                 .collect(),
             manifold: solid.is_manifold().unwrap(),
-            volume: solid.volume(1e-9).unwrap(),
+            volume: solid.volume(1e-8).unwrap(),
             mesh: solid.tessellate(&TessellationParams::default()).unwrap(),
             roles: swept.faces,
         }
@@ -369,7 +369,7 @@ fn a_circle_turns_into_a_torus_about_any_axis() {
                     .position(|r| matches!(r, SweptFace::Side { .. }))
                     .unwrap();
                 (
-                    swept.prism.volume(1e-9).unwrap(),
+                    swept.prism.volume(1e-8).unwrap(),
                     faces[side].surface.clone(),
                     faces.len(),
                 )
@@ -434,8 +434,8 @@ fn a_solids_face_turns_about_its_own_edge() {
             .union(swept.prism.try_clone().unwrap())
             .unwrap();
         assert!(joined.is_manifold().unwrap());
-        let added = joined.volume(1e-9).unwrap() - 6000.0;
-        assert!(close(added, swept.prism.volume(1e-9).unwrap()), "{added}");
+        let added = joined.volume(1e-8).unwrap() - 6000.0;
+        assert!(close(added, swept.prism.volume(1e-8).unwrap()), "{added}");
         let sides_from: Vec<[f64; 3]> = swept
             .faces
             .iter()
@@ -444,7 +444,7 @@ fn a_solids_face_turns_about_its_own_edge() {
                 _ => None,
             })
             .collect();
-        (swept.faces, swept.prism.volume(1e-9).unwrap(), sides_from)
+        (swept.faces, swept.prism.volume(1e-8).unwrap(), sides_from)
     });
     assert_eq!(roles.len(), 5);
     // Pappus: a 20 × 30 face whose centroid is 10 from the axis.

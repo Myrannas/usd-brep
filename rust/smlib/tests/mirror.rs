@@ -301,7 +301,7 @@ fn a_mirror_keeps_every_surface_analytic_and_every_label() {
         for (name, make) in makers {
             let before = make(k);
             let faces = before.faces().unwrap();
-            let volume = before.volume(1e-9).unwrap();
+            let volume = before.volume(1e-8).unwrap();
             for (point, normal) in PLANES {
                 let n = unit(normal);
                 let mut mirrored = make(k);
@@ -321,7 +321,7 @@ fn a_mirror_keeps_every_surface_analytic_and_every_label() {
                 assert_eq!(face_labels(&after), face_labels(&faces), "{name}");
                 assert_eq!(edge_labels(&mirrored), edge_labels(&before), "{name}");
                 assert_eq!(mirrored.tolerance().unwrap(), before.tolerance().unwrap());
-                let error = relative(mirrored.volume(1e-9).unwrap(), volume);
+                let error = relative(mirrored.volume(1e-8).unwrap(), volume);
                 println!("  volume {error:e} relative");
                 assert!(error < 1e-6, "{name}: {error:e}");
                 for (was, is) in faces.iter().zip(&after) {
@@ -424,7 +424,7 @@ fn a_mirrored_solid_faces_out() {
         let params = TessellationParams::default();
         for (name, make) in [("part", part as fn(&Kernel) -> Brep), ("ring", ring)] {
             let before = make(k);
-            let volume = before.volume(1e-9).unwrap();
+            let volume = before.volume(1e-8).unwrap();
             let mesh = before.tessellate(&params).unwrap();
             for (point, normal) in PLANES {
                 let n = unit(normal);
@@ -531,7 +531,7 @@ fn sorted_kinds(solid: &Brep) -> Vec<&'static str> {
 fn half_mirrored_and_joined_is_the_whole() {
     on_kernel(|k| {
         let whole = bracket(k);
-        let volume = whole.volume(1e-9).unwrap();
+        let volume = whole.volume(1e-8).unwrap();
         assert!(sorted_kinds(&whole).contains(&"other"));
         // The half on +x, mirrored across x = 0 and joined back.
         let keep = Brep::cuboid(k, [0.0, -100.0, -100.0], [200.0, 200.0, 200.0]).unwrap();
@@ -552,7 +552,7 @@ fn half_mirrored_and_joined_is_the_whole() {
             whole.face_count()
         );
         assert!(joined.is_manifold().unwrap());
-        let error = relative(joined.volume(1e-9).unwrap(), volume);
+        let error = relative(joined.volume(1e-8).unwrap(), volume);
         println!("volume {error:e} from the whole");
         assert!(error < 1e-8, "{error:e}");
         // The faces cut at x = 0 met their mirrored copies and closed up: one
@@ -587,7 +587,7 @@ fn later_operations_take_a_mirrored_solid() {
     on_kernel(|k| {
         let mut mirrored = part(k);
         mirrored.mirror([0.0; 3], [1.0, 0.0, 0.0]).unwrap();
-        let volume = mirrored.volume(1e-9).unwrap();
+        let volume = mirrored.volume(1e-8).unwrap();
         // The bore, now at x = 80, takes a fillet on its bottom rim, found
         // by the label it had before.
         let rim = EdgeQuery::OnCircle {
@@ -623,7 +623,7 @@ fn later_operations_take_a_mirrored_solid() {
             )
             .unwrap();
         assert!(rounded.is_manifold().unwrap());
-        assert!(rounded.volume(1e-9).unwrap() < volume);
+        assert!(rounded.volume(1e-8).unwrap() < volume);
         // A chamfer round the mirrored top's edges, a hole through a
         // mirrored round, and a face pushed out.
         let top = EdgeQuery::MidpointOnPlane {
@@ -645,7 +645,7 @@ fn later_operations_take_a_mirrored_solid() {
         let hole = Brep::cylinder(k, [190.0, 140.0, -200.0], 6.0, 400.0).unwrap();
         let cut = mirrored.try_clone().unwrap().difference(hole).unwrap();
         assert!(cut.is_manifold().unwrap());
-        assert!(cut.volume(1e-9).unwrap() < volume);
+        assert!(cut.volume(1e-8).unwrap() < volume);
         let back = mirrored
             .find_faces(
                 &smlib::FaceQuery::Facing {
@@ -669,15 +669,15 @@ fn later_operations_take_a_mirrored_solid() {
                 &tolerance,
             )
             .unwrap();
-        let expected = was.offset_faces(&back, 5.0).unwrap().volume(1e-9).unwrap();
-        let error = relative(pushed.volume(1e-9).unwrap(), expected);
+        let expected = was.offset_faces(&back, 5.0).unwrap().volume(1e-8).unwrap();
+        let error = relative(pushed.volume(1e-8).unwrap(), expected);
         assert!(error < 1e-7, "{error:e}");
         // And a copy mirrored across a plane beside the part joins it as a
         // second lump.
         let mut beside = part(k);
         beside.mirror([300.0, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap();
         let both = part(k).union(beside).unwrap();
-        let error = relative(both.volume(1e-9).unwrap(), 2.0 * volume);
+        let error = relative(both.volume(1e-8).unwrap(), 2.0 * volume);
         assert!(error < 1e-8, "{error:e}");
     });
 }
@@ -723,8 +723,8 @@ fn copies_apart_combine_without_a_boolean() {
         }
         assert!(tool.is_manifold().unwrap());
         assert_eq!(tool.face_count(), 36);
-        let each = boss().volume(1e-9).unwrap();
-        let error = relative(tool.volume(1e-9).unwrap(), 12.0 * each);
+        let each = boss().volume(1e-8).unwrap();
+        let error = relative(tool.volume(1e-8).unwrap(), 12.0 * each);
         // The integrator, on copies turned to other angles.
         assert!(error < 1e-8, "{error:e}");
         // Every copy keeps its labels.
@@ -739,8 +739,8 @@ fn copies_apart_combine_without_a_boolean() {
         assert!(once.is_manifold().unwrap());
         assert_eq!(once.face_count(), each_in_turn.face_count());
         let error = relative(
-            once.volume(1e-9).unwrap(),
-            each_in_turn.volume(1e-9).unwrap(),
+            once.volume(1e-8).unwrap(),
+            each_in_turn.volume(1e-8).unwrap(),
         );
         assert!(error < 1e-8, "{error:e}");
     });

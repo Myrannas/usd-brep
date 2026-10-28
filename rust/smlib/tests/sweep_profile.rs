@@ -182,7 +182,7 @@ fn sweep(
             surfaces: faces.iter().map(|f| f.surface.clone()).collect(),
             labels_absent: faces.iter().all(|f| f.label.is_none()),
             manifold: solid.is_manifold().unwrap(),
-            volume: solid.volume(1e-9).unwrap(),
+            volume: solid.volume(1e-8).unwrap(),
             mesh: solid.tessellate(&TessellationParams::default()).unwrap(),
         })
     })
@@ -457,15 +457,15 @@ fn along(x: [f64; 3], y: [f64; 3], profile: Vec<PlaneCurve>) -> Along {
                 }
             }
         }
-        let before = part.volume(1e-9).unwrap();
+        let before = part.volume(1e-8).unwrap();
         let groove = swept.solid.try_clone().unwrap();
         let cut = part.difference(groove).unwrap();
         Along {
             roles: swept.faces.clone(),
             manifold: swept.solid.is_manifold().unwrap(),
-            volume: swept.solid.volume(1e-9).unwrap(),
+            volume: swept.solid.volume(1e-8).unwrap(),
             floor: range,
-            removed: before - cut.volume(1e-9).unwrap(),
+            removed: before - cut.volume(1e-8).unwrap(),
             cut_manifold: cut.is_manifold().unwrap(),
         }
     })

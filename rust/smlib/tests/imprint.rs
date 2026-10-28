@@ -88,7 +88,7 @@ fn top_face_pieces(brep: &Brep) -> Vec<usize> {
 fn a_tool_splits_the_faces_it_crosses_and_changes_nothing_else() {
     on_kernel(|k| {
         let before = block(k);
-        let volume = before.volume(1e-9).unwrap();
+        let volume = before.volume(1e-8).unwrap();
         let Imprint {
             brep,
             edges,
@@ -96,7 +96,7 @@ fn a_tool_splits_the_faces_it_crosses_and_changes_nothing_else() {
         } = before.imprint(through_top(k)).unwrap();
 
         assert!(brep.is_manifold().unwrap());
-        assert!((brep.volume(1e-9).unwrap() - volume).abs() < 1e-6 * volume);
+        assert!((brep.volume(1e-8).unwrap() - volume).abs() < 1e-6 * volume);
         assert!(inside.is_empty(), "a plain imprint doesn't classify");
         // The top is split into the square and the rest round it; the square's
         // four sides are new edges.
@@ -361,12 +361,12 @@ fn a_panel_steps_out_and_in_from_the_rest_of_its_face() {
     on_kernel(|k| {
         for distance in [3.0, -3.0] {
             let (solid, square) = panel(k);
-            let volume = solid.volume(1e-9).unwrap();
+            let volume = solid.volume(1e-8).unwrap();
             let label = solid.faces().unwrap()[square].label.clone();
             let moved = solid.offset_faces(&[square], distance).unwrap();
 
             assert!(moved.is_manifold().unwrap());
-            let change = moved.volume(1e-9).unwrap() - volume;
+            let change = moved.volume(1e-8).unwrap() - volume;
             assert!(
                 (change - 200.0 * distance).abs() < 1e-3,
                 "{distance}: {change}"
@@ -415,11 +415,11 @@ fn a_piece_reaching_the_edge_steps_beside_the_imprint_and_stretches_the_sides() 
                 labels
             };
             let before = labels(&solid);
-            let volume = solid.volume(1e-9).unwrap();
+            let volume = solid.volume(1e-8).unwrap();
             let moved = solid.offset_faces(&[piece], distance).unwrap();
 
             assert!(moved.is_manifold().unwrap());
-            let change = moved.volume(1e-9).unwrap() - volume;
+            let change = moved.volume(1e-8).unwrap() - volume;
             assert!(
                 (change - 3500.0 * distance).abs() < 1e-3,
                 "{distance}: {change}"
@@ -441,11 +441,11 @@ fn both_pieces_moved_together_need_no_step() {
     on_kernel(|k| {
         let (solid, _) = panel(k);
         let top = top_face_pieces(&solid);
-        let volume = solid.volume(1e-9).unwrap();
+        let volume = solid.volume(1e-8).unwrap();
         let moved = solid.offset_faces(&top, 3.0).unwrap();
         assert!(moved.is_manifold().unwrap());
         assert_eq!(moved.face_count(), 7);
-        assert!((moved.volume(1e-9).unwrap() - volume - 18000.0).abs() < 1e-3);
+        assert!((moved.volume(1e-8).unwrap() - volume - 18000.0).abs() < 1e-3);
     });
 }
 
@@ -601,7 +601,7 @@ fn a_push_through_keeps_an_imprint_on_the_faces_it_merges() {
             )
             .unwrap();
         assert_eq!(part.offset_obstacles(&front, -30.0).unwrap().len(), 2);
-        let volume = part.volume(1e-9).unwrap();
+        let volume = part.volume(1e-8).unwrap();
         let moved = part.offset_faces(&front, -30.0).unwrap();
         assert!(moved.is_manifold().unwrap());
         assert_eq!(lid(&moved), 2, "the panel is still apart from the lid");
@@ -610,7 +610,7 @@ fn a_push_through_keeps_an_imprint_on_the_faces_it_merges() {
         assert_eq!(outline.count(), 4);
         // What the push took: a slab of the box, less its rounds, and what it
         // cut off the bosses.
-        assert!(moved.volume(1e-9).unwrap() < volume - 30.0 * 400.0 * 265.0 + 1.0);
+        assert!(moved.volume(1e-8).unwrap() < volume - 30.0 * 400.0 * 265.0 + 1.0);
     });
 }
 
@@ -684,11 +684,11 @@ fn merging_an_imprint_off_one_round_leaves_a_panel_on_another_as_it_was() {
         assert_eq!(after.uv_max, before.uv_max);
         assert!((part.face_centroid(after.index).unwrap().area - area).abs() < 1e-9 * area);
         // And a later join over it works.
-        let volume = part.volume(1e-9).unwrap();
+        let volume = part.volume(1e-8).unwrap();
         let joined = part
             .union(Brep::cuboid(k, [190.0, 140.0, 40.0], [30.0, 30.0, 20.0]).unwrap())
             .unwrap();
         assert!(joined.is_manifold().unwrap());
-        assert!(joined.volume(1e-9).unwrap() > volume);
+        assert!(joined.volume(1e-8).unwrap() > volume);
     });
 }

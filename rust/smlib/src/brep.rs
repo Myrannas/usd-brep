@@ -276,9 +276,9 @@ impl Brep {
         Ok(manifold != 0)
     }
 
-    /// The enclosed volume (`SmApiBrepComputeVolume`). The kernel clamps
-    /// `relative_accuracy` to [1e-8, 1e-1]; tighter is slower but avoids the
-    /// known error on faces trimmed by circles (KNOWN_ISSUES.md).
+    /// The enclosed volume (`SmApiBrepComputeVolume`), to `relative_accuracy`
+    /// as asked: since 1.0.1 the kernel no longer clamps it to [1e-8, 1e-1],
+    /// and below about 1e-8 it can fail on curved faces (`SM_ERR`).
     pub fn volume(&self, relative_accuracy: f64) -> Result<f64, Error> {
         const OP: &str = "SmApiBrepComputeVolume";
         check_positive(
@@ -1890,9 +1890,8 @@ impl Brep {
     /// reports success.
     ///
     /// The brep is consumed: on failure the kernel may have half-modified it,
-    /// so it is dropped. There is no undo; the kernel's `SmApiRemoveFillet`
-    /// does nothing (KNOWN_ISSUES.md), so rebuild from the unfilleted solid
-    /// instead.
+    /// so it is dropped. There is no undo: rebuild from the unfilleted solid
+    /// (the kernel's `SmApiRemoveFillet` works since 1.0.1, but isn't bound).
     pub fn fillet(self, blends: &[EdgeBlend], options: &FilletOptions) -> Result<Brep, Error> {
         const OP: &str = "SmApiFilletEdgesPerEdge";
         if blends.is_empty() {

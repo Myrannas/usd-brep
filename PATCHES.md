@@ -5,43 +5,50 @@ it can. Any change to files under `source/` is one commit per fix, listed here
 against the issue it addresses (a `KNOWN_ISSUES.md` entry or a bug we found), so
 upstream merges stay easy to review.
 
-Base: upstream `v1.0.0` (`c9c5979`).
+Base: upstream `v1.0.1` (`3fd5b95`), merged at `0a9b657`. The fork started
+from `v1.0.0` (`c9c5979`).
 
 | Commit | Files | Issue | Change |
 |---|---|---|---|
 | `a81ed1b` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: in a local operation, `ExtendTrimEdges` lifts a tangent edge from whichever side pointer order picks, which for a face that kept its surface is the old edge; the solid comes out open. | For `SM_OO_LOCAL_OPERATION`, lift from the side whose lifted midpoint lies on the other side's new surface, measured to the whole surface (exact for analytic surfaces and planar B-splines), not the G1-extended one. |
 | `fdc9c9b` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: when the curve replacing an open edge is closed (a plane meeting a sphere), `MateEdges` keeps the trim interval inside the curve's parameter range, which can be the far arc: an inside-out solid with no gaps. | Keep the arc nearer the original edge, re-anchoring the 3D and UV curves when it runs past the curve's seam, and only if they still agree. |
 | `c282328` | `SmOffsetGeometryCreation.cpp` | Found offsetting faces: `TrimExtendedEdge` trims against a not-yet-mated tangent neighbour's old UV curve, which in a local operation can describe the old corner. | For `SM_OO_LOCAL_OPERATION`, also offer the base vertex as a trim point when it lies on the new curve; the shim moves vertices it can place there for the operation. |
-| `a9a7a28` | `SmOffsetExecutive.cpp` | Found offsetting faces: `DoExtendedOffset` mates edges in the order of `m_vEUToEU`, an `unordered_map` keyed by edgeuse addresses, which also picks each edge's target side; the same offset gave different last digits, vertices and trim curves from one process to the next. | For `SM_OO_LOCAL_OPERATION`, mate them in the original brep's order: its edges in turn, each edge's edgeuses in turn. |
 | `4d13c5e` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: `Phase1SetupBrep` builds every face's surface cache and splits every edge, so a small edit still pays for the whole solid's edge preparation. | Add `SmTess::Phase1SetupFaces`, which sets up only the faces given (with caches for the faces sharing their edges, which split only those edges) exactly as `Phase1SetupBrep` would, and reports refinement or anything `Phase1SetupBrep` would recover from; and a `SplitFaceEdgesToUVSize` overload that splits only edges shared with given faces. Existing calls are unchanged. |
 | `7efc9ef` | `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: a face's surface cache, often the largest part of setting it up, is built again every tessellation though it depends only on the surface and the parameters. | `Phase1SetupFaces` takes an optional `SmTessSrfCacheStore`: faces take its caches for identical surfaces, and faces set up only to split shared edges leave theirs there. `SmTessSrfCache::SetFace` moves a cache to another face and tessellation. |
 | `76a3dbc` | `SmMemBlockMgr.h`, `SmTess.h`, `SmTess.cpp` | Found keeping tessellated faces across rebuilds: Phase 2 subdivides and labels a face's surface cache, so a kept cache serves one face once, and faces whose surfaces stay while their boundaries move (beside a dragged fillet) build theirs in every tessellation. | Add `SmTessSrfCache::Copy`, a deep copy of a cache as `BuildTree` leaves it: the tree's node and node-data blocks byte for byte with their pointers mapped (`SmMemBlockMgr::CopyFrom`), B-spline subdivision surfaces with their exact knots; NULL for a cache holding anything else. `Phase1SetupFaces` gives the faces it tessellates copies and leaves originals in the store, which also gets copies of caches it builds when `SmTessSrfCacheStore::WantsCopy` says to. `SetFace` repoints nodes from the old face's surface to the new one's. |
 | `a9b66ee` | `SmBrep.cpp` | Found imprinting: `RemoveTopologicalEdgesAndVertices` tests each edge with `SmEdge::IsTopological`, which can expand one face's surface to cover the other's as a side effect, before it looks for the edge in the keep list. An edge kept between two pieces of a curved face (a panel imprinted on a crate's round, merged back off the round at the other end) leaves a piece on the stretched surface: its box grows by 12 mm, its area integral fails and a later union over it fails with `SM_ERR`. | Look for each edge in the keep list before testing it. Without a keep list the merge runs as before. |
 | `cd41f50` | `SmTorus.cpp` | Found revolving: `SmTorus::IsNurbSurfaceTorus` snaps the generator circle's start and end angles to 0 and 360 only within `SM_EFF_ZERO` (1e-12 degrees). A circle revolved a whole turn on a tilted plane came out with both 2.7e-12 degrees off zero, and the torus got an empty (u, v) domain. | Snap within `SM_EFF_ZERO_DEG` and turn an end no further than the start into a whole turn, as `RebuildSTEPFromNURBParameters` in the same file does. Nothing in the kernel calls it (its call in `CopyAndAddAnalytics` is commented out); the shim's revolve does. |
 | `c7639c2` | `SmTorus.cpp` | Found piping and revolving: `SmTorus::IsNurbSurfaceTorus` took the major radius as the distance between the first parallel circle's centre and the generator circle's, too long whenever that circle isn't the equator (a pipe bent round 10 came back a torus of 11.18), and the generator's start and end angles unsigned, so a point below the torus's plane read as one above and the torus ran half a turn round the tube from its surface. | Drop the height between the centres, and sign the angles towards the torus's z axis, the generator circle's y axis. Of 30 circles revolved about axes every way on two planes, 22 were recognised before and 30 after. |
-| `0afdfdb` | `SmOffsetExecutive.cpp` | Found hollowing: `a9a7a28` put a local operation's edges in the brep's order but left solid offsets, which shells are, on the edgeuses' addresses. The same shell came out differently from one process to the next: a box with its top's rim rounded hollowed to 41034, 42223 or 43578 mm³, and a box rounded on every edge failed in one run and not the next. | Mate a solid offset's edges in the original brep's order too (`sm_SortInBrepOrder`). Three runs of each give the same result. |
 | `23281a6` | `SmBSplineSurface.h`, `SmBSplineSurfaceNLib.cpp` | Found sweeping grooves off one plane: `SmBSplineSurface::CreateSweepSurface` starts the section's frame from any vector square to the trajectory's start tangent (`MakeUnitOrthoVectors`) and gives `N_CreateSweepScale` no orientation curve, so a profile swept along a path across a round has no way to stay square to the surface. `N_CreateSweepScale` takes one (`curZ`), but nothing outside NLib reaches it. | Add `SmBSplineSurface::CreateOrientedSweepSurface`, which passes an orientation curve as `curZ`, the section given in the local frame (x along the trajectory, z along the curve), cubic along the sweep. Only adds a method; the shim's `sweep_profile_along` calls it. |
 
-`source/SM_API` is unmodified. Each offset patch before `0afdfdb` changes only
+Dropped at the 1.0.1 merge: `a9a7a28` and `0afdfdb`, which mated a local
+operation's and a solid offset's edges in the original brep's order
+(`sm_SortInBrepOrder`, its edges in turn) rather than by the edgeuses'
+addresses. Upstream 1.0.1 fixed the same nondeterminism for every extended
+offset (`sm_OrderEdgeusesByBrep`: the brep's faces, their faceuses and
+loops, reversed; GitHub #10 and #21), and the merge takes its
+`SmOffsetExecutive.cpp` whole.
+
+`source/SM_API` is unmodified. Each offset patch changes only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
-offset), and `0afdfdb` sorts solid offsets' mating the same way. The
-tessellation patches only add methods and a class (`SmMemBlockMgr` gains a
-block copy and block accessors): `SmApiTessellate` and `Phase1SetupBrep`
-take the code paths they always did. The merge patch changes only merges
+offset). The tessellation patches only add methods and a class
+(`SmMemBlockMgr` gains a block copy and block accessors): `SmApiTessellate`
+and `Phase1SetupBrep` take the code paths they always did, and 1.0.1's
+faster tessellation is in the triangulation after them (loop nesting and
+joining holes), which `Phase1SetupFaces` leaves alone. The merge patch changes only merges
 given a keep list: `RemoveTopologicalEdgesAndVertices()` without one, as
 every boolean's post-process and `Brep::merge_faces` call it, is as it was.
 The torus patches change only `SmTorus::IsNurbSurfaceTorus`, which only the
-shim calls. Patch `0afdfdb` changes only solid offsets
-(`SM_OO_SOLID_OFFSET`), which only the shim's shell makes. Patch `23281a6`
-only adds a method.
+shim calls. Patch `23281a6` only adds a method.
 
 ## Notes from the bring-up (no patch needed)
 
 - `SmTopologySweep.cpp:1773` triggers `-Wmisleading-indentation`: an `if`
   around `SetSame(pE, pSweptEdge)` was commented out and the statement kept its
   indentation. Harmless, and the only compiler warning in the kernel build.
-- `SmApiCreateCylinder` builds an `SmCone` with a zero semi-angle, not an
-  `SmCylinder`; the shim reports it as a cylinder via `SmCone::IsCylinder()`.
+- `SmApiCreateCylinder` built an `SmCone` with a zero semi-angle before
+  1.0.1, which builds an `SmCylinder`; the shim reports either as a cylinder
+  (`SmCone::IsCylinder()`), and the analytic sweeps still make cones.
 - `SmApiCreateContext` is the only setup call needed; neither TBB nor USD is
   linked on macOS.
 
@@ -102,10 +109,10 @@ change was needed.
   face's edge curves, so its side faces have no link back to the edges they
   came from. The shim's `sm_brep_sweep_face` finds each side's source edge by
   where its start edge lies.
-- `SmApiFaceComputeCentroid` clamps its relative accuracy to 1e-4, which puts
-  a hole placed at a face's centroid up to a few hundredths of a millimetre
-  off on a 500 mm face. The shim calls `SmFace::ComputePreciseProperties`
-  directly at 1e-7.
+- `SmApiFaceComputeCentroid` clamped its relative accuracy to 1e-4 before
+  1.0.1, which put a hole placed at a face's centroid up to a few hundredths
+  of a millimetre off on a 500 mm face. The shim calls
+  `SmFace::ComputePreciseProperties` directly at 1e-7, as it did.
 - `SmSurface::IsPlanar`'s normal comes from a bounding pseudo-box and can face
   either way, so the shim evaluates a planar face's normal from its surface
   and orients it out of the solid by region, as `outward_normal` does.
@@ -137,7 +144,7 @@ but not much else. What goes wrong, and what the shim
   been mated yet, follow the executive's mating order, so results varied with
   distances. Patch `a81ed1b` fixes the side. The order itself was the
   edgeuses' addresses, so results varied between runs too (ASLR); patch
-  `a9a7a28` puts it in the brep's order.
+  `a9a7a28` put it in the brep's order, as upstream's 1.0.1 does now.
 - Edges re-intersected when nothing about them changed shape lose precision,
   and fail where two equal fillets meet at a corner: their mitre ends at the
   corner of the face they round, where the cylinders touch tangentially, a
@@ -191,7 +198,7 @@ sides and tops, a frustum's side both ways, a countersink, a sphere-cut box's
 sphere faces moved out, a torus. A hole's seam under a pocket floor moved
 either way comes out bit for bit as in the part built at its new depth. Every
 outcome came out bit-identical in six processes once patch `a9a7a28` fixed the
-mating order; before it, the sphere-cut box and a top-rounded box moved at its
+mating order (upstream's order replaces it since 1.0.1); before it, the sphere-cut box and a top-rounded box moved at its
 top and walls varied in the last digits. Refused cleanly: fillets sliding along
 drafted walls (the result tessellates right but its own volume is 20-30% off),
 a sphere-cut box with its sphere faces moved in or its top moved up (the
@@ -203,9 +210,10 @@ turns a `FaceQuery` into indices. An offset changes no topology, so every face
 and edge keeps its label, attribute and all: the moved faces, the blends that
 ride with them and the faces that stretch (`tests/labels.rs`). A drafted wall
 is a B-spline surface whose control points share a plane, which
-`SmSurface::IsPlanar` can't confirm below about 1e-5, so `outward_plane` (the
-labels work's planar-face normal) also accepts what the offset's `plane_of`
-does.
+`SmSurface::IsPlanar` couldn't confirm below about 1e-5 before 1.0.1, so
+`outward_plane` (the labels work's planar-face normal) also accepted what the
+offset's `plane_of` does; since 1.0.1 it confirms one at 1e-7, and
+`outward_plane` asks it alone.
 
 ## Notes from the rebuild trims (no patch needed)
 
@@ -232,8 +240,11 @@ that already varied from run to run.
     scores it 6e-2; every valid result in the tests scores 2.6e-4 or less
     (a torus; 3.5e-5 for everything else), and the old test still refuses it.
   - Each face's volume is integrated alone (`SM_PPF_VOLUME`), not with every
-    moment. The integrator's step control follows the area whatever is asked
-    for, so the volume is bit for bit what `SmApiBrepComputeVolume` gives.
+    moment. Before 1.0.1 the integrator's step control followed the area
+    whatever was asked for, so the volume was bit for bit what
+    `SmApiBrepComputeVolume` gives; since, it holds each property asked for
+    to the accuracy, so the two agree to the accuracy, and the volume alone
+    costs less than `SmApiBrepComputeVolume`'s every moment.
 - `Brep::edges` no longer integrates each edge's exact length
   (`SmApiEdgeComputeLength`, an ODE per edge), which nothing read and which
   was 9% of the rebuild. `Brep::edge_length` integrates one edge's on demand.
@@ -409,7 +420,7 @@ steps are shim and Rust only. What the shim relies on:
 
 Revolve, Draft, Pipe and Hollow, for game-cad's features of those names.
 Shim and Rust only, apart from the torus patches (`cd41f50`, `c7639c2`) and
-the shell's mating order (`0afdfdb`).
+the shell's mating order (`0afdfdb`, upstream's since 1.0.1).
 
 ### Revolve
 
@@ -589,7 +600,7 @@ offset from a face, or a new face from none.
   is a rim) and gets the real label back; one `thickness` in is its inner
   face and has none, nor do its edges; a face with no index is new.
 - The same shell came out differently from one process to the next until
-  patch `0afdfdb`.
+  patch `0afdfdb`, and since 1.0.1 upstream's own order keeps it the same.
 - The result must be a manifold solid whose faces' integrals agree with
   their edges (`volume_agrees`, as Offset Face checks): a box with its
   top's rim rounded 4, opened at the top and hollowed 2, came back with a
@@ -1120,3 +1131,55 @@ line along its normal makes them, its y following the faces' normal.
   diagonal at 1e-3 (`SIGSEGV` in `SmApiBooleanDifference`, at
   `sm_WhichPVToCombine`); at 1e-2 it cut, leaving slivers of its walls.
   Profiles run on past the surface are fine.
+
+## Notes from the 1.0.1 merge
+
+Upstream's 1.0.1 (`3fd5b95`) merged at `0a9b657` with one conflict, in
+`SmOffsetExecutive.cpp`, where upstream's `sm_OrderEdgeusesByBrep` replaces
+`a9a7a28` and `0afdfdb` (above). Four more files both sides touched merged
+cleanly and don't meet:
+
+- `SmOffsetGeometryCreation.cpp`: upstream's fix is in `EdgeuseOffset`, for
+  a shell's open face meeting an offset face tangentially; ours are in
+  `ExtendTrimEdges`, `MateEdges` and `TrimExtendedEdge`, for local
+  operations, and `fdc9c9b`'s nearer arc, which a shell's mating takes as
+  before.
+- `SmBrep.cpp`: upstream's changes are in `DeleteFace`, `RefreshGaps`,
+  `RefreshTols` and seam insertion (`MakeEdgeInFaceWithVU` and its
+  helpers), far from `RemoveTopologicalEdgesAndVertices` (`a9b66ee`).
+- `SmBSplineSurfaceNLib.cpp`: upstream fixed `TrimWithDomain`'s upper V
+  knot snap; `23281a6` only adds a method.
+- `SmTess.cpp`: upstream's speed-up is in the triangulation (loop nesting by
+  precomputed points and boxes, joining holes through a grid, checking only
+  the best corner for inside vertices), after `Phase1SetupBrep`, which
+  `Phase1SetupFaces` copies; neither touches the other's functions.
+
+What 1.0.1 changes for the shim and its callers:
+
+- **Volume accuracy.** `SmApiBrepComputeVolume` no longer clamps its
+  relative accuracy to [1e-8, 1e-1], so a test that asked 1e-9 now gets it
+  and fails on drafted cones (`SM_ERR`); the tests ask the 1e-8 they were
+  getting. Each trim curve's knot spans integrate apart and every property
+  is held to the accuracy, so the volume costs more:
+  `SmApiBrepComputeVolume` integrates every moment.
+- **Fillets sliding along drafted walls** (the face offset's refusal test)
+  come out exact, -1.8e-8 off the part built at its new height to 1e-7,
+  where the volume was 20-30% off: the faces' integrals were wrong, not the
+  faces. Their volume can't be integrated to 1e-8 (`SM_ERR`).
+- **Planar NURBS.** `SmSurface::IsPlanar` bounds the surface without the
+  zone-tolerance padding, so it confirms a flat NURBS at small tolerances:
+  `outward_plane` no longer falls back to `plane_of` (a tapered prism's
+  walls get their normals at 1e-7), and fillets on a prism with planar
+  NURBS walls (`Brep::tapered_prism`) come out cylinders and spheres, not
+  NURBS.
+- **Distances.** `SmApiBrepRelationship` (`Brep::relationship`) measures
+  `Brep::cylinder`s side by side exactly, now `SmCylinder`s, where their
+  distance fell short (`tests/transform_bodies.rs`).
+- **Shells.** An opening that meets a round tangentially (a box's top with
+  its rim rounded 4) hollows now: each inside round, `4 - t`, stops where it
+  turns level and a new upright face on the round's axis closes the wall up
+  to the opening, so the wall is as thick as the round there
+  (`tests/shell.rs`, the volume to 1e-6 of that shape at 1, 2 and 3).
+  `SmApiShellBrepFull` returns an error rather than crashing when an inward
+  shell exactly closes the cavity.
+- `SmApiCreateCylinder` builds an `SmCylinder` (the bring-up notes, above).

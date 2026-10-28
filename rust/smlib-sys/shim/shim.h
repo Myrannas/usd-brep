@@ -351,7 +351,8 @@ sm_status sm_brep_intersection(sm_brep *a, sm_brep *b, sm_brep **out);
 /* SmApiBrepIsManifoldSolid. */
 sm_status sm_brep_is_manifold_solid(const sm_brep *brep, int32_t *out);
 
-/* SmApiBrepComputeVolume; relative_accuracy is clamped to [1e-8, 1e-1]. */
+/* SmApiBrepComputeVolume, to relative_accuracy as asked (clamped to
+ * [1e-8, 1e-1] before 1.0.1). */
 sm_status sm_brep_volume(const sm_brep *brep, double relative_accuracy, double *out);
 
 /* Face and edge counts of the brep's own lists. */
@@ -398,7 +399,7 @@ sm_status sm_brep_face_geometry(const sm_brep *brep, sm_face_geometry *out, size
 
 /* The area and area centroid of the trimmed face at an index of the brep's
  * face list, integrated to relative_accuracy (clamped to [1e-10, 1e-1];
- * SmApiFaceComputeCentroid stops at 1e-4). On a planar face the centroid lies
+ * SmApiFaceComputeCentroid stopped at 1e-4 before 1.0.1). On a planar face the centroid lies
  * in the face's plane, though not necessarily inside the face. */
 sm_status sm_brep_face_centroid(const sm_brep *brep, size_t face, double relative_accuracy, double *area,
                                 double centroid[3]);

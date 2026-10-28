@@ -178,7 +178,7 @@ fn draft(frame: Frame, loops: Vec<Vec<BoundaryCurve>>, distance: f64, draft_deg:
                 .map(|i| solid.face_centroid(i).unwrap().centroid)
                 .collect(),
             manifold: solid.is_manifold().unwrap(),
-            volume: solid.volume(1e-9).unwrap(),
+            volume: solid.volume(1e-8).unwrap(),
             mesh: solid.tessellate(&TessellationParams::default()).unwrap(),
             roles: swept.faces,
         }
@@ -376,12 +376,12 @@ fn a_solids_face_with_a_hole_in_it_leans() {
             })
             .collect();
         let manifold = swept.prism.is_manifold().unwrap();
-        let volume = swept.prism.volume(1e-9).unwrap();
+        let volume = swept.prism.volume(1e-8).unwrap();
         // And joined back on, as an extrude does.
-        let before = part.volume(1e-9).unwrap();
+        let before = part.volume(1e-8).unwrap();
         let joined = part.union(swept.prism).unwrap();
         assert!(joined.is_manifold().unwrap());
-        assert!(close(joined.volume(1e-9).unwrap(), before + volume));
+        assert!(close(joined.volume(1e-8).unwrap(), before + volume));
         (swept.faces, volume, sides_from, manifold)
     });
     assert!(manifold);

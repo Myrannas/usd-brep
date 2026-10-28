@@ -135,7 +135,7 @@ fn sweep(loops: Vec<Vec<BoundaryCurve>>, frame: Frame, distance: f64) -> Swept {
             sides,
             start: centroid(SweptFace::Start),
             end: centroid(SweptFace::End),
-            volume: swept.prism.volume(1e-9).unwrap(),
+            volume: swept.prism.volume(1e-8).unwrap(),
             roles: swept.faces,
         }
     })

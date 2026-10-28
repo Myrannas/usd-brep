@@ -265,6 +265,11 @@ fn kind(surface: &Surface) -> &'static str {
     }
 }
 
+/// How closely a shape's volume is integrated: since 1.0.1 the kernel holds
+/// the volume itself to the accuracy, and can't hold the drafted D's NURBS
+/// side, turned or stretched, to 1e-8 (`SM_ERR`).
+const SHAPE_ACCURACY: f64 = 1e-7;
+
 /// Everything about a solid that a transform should keep or scale.
 #[derive(Debug)]
 struct Shape {
@@ -294,7 +299,7 @@ fn shape(solid: &Brep) -> Shape {
         domains: faces.iter().map(|f| (f.uv_min, f.uv_max)).collect(),
         face_labels: faces.iter().map(|f| f.label.clone()).collect(),
         edge_labels: solid.edges().unwrap().into_iter().map(|e| e.label).collect(),
-        volume: solid.volume(1e-9).unwrap(),
+        volume: solid.volume(SHAPE_ACCURACY).unwrap(),
         manifold: solid.is_manifold().unwrap(),
         inside_out: inside_out(&mesh),
         enclosed: enclosed(&mesh),
@@ -443,7 +448,7 @@ fn every_body_keeps_its_labels_volume_and_outward_faces() {
                     assert!(operation.stretched().is_some(), "{what}: {error}");
                     assert!(before.kinds.contains(&"offset"), "{what}: {error}");
                     assert_eq!(solid.faces().unwrap().len(), before.kinds.len());
-                    assert!(relative(solid.volume(1e-9).unwrap(), before.volume) < 1e-9);
+                    assert!(relative(solid.volume(SHAPE_ACCURACY).unwrap(), before.volume) < 1e-9);
                     refused.push(what);
                     continue;
                 }
@@ -678,7 +683,7 @@ fn copies_apart_combine_and_copies_that_touch_are_refused() {
     on_kernel(|k| {
         for (name, body) in bodies(k) {
             let faces = body.face_count();
-            let volume = body.volume(1e-9).unwrap();
+            let volume = body.volume(1e-8).unwrap();
             // The kernel's bounding box is its faces' surfaces', which can
             // stand off a rounded body; the mesh's vertices lie on it, and
             // reach no further than it does.
@@ -702,7 +707,7 @@ fn copies_apart_combine_and_copies_that_touch_are_refused() {
             pair.combine(&image).unwrap();
             assert!(pair.is_manifold().unwrap(), "{name}");
             assert_eq!(pair.face_count(), 3 * faces, "{name}");
-            let error = relative(pair.volume(1e-9).unwrap(), 3.0 * volume);
+            let error = relative(pair.volume(1e-8).unwrap(), 3.0 * volume);
             assert!(error < 1e-6, "{name}: {error:e}");
             let labels: Vec<_> = pair.faces().unwrap().into_iter().map(|f| f.label).collect();
             assert_eq!(labels[..faces], labels[faces..2 * faces], "{name}");
@@ -735,7 +740,7 @@ fn copies_apart_combine_and_copies_that_touch_are_refused() {
 }
 
 #[test]
-fn the_relationship_query_is_exact_for_planes_and_spheres_and_cautious_for_cylinders() {
+fn the_relationship_query_is_exact_for_planes_spheres_and_cylinders() {
     on_kernel(|k| {
         let block = |x: f64| Brep::cuboid(k, [x, 0.0, 0.0], [10.0, 10.0, 10.0]).unwrap();
         let ball = |x: f64| Brep::sphere(k, [x, 0.0, 0.0], 5.0).unwrap();
@@ -758,15 +763,14 @@ fn the_relationship_query_is_exact_for_planes_and_spheres_and_cautious_for_cylin
                 assert!((found - gap).abs() < 1e-9, "{what} {gap} apart: {found}");
             }
         }
-        // Side by side, a cylinder's distance falls short: never more than
-        // the truth, so what reads as apart is.
+        // Side by side too, since 1.0.1, whose cylinders are SmCylinders
+        // rather than cones of no angle; before, their distance fell short.
         for gap in [0.01, 1.0, 5.0, 10.0, 300.0] {
             let start = Instant::now();
             let found = bolt(0.0, 0.0).relationship(&bolt(16.0 + gap, 0.0)).unwrap();
             let took = start.elapsed();
             match found {
-                Relationship::Apart { gap: found } => assert!(found <= gap, "{gap}: {found}"),
-                Relationship::Touching => {}
+                Relationship::Apart { gap: found } => assert!((found - gap).abs() < 1e-9, "{gap}: {found}"),
                 other => panic!("{gap}: {other:?}"),
             }
             println!("bolts {gap} apart side by side: {found:?} in {took:?}");
@@ -869,7 +873,7 @@ fn patterns_combine_copy_by_copy() {
             let each = copies.into_iter().fold(plate(), |plate, copy| plate.union(copy).unwrap());
             let in_turn = start.elapsed();
             assert_eq!(once.face_count(), each.face_count());
-            assert!(relative(once.volume(1e-9).unwrap(), each.volume(1e-9).unwrap()) < 1e-9);
+            assert!(relative(once.volume(1e-8).unwrap(), each.volume(1e-8).unwrap()) < 1e-9);
             println!(
                 "{name}: combined in {combined:?} (slowest copy {slowest:?}), then one union in {union:?}; \
                  a union per copy {in_turn:?}"
