@@ -49,6 +49,7 @@ mod edges;
 mod error;
 mod faces;
 mod fillet;
+mod freeform;
 mod imprint;
 mod kernel;
 mod label;
@@ -66,6 +67,9 @@ pub use faces::{
     ScaleReport, SurfaceKind, Sweep, SweptFace,
 };
 pub use fillet::{Continuity, CrossSection, EdgeBlend, FilletOptions};
+pub use freeform::{
+    Closest, Curve, CurveShape, FreeSurface, Net, Sheets, Stitched, SurfaceShape, samples,
+};
 pub use imprint::{Imprint, ImprintEdge};
 pub use kernel::Kernel;
 pub use label::{Label, LabelMatch, MAX_ROLE_LEN};

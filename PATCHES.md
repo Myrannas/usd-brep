@@ -1134,6 +1134,63 @@ line along its normal makes them, its y following the faces' normal.
   `sm_WhichPVToCombine`); at 1e-2 it cut, leaving slivers of its walls.
   Profiles run on past the surface are fine.
 
+## Notes from free-form surfaces (no patch needed)
+
+Shim and Rust only (`rust/smlib-sys/shim/freeform.cpp`,
+`rust/smlib/src/freeform.rs`, `rust/smlib/tests/freeform.rs`), from the
+free-form spike (`freeform-spike`, `5df52da`), kept for game-cad's free-form
+work: NURBS curves and surfaces made and read, and faces of them stitched
+into solids. No kernel source changes.
+
+- `Curve`: from poles and a whole knot vector (`SmApiCreateCanonicalCurve`;
+  a rational quarter circle stays on its circle to 1e-9), through points
+  (`SmBSplineCurve::InterpolatePoints`, chord length), a brep's edge's
+  curve as a NURBS trimmed to the edge, a constant curve with another's
+  knots (a cross-boundary derivative), and `ellipse` and `line`. A closed
+  (periodic) curve through points can't bound a planar face
+  (`CreatePlanarFacesWith3DCurves` returns `SM_ERR`), so `samples` caps
+  with clamped rational ellipses.
+- `FreeSurface`: from a control net (`SmBSplineSurface::CreateCanonical`),
+  a loft through sections (`CreateSkinnedSurface`, interpolating, no rails
+  or end derivatives; closed sections make a closed skin with one seam), a
+  Gordon network (`CreateGordonSurface`: chord-length curves aren't
+  parameter-compatible, so a 3 by 3 network on a saddle strays 0.21 mm
+  between its curves), a Coons patch (`CreateCoonsPatch`, bilinear or with
+  cross derivatives), and an N-sided fill (`CreateNSidedPatch`,
+  `N_FillNSidedHole`: N four-sided patches meeting in the middle). Read
+  back: a face's surface, its domain, a point and normal, its shape and its
+  whole control net (`net`: an analytic surface's as
+  `CopyAnalyticAsNurb` makes it), and the point nearest another
+  (`closest_point`, `SmApiSurfaceClosestPoint` over the natural domain, to
+  1e-5 of the foot of a normal on the dome, the tank's rational skin and a
+  cylinder).
+- **The fill isn't a sphere.** Where three rounds of radius r meet, the
+  patches meet the rounds within 0.11° but bulge up to 0.043 r off the
+  sphere the exact corner lies on, whatever cross-boundary derivatives it
+  meets (`n_sided_fill_quality`), and the rounded box, its rounds lofted
+  between arcs through points, is 5.9e-4 bigger by volume than exact.
+  `FreeSurface::fill` says so.
+- `Sheets`: faces from surfaces on their whole domains
+  (`SmBrep::CreateFacesFromSurface`, split where a surface is only C0) and
+  planar faces bounded by curves (`CreatePlanarFacesWith3DCurves`, which
+  makes `SmPlane`s), stitched (`SmBrep::StitchAndOrient`) or stitched into
+  a solid with what it closed (`SmStitch::StitchIntoSolid`). A bilinear
+  Coons patch (degree 1 both ways) can't be added as a face (`SM_ERR`);
+  a cubic net can.
+- **Flat NURBS since 1.0.1.** A flat NURBS face reports its normal as a
+  plane does (`SmSurface::IsPlanar`, no longer padded), so nothing in the
+  spike's shim works round it: a box whose top is a cubic net with no lift
+  reports the top flat and stays a NURBS (`flat_nurbs_faces_are_flat`).
+- `samples`: `domed_box` (a cubic net for a top over planar walls),
+  `lofted_tank` (a loft through ellipses, capped) and `rounded_box` (rounds
+  lofted between arcs, corners filled), for tests. Each closes into a
+  manifold solid first time.
+- On free-form faces, from the spike's survey (`freeform_robustness`,
+  ignored; about five minutes in release): booleans and fillets hold
+  (416 of 417 cases), offsets don't (2 of 16, `SHIM_ERR_BROKE_SOLID`), and
+  shells work on one patch but not across the N-sided fills, taking 27 s
+  each to fail there.
+
 ## Notes from the 1.0.1 merge
 
 Upstream's 1.0.1 (`3fd5b95`) merged at `0a9b657` with one conflict, in

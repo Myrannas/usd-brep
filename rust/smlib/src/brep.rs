@@ -53,6 +53,11 @@ type BooleanFn = unsafe extern "C" fn(
 ) -> sys::sm_status;
 
 impl Brep {
+    /// The shim's handle, for the crate's other modules.
+    pub(crate) fn as_raw(&self) -> *mut sys::sm_brep {
+        self.raw.as_ptr()
+    }
+
     /// Wraps a brep the shim just handed over.
     pub(crate) fn from_raw(operation: &'static str, raw: *mut sys::sm_brep) -> Result<Brep, Error> {
         match NonNull::new(raw) {

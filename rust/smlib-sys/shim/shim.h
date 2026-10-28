@@ -1022,6 +1022,115 @@ void sm_imprint_free(sm_imprint_edge *edges, uint8_t *inside);
  * SM_SHIM_ERR_BAD_EDGE when an index is out of range or repeated. */
 sm_status sm_brep_merge_faces_keeping(sm_brep *brep, const uint32_t *keep, size_t count);
 
+/* ---- Free-form curves and surfaces (freeform.cpp) ----
+ *
+ * NURBS curves and surfaces made from control points or from other curves
+ * (SmBSplineCurve, SmBSplineSurface), made into faces and stitched into a
+ * solid. Curves and surfaces are owned by the caller; every function copies
+ * what it's given, so a caller frees its own. */
+
+/* An SmBSplineCurve, or for an edge's curve whatever kind SMLib made. */
+typedef struct sm_curve sm_curve;
+/* An SmSurface, an SmBSplineSurface for everything made here. */
+typedef struct sm_surface sm_surface;
+
+/* A NURBS curve of the given degree from count poles and its whole knot
+ * vector, count + degree + 1 knots, non-decreasing; weights NULL for a
+ * non-rational one (SmApiCreateCanonicalCurve). */
+sm_status sm_curve_create(int32_t degree, const sm_vec3 *poles, const double *weights, size_t count,
+                          const double *knots, size_t knot_count, sm_curve **out);
+/* A non-rational curve of the given degree through count points,
+ * chord-length parameterised (SmBSplineCurve::InterpolatePoints); closed
+ * makes it run on through the first point again, smoothly. */
+sm_status sm_curve_interpolate(const sm_vec3 *points, size_t count, int32_t degree, int32_t closed,
+                               sm_curve **out);
+/* A copy of the brep's edge's curve as a NURBS, trimmed to the edge and
+ * running from its start vertex to its end. */
+sm_status sm_curve_of_edge(const sm_brep *brep, size_t edge, sm_curve **out);
+/* A curve with the knots and degree of like and every pole at vector: a
+ * constant cross-boundary derivative compatible with it. Fails on a rational
+ * curve. */
+sm_status sm_curve_constant_like(const sm_curve *like, sm_vec3 vector, sm_curve **out);
+sm_status sm_curve_copy(const sm_curve *curve, sm_curve **out);
+/* Turns the curve round, keeping its interval. */
+sm_status sm_curve_reverse(sm_curve *curve);
+sm_status sm_curve_interval(const sm_curve *curve, double *min, double *max);
+/* The point and first derivative at t; derivative may be NULL. */
+sm_status sm_curve_evaluate(const sm_curve *curve, double t, sm_vec3 *point, sm_vec3 *derivative);
+/* Degree, pole count and whether it's rational, for an SmBSplineCurve. */
+sm_status sm_curve_shape(const sm_curve *curve, int32_t *degree, size_t *poles, int32_t *rational);
+void sm_curve_free(sm_curve *curve);
+
+/* A NURBS surface from count_u * count_v poles, u-major (pole (i, j) at
+ * i * count_v + j), and its whole knot vectors; weights NULL for a
+ * non-rational one (SmBSplineSurface::CreateCanonical). */
+sm_status sm_surface_create(int32_t degree_u, int32_t degree_v, const sm_vec3 *poles, size_t count_u, size_t count_v,
+                            const double *weights, const double *knots_u, size_t knot_count_u, const double *knots_v,
+                            size_t knot_count_v, sm_surface **out);
+/* A loft (skin) through count section curves, in order, each a u
+ * isoparameter curve of the result, of degree up to degree along v
+ * (SmBSplineSurface::CreateSkinnedSurface, interpolating). */
+sm_status sm_surface_loft(const sm_curve *const *sections, size_t count, int32_t degree, sm_surface **out);
+/* A Gordon surface through a network of u curves crossing v curves
+ * (SmBSplineSurface::CreateGordonSurface). */
+sm_status sm_surface_gordon(const sm_curve *const *u, size_t u_count, const sm_curve *const *v, size_t v_count,
+                            sm_surface **out);
+/* A Coons patch on four boundary curves, in order round it, each running
+ * on from the last's end; with derivatives (four cross-boundary derivative
+ * curves, into the patch, compatible with their boundaries), a bicubic one
+ * meeting them, else bilinear (SmBSplineSurface::CreateCoonsPatch). */
+sm_status sm_surface_coons(const sm_curve *const *boundary, const sm_curve *const *derivatives, double tolerance,
+                           sm_surface **out);
+/* Fills an N-sided hole bounded by count non-rational curves, in order
+ * round it, each running on from the last's end, with count four-sided
+ * patches meeting at its middle (SmBSplineSurface::CreateNSidedPatch,
+ * N_FillNSidedHole). derivatives, if not NULL, has count cross-boundary
+ * derivative curves into the hole, any of them NULL, met to within
+ * angle_tol_deg. out has room for count surfaces; out_count says how many
+ * it made. */
+sm_status sm_surface_fill(const sm_curve *const *boundary, const sm_curve *const *derivatives, size_t count,
+                          double angle_tol_deg, sm_surface **out, size_t *out_count);
+sm_status sm_surface_domain(const sm_surface *surface, double min[2], double max[2]);
+/* The point and unit normal at (u, v); normal may be NULL. */
+sm_status sm_surface_evaluate(const sm_surface *surface, double u, double v, sm_vec3 *point, sm_vec3 *normal);
+/* Degrees and pole counts of the surface as a NURBS: an SmBSplineSurface as
+ * it is, an analytic surface converted (SmSurface::CopyAnalyticAsNurb). */
+sm_status sm_surface_shape(const sm_surface *surface, int32_t *degree_u, int32_t *degree_v, size_t *poles_u,
+                           size_t *poles_v, int32_t *rational);
+/* The control net of the surface as a NURBS, as sm_surface_shape sizes it:
+ * poles_u * poles_v poles, u-major (pole (i, j) at i * poles_v + j), in
+ * Euclidean coordinates; their weights, all 1 for a non-rational one
+ * (weights may be NULL); and the whole knot vectors, poles + degree + 1
+ * knots each. */
+sm_status sm_surface_net(const sm_surface *surface, sm_vec3 *poles, double *weights, double *knots_u,
+                         double *knots_v);
+/* The point of the surface nearest point, over its natural domain
+ * (SmApiSurfaceClosestPoint): where it is, its (u, v) and how far it is. */
+sm_status sm_surface_closest_point(const sm_surface *surface, sm_vec3 point, sm_vec3 *closest, double uv[2],
+                                   double *distance);
+/* A copy of the brep's face's surface. */
+sm_status sm_surface_of_face(const sm_brep *brep, size_t face, sm_surface **out);
+void sm_surface_free(sm_surface *surface);
+
+/* A brep with nothing in it, to add faces to. */
+sm_status sm_brep_create_empty(sm_brep **out);
+/* Adds a copy of the surface as a face on its whole domain, split where
+ * it's only C0 (SmBrep::CreateFacesFromSurface), each piece labelled with
+ * label if it's not NULL; faces says how many it made. */
+sm_status sm_brep_add_surface(sm_brep *brep, const sm_surface *surface, const sm_label *label, size_t *faces);
+/* Adds a planar face bounded by a closed loop of curves
+ * (SmBrep::CreatePlanarFacesWith3DCurves), labelled with label if it's not
+ * NULL. */
+sm_status sm_brep_add_planar_face(sm_brep *brep, const sm_curve *const *loop, size_t count, const sm_label *label);
+/* Stitches the brep's faces along edges that lie together and orients
+ * them (SmBrep::StitchAndOrient); solid says whether that made a manifold
+ * solid. tolerance <= 0 takes the kernel's. */
+sm_status sm_brep_stitch(sm_brep *brep, double tolerance, int32_t *solid);
+/* SmStitch::StitchIntoSolid, reporting how many edges it glued and the
+ * largest gaps it closed. */
+sm_status sm_brep_stitch_into_solid(sm_brep *brep, int32_t *solid, uint32_t *stitched, double *vertex_gap,
+                                    double *edge_gap);
+
 #ifdef __cplusplus
 }
 #endif
