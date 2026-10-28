@@ -563,6 +563,65 @@ fn refuses_a_chain_over_a_sharp_edge() {
     assert_eq!(reason, "the edges must meet tangentially, not at a sharp edge");
 }
 
+/// A slab 100 across, 30 deep and 20 tall whose top, y = 0 for x < 0,
+/// folds up `fold_deg` past x = 0, a box turned that much about the z axis
+/// joined to one that isn't, imprinted by a level plane at z = 10: the brep
+/// and the two edges along its top, by x.
+fn folded(kernel: &Kernel, fold_deg: f64) -> (Brep, Vec<usize>) {
+    let level = Brep::cuboid(kernel, [-50.0, -30.0, 0.0], [50.0, 30.0, 20.0]).unwrap();
+    let mut turned = Brep::cuboid(kernel, [-5.0, -30.0, 0.0], [55.0, 30.0, 20.0]).unwrap();
+    turned.rotate_about([0.0; 3], [0.0, 0.0, 1.0], fold_deg).unwrap();
+    let slab = level.union(turned).unwrap();
+    let mut tool = Brep::cuboid(kernel, [-100.0, -100.0, -100.0], [200.0, 200.0, 110.0]).unwrap();
+    let mut top = None;
+    for face in tool.faces().unwrap() {
+        if face.normal.is_some_and(|n| n[2] > 0.999) {
+            top = Some(face.index as u32);
+        }
+        let label = Label { feature: 2, role: "box".into(), index: face.index as u32 };
+        tool.set_face_label(face.index, &label).unwrap();
+    }
+    let imprint = slab.imprint(tool).unwrap();
+    let edges = imprint.brep.edges().unwrap();
+    let mut chain: Vec<usize> = imprint
+        .edges
+        .iter()
+        .filter(|e| e.tool_faces.len() == 1 && Some(e.tool_faces[0].index) == top)
+        .map(|e| e.edge)
+        .filter(|&e| edges[e].samples.iter().all(|p| p[1] > -1e-6 && p[0].abs() < 50.0))
+        .collect();
+    let middle = |e: usize| edges[e].samples.iter().map(|p| p[0]).sum::<f64>();
+    chain.sort_by(|&a, &b| middle(a).total_cmp(&middle(b)));
+    assert_eq!(chain.len(), 2);
+    (imprint.brep, chain)
+}
+
+#[test]
+fn runs_on_across_a_crease_within_a_degree() {
+    // Free-form patches stitched a hair off smooth turn an edge crossing
+    // them by as much: a fold of half a degree sweeps, and cuts, as one
+    // groove; one of two is a sharp edge.
+    let (half, two) = on_kernel(|k| {
+        let (part, chain) = folded(k, 0.5);
+        let (profile, area) = square();
+        let swept = part.sweep_profile_along(&chain, &profile, 16, 1e-4).unwrap();
+        let length: f64 = chain.iter().map(|&e| part.edge_length(e).unwrap()).sum();
+        let volume = swept.solid.volume(1e-8).unwrap();
+        assert!(swept.solid.is_manifold().unwrap());
+        assert!((volume - area * length).abs() < 1e-3 * area * length, "{volume} vs {}", area * length);
+        let cut = part.difference(swept.solid).unwrap();
+        let half = cut.is_manifold().unwrap();
+        let (part, chain) = folded(k, 2.0);
+        let two = match part.sweep_profile_along(&chain, &profile, 16, 1e-4) {
+            Err(Error::InvalidArgument { reason, .. }) => reason,
+            other => panic!("{other:?}"),
+        };
+        (half, two)
+    });
+    assert!(half);
+    assert_eq!(two, "the edges must meet tangentially, not at a sharp edge");
+}
+
 /// That the mesh's triangles wind with the kernel's normals and enclose the
 /// solid's volume to 1%.
 fn assert_mesh(mesh: &Mesh, volume: f64) {

@@ -1163,8 +1163,9 @@ impl Brep {
     /// whose path leaves one plane (a diagonal across a round, a line on a
     /// NURBS face). The edges, by index in [`edges`](Brep::edges), run end
     /// to end in order, each either way along its curve, and join
-    /// tangentially, within 1e-3 radians: a chain over a sharp edge of the
-    /// part is refused, since the normal would round its corner. The
+    /// tangentially, within a degree, as patches stitched a hair off smooth
+    /// do: a chain over a sharp edge of the part is refused, since the
+    /// normal would round its corner. The
     /// profile is [`sweep_profile`](Brep::sweep_profile)'s:
     /// x to the left of the chain, y along the outward normal of the faces
     /// it lies on.
