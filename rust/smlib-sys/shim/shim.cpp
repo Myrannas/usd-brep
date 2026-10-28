@@ -4798,7 +4798,8 @@ void sm_swept_faces_free(sm_swept_face* faces) { delete[] faces; }
 
 sm_status sm_brep_merge_faces(sm_brep* brep) {
     if (!brep) return SM_SHIM_ERR_NULL_ARGUMENT;
-    return guarded([&] { return static_cast<sm_status>(brep_of(brep)->RemoveTopologicalEdgesAndVertices()); });
+    // Free-form too, as sm_brep_merge_faces_keeping.
+    return guarded([&] { return static_cast<sm_status>(brep_of(brep)->RemoveTopologicalEdgesAndVertices(nullptr, nullptr, TRUE)); });
 }
 
 sm_status sm_brep_relationship(const sm_brep* a, const sm_brep* b, int32_t* relationship, double* distance) {
@@ -6850,7 +6851,10 @@ sm_status sm_brep_merge_faces_keeping(sm_brep* brep, const uint32_t* keep, size_
         SmBrep* target = brep_of(brep);
         SmTArray<SmEdge*> kept;
         if (edges_at(*target, keep, count, kept) != SM_SUCCESS) return SM_SHIM_ERR_BAD_EDGE;
-        return static_cast<sm_status>(target->RemoveTopologicalEdgesAndVertices(&kept));
+        // Free-form too: a boolean or an imprint gives each piece of a
+        // split B-spline face its own copy of the surface, which the merge
+        // would otherwise leave in pieces.
+        return static_cast<sm_status>(target->RemoveTopologicalEdgesAndVertices(&kept, nullptr, TRUE));
     });
 }
 

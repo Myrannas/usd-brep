@@ -20,6 +20,7 @@ from `v1.0.0` (`c9c5979`).
 | `cd41f50` | `SmTorus.cpp` | Found revolving: `SmTorus::IsNurbSurfaceTorus` snaps the generator circle's start and end angles to 0 and 360 only within `SM_EFF_ZERO` (1e-12 degrees). A circle revolved a whole turn on a tilted plane came out with both 2.7e-12 degrees off zero, and the torus got an empty (u, v) domain. | Snap within `SM_EFF_ZERO_DEG` and turn an end no further than the start into a whole turn, as `RebuildSTEPFromNURBParameters` in the same file does. Nothing in the kernel calls it (its call in `CopyAndAddAnalytics` is commented out); the shim's revolve does. |
 | `c7639c2` | `SmTorus.cpp` | Found piping and revolving: `SmTorus::IsNurbSurfaceTorus` took the major radius as the distance between the first parallel circle's centre and the generator circle's, too long whenever that circle isn't the equator (a pipe bent round 10 came back a torus of 11.18), and the generator's start and end angles unsigned, so a point below the torus's plane read as one above and the torus ran half a turn round the tube from its surface. | Drop the height between the centres, and sign the angles towards the torus's z axis, the generator circle's y axis. Of 30 circles revolved about axes every way on two planes, 22 were recognised before and 30 after. |
 | `23281a6` | `SmBSplineSurface.h`, `SmBSplineSurfaceNLib.cpp` | Found sweeping grooves off one plane: `SmBSplineSurface::CreateSweepSurface` starts the section's frame from any vector square to the trajectory's start tangent (`MakeUnitOrthoVectors`) and gives `N_CreateSweepScale` no orientation curve, so a profile swept along a path across a round has no way to stay square to the surface. `N_CreateSweepScale` takes one (`curZ`), but nothing outside NLib reaches it. | Add `SmBSplineSurface::CreateOrientedSweepSurface`, which passes an orientation curve as `curZ`, the section given in the local frame (x along the trajectory, z along the curve), cubic along the sweep. Only adds a method; the shim's `sweep_profile_along` calls it. |
+| `4c47959` | `SmEdge.h`, `SmEdge.cpp`, `SmBrep.h`, `SmBrep.cpp` | Found carrying a panel line onto one of a free-form corner's patches: `SmEdge::IsTopological` merges faces on different surfaces only when both are analytic or planar ([cbi660]), and a boolean or imprint that splits a B-spline face gives each piece its own copy of the surface, so the pieces never merge again. Taking an imprint back off the corner's other patches left all 12 of its new edges, 11 of which should have gone, and the groove ran on round the loop. Pieces of a ruled round that come back as surfaces of extrusion beside B-spline ones stayed apart too. | `RemoveTopologicalEdgesAndVertices` and `IsTopological` take `bFreeForm`, default FALSE: faces on two copies of one B-spline surface (degrees, knots, weights and control points equal exactly) are on one surface, and a B-spline face beside an analytic one goes on to the covering test two analytic faces get (`sm_CoverOtherCoincidentFace`), which checks that they coincide. Existing calls are unchanged; the shim's `sm_brep_merge_faces` and `sm_brep_merge_faces_keeping` pass TRUE. |
 
 Dropped at the 1.0.1 merge: `a9a7a28` and `0afdfdb`, which mated a local
 operation's and a solid offset's edges in the original brep's order
@@ -35,9 +36,13 @@ offset). The tessellation patches only add methods and a class
 (`SmMemBlockMgr` gains a block copy and block accessors): `SmApiTessellate`
 and `Phase1SetupBrep` take the code paths they always did, and 1.0.1's
 faster tessellation is in the triangulation after them (loop nesting and
-joining holes), which `Phase1SetupFaces` leaves alone. The merge patch changes only merges
-given a keep list: `RemoveTopologicalEdgesAndVertices()` without one, as
-every boolean's post-process and `Brep::merge_faces` call it, is as it was.
+joining holes), which `Phase1SetupFaces` leaves alone. The keep-list
+patch changes only merges given a keep list: `RemoveTopologicalEdgesAndVertices()`
+without one, as every boolean's post-process calls it, is as it was. The
+free-form merge patch changes only merges given `bFreeForm`, which only the
+shim's merges pass (`Brep::merge_faces`, `merge_faces_keeping`); every
+merge inside the kernel, the fillets' and booleans' among them, is as it
+was.
 The torus patches change only `SmTorus::IsNurbSurfaceTorus`, which only the
 shim calls. Patch `23281a6` only adds a method.
 
@@ -1134,7 +1139,7 @@ line along its normal makes them, its y following the faces' normal.
   `sm_WhichPVToCombine`); at 1e-2 it cut, leaving slivers of its walls.
   Profiles run on past the surface are fine.
 
-## Notes from free-form surfaces (no patch needed)
+## Notes from free-form surfaces
 
 Shim and Rust only (`rust/smlib-sys/shim/freeform.cpp`,
 `rust/smlib/src/freeform.rs`, `rust/smlib/tests/freeform.rs`), from the
@@ -1190,6 +1195,14 @@ into solids. No kernel source changes.
   (416 of 417 cases), offsets don't (2 of 16, `SHIM_ERR_BROKE_SOLID`), and
   shells work on one patch but not across the N-sided fills, taking 27 s
   each to fail there.
+- **Split free-form faces merge back** with `4c47959`: a slab imprinted
+  through the rounded box's corner splits it into 66 faces, and merging
+  the new edges away, or every edge that can be, gives the 42 it had, the
+  same kinds (`split_freeform_faces_merge_back`; 62 before). Each piece of
+  a split B-spline face lies on its own copy of the surface, equal to the
+  bit, and some pieces of a round lofted through arcs come back as
+  surfaces of extrusion (kernel type 15030), which the covering test merges
+  into the B-spline beside them.
 
 ## Notes from the 1.0.1 merge
 

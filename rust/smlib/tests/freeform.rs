@@ -1,7 +1,8 @@
 //! Free-form surfaces made into solids: a loft closed round and capped, a box
 //! whose top is a NURBS dome, and a rounded box whose corners are N-sided
 //! fills. Each must close into a manifold solid of the right volume and
-//! tessellate. Also each surface's control net and closest point, and, run
+//! tessellate. Also each surface's control net and closest point, split
+//! free-form faces merging back, and, run
 //! by hand, how booleans, fillets, offsets and shells fare on them
 //! (`freeform_robustness`).
 //!
@@ -260,6 +261,46 @@ fn rounded_box_corners_fill() {
                 .count(),
             6
         );
+    });
+}
+
+/// A slab imprinted through a rounded box's corner, splitting its fill
+/// patches and its rounds, merges back to the 42 faces it had, whether the
+/// new edges alone are merged away (`merge_faces_keeping`) or every edge
+/// that can be (`merge_faces`). Each piece of a split NURBS face lies on its
+/// own copy of the surface, and some pieces of a round come back as surfaces
+/// of extrusion, which the kernel's merge left apart before the fork's
+/// `bFreeForm`.
+#[test]
+fn split_freeform_faces_merge_back() {
+    on_kernel(|k| {
+        let rounded = samples::rounded_box(k, [-50.0, -30.0, -20.0], [100.0, 60.0, 40.0], 8.0)
+            .unwrap()
+            .brep;
+        let whole = kinds(&rounded);
+        let slab = || Brep::cuboid(k, [44.0, -100.0, -100.0], [1.0, 200.0, 200.0]).unwrap();
+        for keeping in [true, false] {
+            let imprint = rounded.try_clone().unwrap().imprint_classified(slab()).unwrap();
+            let mut brep = imprint.brep;
+            let split = brep.face_count();
+            assert!(split > 42, "the slab splits faces: {split}");
+            if keeping {
+                let new: Vec<usize> =
+                    imprint.edges.iter().filter(|e| e.new).map(|e| e.edge).collect();
+                let keep: Vec<usize> =
+                    (0..brep.edge_count()).filter(|e| !new.contains(e)).collect();
+                brep.merge_faces_keeping(&keep).unwrap();
+            } else {
+                brep.merge_faces().unwrap();
+            }
+            println!(
+                "keeping {keeping}: 42 faces, {split} imprinted, {} merged back",
+                brep.face_count()
+            );
+            assert_eq!(brep.face_count(), 42, "keeping {keeping}");
+            assert_eq!(kinds(&brep), whole, "keeping {keeping}");
+            assert!(brep.is_manifold().unwrap());
+        }
     });
 }
 

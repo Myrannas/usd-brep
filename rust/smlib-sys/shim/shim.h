@@ -720,8 +720,10 @@ void sm_shell_faces_free(sm_shell_face *faces);
 
 /* Merges faces that lie on one surface into one face, removing the edges
  * between them, and edges that lie on one curve into one edge
- * (SmBrep::RemoveTopologicalEdgesAndVertices). The shape is unchanged. Labels
- * follow sm_label's merge rule. */
+ * (SmBrep::RemoveTopologicalEdgesAndVertices, with bFreeForm: faces on copies
+ * of one B-spline surface, as a boolean leaves the pieces of a split
+ * free-form face, merge too, and a B-spline face an analytic surface beside
+ * it covers). The shape is unchanged. Labels follow sm_label's merge rule. */
 sm_status sm_brep_merge_faces(sm_brep *brep);
 
 /* How two solids lie (SmApiBrepRelationship): relationship is

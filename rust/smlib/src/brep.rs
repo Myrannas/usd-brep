@@ -1403,9 +1403,12 @@ impl Brep {
     /// Merges faces that lie on one surface into one face, and edges that lie
     /// on one curve into one edge (`SmBrep::RemoveTopologicalEdgesAndVertices`),
     /// without changing the shape: after a union that leaves a wall in two
-    /// coplanar pieces, it's one face again. Merged faces keep the older label
-    /// (see [`Label`]). Booleans already do this along their intersection
-    /// curves.
+    /// coplanar pieces, it's one face again. Free-form faces merge too: a
+    /// boolean gives each piece of a split NURBS face its own copy of the
+    /// surface, which counts as one surface here, and a NURBS face that lies
+    /// on an analytic surface beside it merges into that. Merged faces keep
+    /// the older label (see [`Label`]). Booleans already do this along their
+    /// intersection curves, though not for free-form faces.
     pub fn merge_faces(&mut self) -> Result<(), Error> {
         // SAFETY: self is a live brep on the kernel thread.
         let status = unsafe { sys::sm_brep_merge_faces(self.raw.as_ptr()) };
