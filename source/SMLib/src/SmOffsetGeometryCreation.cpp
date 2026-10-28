@@ -1385,6 +1385,30 @@ SmBoolean bDebugMe2 = FALSE;
             }
         }
 
+      // A closed edge (one vertex) replaced by a closed curve: the vertex
+      // lands on the curve once, so there's no second trim point apart from
+      // the first. When that one is the curve's own start or end, the whole
+      // curve is the edge.
+      if (!bFound && i == 1)
+        {
+          const SmEdge *pBaseEdge = pBaseEdgeuse->GetEdge();
+          SmExtent1d    sCrvIvl   = p3DCurve->GetNaturalInterval();
+          SmPoint3d     sCrvStart, sCrvEnd;
+          const double  dZero     = SM_EFF_ZERO_SQRT * (1.0 + sCrvIvl.GetMaxDimension());
+          const double  dAt       = sTrimIvl.GetMin();
+          if (   pBaseEdge->GetStartVertex() == pBaseEdge->GetOtherVertex(pBaseEdge->GetStartVertex())
+              && (   smos_Fabs(dAt - sCrvIvl.GetMin()) <= dZero
+                  || smos_Fabs(dAt - sCrvIvl.GetMax()) <= dZero)
+              && p3DCurve->EvaluatePoint(sCrvIvl.GetMin(), sCrvStart) == SM_SUCCESS
+              && p3DCurve->EvaluatePoint(sCrvIvl.GetMax(), sCrvEnd) == SM_SUCCESS
+              && sCrvStart.DistanceBetween(sCrvEnd) <= pBaseEdge->GetTolerance())
+            {
+              bGoodEdge     = TRUE;
+              rTrimInterval = sCrvIvl;
+              return SM_SUCCESS;
+            }
+        }
+
       // BadEdge when no trim point was found for this iteration
       if (!bFound) 
         {
