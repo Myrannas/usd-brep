@@ -337,6 +337,29 @@ impl Brep {
             .collect())
     }
 
+    /// How far off exactly smooth each edge is, in degrees, in the order of
+    /// [`edges`](Brep::edges): the largest angle between the normals of the
+    /// two faces it joins at twelve points along it, its ends and a
+    /// thousandth of it in from them among them, so a sharp edge reads its
+    /// sharpest. `None` for an edge without two faces, a seam, or one whose
+    /// normals the kernel can't find. An edge's middle alone
+    /// ([`EdgeGeometry::bend_deg`]) can miss where it parts from smooth: a
+    /// NURBS fillet round a lofted tank's cap is 0.00004° off there and
+    /// 0.005° near its ends, which the kernel's shell can't take (see
+    /// `PATCHES.md`, Notes from free-form offsets and shells).
+    pub fn edge_creases(&self) -> Result<Vec<Option<f64>>, Error> {
+        let mut raw = vec![0.0; self.edge_count()];
+        let mut count = 0;
+        // SAFETY: self is a live brep on the kernel thread; raw has room for
+        // raw.len() edges.
+        let status = unsafe {
+            sys::sm_brep_edge_creases(self.raw.as_ptr(), raw.as_mut_ptr(), raw.len(), &mut count)
+        };
+        Error::check("sm_brep_edge_creases", status)?;
+        raw.truncate(count);
+        Ok(raw.into_iter().map(|crease| (crease >= 0.0).then_some(crease)).collect())
+    }
+
     /// The arc length of the edge at `edge` in [`edges`](Brep::edges)
     /// (`SmApiEdgeComputeLength`), integrated to a relative accuracy of 1e-7.
     /// This costs far more than [`edges`](Brep::edges), which leaves it out.

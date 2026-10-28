@@ -372,6 +372,14 @@ sm_status sm_brep_edge_geometry(const sm_brep *brep, sm_edge_geometry *out, size
  * sm_brep_edge_geometry leaves it out. */
 sm_status sm_brep_edge_length(const sm_brep *brep, size_t edge, double relative_accuracy, double *out);
 
+/* How far off exactly smooth the brep's first `capacity` edges are, in
+ * degrees, to out, and the brep's edge count to *count: the largest angle
+ * between the normals of the two faces an edge joins at twelve points along
+ * it, its ends and points a thousandth of it in from them among them, so a
+ * sharp edge reads its sharpest. -1 for an edge without two faces, a seam,
+ * or one whose normals the kernel can't find. */
+sm_status sm_brep_edge_creases(const sm_brep *brep, double *out, size_t capacity, size_t *count);
+
 /* SmApiFilletEdgesPerEdge: fillets the edges at the given indices of the
  * brep's edge list in place. Edge edges[i] gets radii[i] and the
  * sm_fillet_section sections[i]. continuity (1, 2 or 3 for G1, G2 or G3) and

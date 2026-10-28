@@ -4529,6 +4529,41 @@ sm_status apart(const SmBrep& a, const SmBrep& b, bool& out) {
     return SM_SUCCESS;
 }
 
+// How far off exactly smooth an edge is, in degrees (sm_brep_edge_creases),
+// or -1. The normals are its two faceuses' on one side of it, as
+// SmEdgeuse::IsTangentSector reads them, which samples only five points
+// inside an edge: a NURBS fillet round a lofted tank's cap is 0.00004°
+// off smooth at its middle and 0.005° a thousandth in from its ends.
+double edge_crease(const SmEdge* edge) {
+    SmTArray<SmEdgeuse*> uses;
+    edge->GetEdgeuses(uses);
+    if (uses.GetSize() < 1) return -1.0;
+    const SmEdgeuse* use = uses[0];
+    const SmEdgeuse* other = use->GetRadial();
+    if (!other || other == use || !use->GetFace() || !other->GetFace() || use->GetFace() == other->GetFace()) {
+        return -1.0;
+    }
+    const SmExtent1d interval = edge->GetInterval();
+    static const double shares[] = {0.0, 1e-3, 0.12, 0.25, 0.34, 0.5, 0.55, 0.75, 0.78, 0.93, 1.0 - 1e-3, 1.0};
+    double worst = 0.0;
+    for (const double share : shares) {
+        SmPoint3d at_a;
+        SmPoint3d at_b;
+        SmVector3d into_a;
+        SmVector3d into_b;
+        SmVector3d normal_a;
+        SmVector3d normal_b;
+        if (use->EvaluateBinormal(interval.Evaluate(share), TRUE, at_a, into_a, nullptr, &normal_a) != SM_SUCCESS ||
+            other->EvaluateBinormal(interval.Evaluate(share), TRUE, at_b, into_b, nullptr, &normal_b) != SM_SUCCESS ||
+            normal_a.Unitize() != SM_SUCCESS || normal_b.Unitize() != SM_SUCCESS) {
+            return -1.0;
+        }
+        const double along = std::max(-1.0, std::min(1.0, normal_a.Dot(normal_b)));
+        worst = std::max(worst, std::acos(along) * 180.0 / SM_PI);
+    }
+    return worst;
+}
+
 }  // namespace
 
 extern "C" {
@@ -4645,6 +4680,18 @@ sm_status sm_brep_edge_geometry(const sm_brep* brep, sm_edge_geometry* out, size
             const sm_status status = describe_edge(edges[static_cast<ULONG>(i)], face_index, out[i]);
             if (status != SM_SUCCESS) return status;
         }
+        *count = edges.GetSize();
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_brep_edge_creases(const sm_brep* brep, double* out, size_t capacity, size_t* count) {
+    if (!brep || !count || (capacity > 0 && !out)) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&] {
+        SmTArray<SmEdge*> edges;
+        brep_of(brep)->GetEdges(edges);
+        const size_t written = std::min(capacity, static_cast<size_t>(edges.GetSize()));
+        for (size_t i = 0; i < written; ++i) out[i] = edge_crease(edges[static_cast<ULONG>(i)]);
         *count = edges.GetSize();
         return SM_SUCCESS;
     });
