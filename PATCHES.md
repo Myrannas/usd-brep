@@ -987,8 +987,10 @@ calling the kernel's own scale or mirror. Nothing in the kernel changed.
   also calls a solid in a cavity of the other apart; combine refuses that,
   since the copy would belong in the cavity's region.
 - `BrepBrepSolve`'s closest approach is exact between planes and spheres
-  (blocks and balls 0.01 to 300 apart, to 1e-12) but falls short beside a
-  cylinder: two of the crate's bolts (radius 8) side by side read 4.45 closer
+  (blocks and balls 0.01 to 300 apart, to 1e-12), and since 1.0.1 beside
+  cylinders too: two of the crate's bolts side by side, swept from a circle
+  or made by `Brep::cylinder`, combine 0.5 to 10 apart and read their gap
+  exactly. Before, it fell short beside a cylinder: two of the crate's bolts (radius 8) side by side read 4.45 closer
   than they are, 9.6 at 45°, and two 25 mm vents 14. In every case tried it
   never read further than the truth, so what it calls apart is, but round
   copies closer than about 0.3 to 0.6 of their radius are refused though
@@ -1172,9 +1174,11 @@ What 1.0.1 changes for the shim and its callers:
   walls get their normals at 1e-7), and fillets on a prism with planar
   NURBS walls (`Brep::tapered_prism`) come out cylinders and spheres, not
   NURBS.
-- **Distances.** `SmApiBrepRelationship` (`Brep::relationship`) measures
-  `Brep::cylinder`s side by side exactly, now `SmCylinder`s, where their
-  distance fell short (`tests/transform_bodies.rs`).
+- **Distances.** `SmApiBrepRelationship` (`Brep::relationship`) and the
+  combine's own query measure cylinders side by side exactly, where their
+  distance fell short (`tests/transform_bodies.rs`; the notes from
+  combining copies, above), so `Brep::combine` gathers round copies however
+  close.
 - **Shells.** An opening that meets a round tangentially (a box's top with
   its rim rounded 4) hollows now: each inside round, `4 - t`, stops where it
   turns level and a new upright face on the round's axis closes the wall up

@@ -763,8 +763,8 @@ fn the_relationship_query_is_exact_for_planes_spheres_and_cylinders() {
                 assert!((found - gap).abs() < 1e-9, "{what} {gap} apart: {found}");
             }
         }
-        // Side by side too, since 1.0.1, whose cylinders are SmCylinders
-        // rather than cones of no angle; before, their distance fell short.
+        // Side by side too, since 1.0.1; before, a cylinder's distance fell
+        // short.
         for gap in [0.01, 1.0, 5.0, 10.0, 300.0] {
             let start = Instant::now();
             let found = bolt(0.0, 0.0).relationship(&bolt(16.0 + gap, 0.0)).unwrap();
