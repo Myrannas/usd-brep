@@ -2223,6 +2223,53 @@ bool edges_lie_on(const SmFace* face, const SmSurface* surface, double tolerance
     return true;
 }
 
+// After a local operation, each face it left on an exact offset of a
+// B-spline surface curved both ways takes NLib's B-spline approximation of
+// that offset, within `tolerance` (SmOffsetExecutive::ReplaceImplicitOffsets,
+// face by face). The exact offset is evaluated by marching: the volume check
+// alone took 11 s on a lofted tank's skin moved 10 mm in, then disagreed.
+// Offsets of other surfaces are left as they are, as is a face whose
+// approximation fails.
+void approximate_freeform_offsets(SmBrep& brep, double tolerance) {
+    const SmContext& context = *brep.GetContext();
+    SmTArray<SmFace*> faces;
+    brep.GetFaces(faces);
+    SmTArray<SmFace*> approximated;
+    SmTArray<SmBSplineSurface*> approximations;
+    for (ULONG i = 0; i < faces.GetSize(); ++i) {
+        if (!SM_CAST_PTR(SmOffsetSurface, faces[i]->GetSurface())) continue;
+        // Only the part of the surface the face uses, extensions and all.
+        faces[i]->ShrinkGeometry();
+        SmOffsetSurface* offset = SM_CAST_PTR(SmOffsetSurface, faces[i]->GetSurface());
+        if (!offset) continue;
+        // A free-form face's, curved both ways. An analytic face's extension
+        // can be a B-spline too, and SMLib makes a chamfer as a ruled one
+        // (degree 1 across): their exact offsets stay, as a Transform reads
+        // them (an offset can't stretch unevenly).
+        const SmBSplineSurface* own = SM_CAST_PTR(SmBSplineSurface, offset->GetBaseSurface());
+        if (!own || own->GetDegree(SM_SP_U) < 2 || own->GetDegree(SM_SP_V) < 2) continue;
+        SmSurface* base = offset->GetExtendedBaseSurface() ? offset->GetExtendedBaseSurface() : offset->GetBaseSurface();
+        SmBSplineSurface* nurbs = SM_CAST_PTR(SmBSplineSurface, base);
+        if (!nurbs) continue;
+        SmBSplineSurface* approximation = nullptr;
+        if (nurbs->ApproximateOffsetSurface(context, offset->GetOffsetDistance(), tolerance, approximation, 0) !=
+                SM_SUCCESS ||
+            !approximation) {
+            delete approximation;
+            continue;
+        }
+        approximated.Add(faces[i]);
+        approximations.Add(approximation);
+    }
+    for (ULONG i = 0; i < approximated.GetSize(); ++i) {
+        SmFace* face = approximated[i];
+        face->Notify(SM_NO_PRE_EDIT, face, SM_NO_GET_BREP(face), NULL);
+        face->SetUVDomain(approximations[i]->GetNaturalUVDomain());
+        if (brep.ReplaceSurface(face, approximations[i], TRUE, NULL) != SM_SUCCESS) delete approximations[i];
+        face->Notify(SM_NO_POST_EDIT, face, SM_NO_GET_BREP(face), NULL);
+    }
+}
+
 // Whether the surface is one of the kinds plan_offset recognises: SMLib's
 // IsAnalytic also counts any surface of extrusion or revolution.
 bool canonical(const SmSurface* surface) {
@@ -2367,6 +2414,7 @@ sm_status rigid_local_operation(SmBrep& brep, const SmTArray<SmFace*>& moved, Sm
     moved_status = rebuilt->CopyFaces(new_faces, &brep);
     if (moved_status != SM_SUCCESS) return static_cast<sm_status>(moved_status);
     restore_analytic_surfaces(brep, analytic);
+    approximate_freeform_offsets(brep, brep.GetTolerance() / 10.0);
     return SM_SUCCESS;
 }
 
