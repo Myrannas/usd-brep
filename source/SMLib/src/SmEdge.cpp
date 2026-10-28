@@ -4968,6 +4968,55 @@ static SmStatus sm_CoverOtherCoincidentFace
 } // end sm_CoverOtherCoincidentFace
 
 /*******************************************************************//**
+PURPOSE: Return TRUE when two surfaces are copies of one B-spline surface:
+         the same degrees, knots, weights and control points, exactly.
+
+NOTES: For SmEdge::IsTopological's bFreeForm. Analytic surfaces (SmPlane is a
+  B-spline too) are left to its covering test.
+***********************************************************************/
+static SmBoolean sm_AreCopiesOfOneBSplineSurface
+  (const SmSurface * pSurf0,   // in :
+   const SmSurface * pSurf1)   // in :
+{
+  if (   pSurf0 == NULL || pSurf1 == NULL
+      || pSurf0->GetType() != SmBSplineSurface_TYPE
+      || pSurf1->GetType() != SmBSplineSurface_TYPE)
+    { return FALSE ; }
+
+  const SmBSplineSurface * pB0 = (const SmBSplineSurface *) pSurf0 ;
+  const SmBSplineSurface * pB1 = (const SmBSplineSurface *) pSurf1 ;
+  if (   pB0->GetDegree(SM_SP_U) != pB1->GetDegree(SM_SP_U)
+      || pB0->GetDegree(SM_SP_V) != pB1->GetDegree(SM_SP_V)
+      || pB0->IsRational() != pB1->IsRational())
+    { return FALSE ; }
+
+  ULONG lKnotsU0 = 0, lKnotsV0 = 0, lKnotsU1 = 0, lKnotsV1 = 0 ;
+  double *pdKnotsU0 = NULL, *pdKnotsV0 = NULL, *pdKnotsU1 = NULL, *pdKnotsV1 = NULL ;
+  if (   pB0->GetKnotsPointers(lKnotsU0, lKnotsV0, pdKnotsU0, pdKnotsV0) != SM_SUCCESS
+      || pB1->GetKnotsPointers(lKnotsU1, lKnotsV1, pdKnotsU1, pdKnotsV1) != SM_SUCCESS
+      || lKnotsU0 != lKnotsU1 || lKnotsV0 != lKnotsV1
+      || pdKnotsU0 == NULL || pdKnotsV0 == NULL || pdKnotsU1 == NULL || pdKnotsV1 == NULL)
+    { return FALSE ; }
+  ULONG ii ;
+  for (ii = 0; ii < lKnotsU0; ii++) { if (pdKnotsU0[ii] != pdKnotsU1[ii]) { return FALSE ; } }
+  for (ii = 0; ii < lKnotsV0; ii++) { if (pdKnotsV0[ii] != pdKnotsV1[ii]) { return FALSE ; } }
+
+  ULONG lCountU0 = 0, lCountV0 = 0, lCountU1 = 0, lCountV1 = 0 ;
+  double *pdPoints0 = NULL, *pdPoints1 = NULL ;
+  if (   pB0->GetControlPointsPointer(lCountU0, lCountV0, pdPoints0) != SM_SUCCESS
+      || pB1->GetControlPointsPointer(lCountU1, lCountV1, pdPoints1) != SM_SUCCESS
+      || lCountU0 != lCountU1 || lCountV0 != lCountV1
+      || pdPoints0 == NULL || pdPoints1 == NULL)
+    { return FALSE ; }
+  // Four doubles a control point: x, y, z and w (homogeneous when rational).
+  const ULONG lDoubles = 4 * lCountU0 * lCountV0 ;
+  for (ii = 0; ii < lDoubles; ii++) { if (pdPoints0[ii] != pdPoints1[ii]) { return FALSE ; } }
+
+  return(TRUE) ;
+
+} // end sm_AreCopiesOfOneBSplineSurface
+
+/*******************************************************************//**
 PURPOSE: Return TRUE if the edge is a topological edge.
 
 NOTES: 
@@ -4989,7 +5038,9 @@ SmBoolean SmEdge::IsTopological
    double     & rdDistBetween,      // out: max dist found between covered and covering surfaces
    double       dApproxTol3d_Gain,   // in : Multiplier applied to XSectTol3d, default:[1.0]
                                     //      argument added to support previous behavior.
-   SmExtent2d * pOptMergedFaceDomain) // out: optional merged domain in the retained surface's final NURBS parameters
+   SmExtent2d * pOptMergedFaceDomain, // out: optional merged domain in the retained surface's final NURBS parameters
+   SmBoolean    bFreeForm)          // in : also faces on two copies of one B-spline surface, and a B-spline face
+                                    //      an analytic surface beside it can cover, default:[FALSE]
 const
 {
   // init output
@@ -5179,9 +5230,21 @@ SmBoolean bDebugMe = FALSE ;
       SmApproxTol3d sApproxTol3d = dApproxTol3d_Gain * smos_Min(SmTol::GetApproxTol3d(pFace1), SmTol::GetApproxTol3d(pFace2)) ; 
 
       // Do this only for Analytic surfaces, because they are extendable.  [cbi660]
-      if ( ! ( paSurf[0]->IsAnalytic() || paSurf[0]->IsPlanar( sApproxTol3d ) ) )
-        { return FALSE; }
-      if ( ! ( paSurf[1]->IsAnalytic() || paSurf[1]->IsPlanar( sApproxTol3d ) ) )
+      // With bFreeForm, two faces on copies of one B-spline surface (a boolean
+      // that splits a free-form face gives each piece its own copy) are on one
+      // surface, and a B-spline face beside an analytic one (a piece the boolean
+      // recognised as analytic) may be covered as two analytic faces may.
+      const SmBoolean bAnalytic0 = paSurf[0]->IsAnalytic() || paSurf[0]->IsPlanar( sApproxTol3d );
+      const SmBoolean bAnalytic1 = paSurf[1]->IsAnalytic() || paSurf[1]->IsPlanar( sApproxTol3d );
+      if ( bFreeForm && sm_AreCopiesOfOneBSplineSurface( paSurf[0], paSurf[1] ) )
+        {
+          rpSurfToKeep  = paSurf[0] ;
+          rdDistBetween = 0.0 ;
+          if (pOptMergedFaceDomain != NULL)
+            { pFace1->GetUVDomain().Union(pFace2->GetUVDomain(), *pOptMergedFaceDomain); }
+          return(TRUE) ;
+        }
+      if ( ! ( bAnalytic0 && bAnalytic1 ) && ! ( bFreeForm && ( bAnalytic0 || bAnalytic1 ) ) )
         { return FALSE; }
 
       // If we have planes use a much tighter coincidence check tolerance

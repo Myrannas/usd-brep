@@ -374,8 +374,10 @@ public:
       SmSurface *&rpSurfToKeep,             ///< [out]: Surface to keep if 'this' gets deleted to merge two faces into one <br>
       double     &rDistBetween,             ///< [out]: max dist found between covered and covering surfaces               <br>
       double     dXSectTol3d_Gain=1.0,       ///< [in] : multiplier applied to Gap Tolerance checks                         <br>
-      SmExtent2d *pOptMergedFaceDomain=NULL ///< [out]: optional union in retained surface's final NURBS parameters         <br>
+      SmExtent2d *pOptMergedFaceDomain=NULL, ///< [out]: optional union in retained surface's final NURBS parameters         <br>
                                            ///<        valid when TRUE
+      SmBoolean  bFreeForm=FALSE            ///< [in] : also faces on two copies of one B-spline surface, and a B-spline     <br>
+                                           ///<        face an analytic surface beside it can cover                         <br>
     ) const ;
 
     // TRUE = SM_ARE_SAME(m_sZoneTol3d == SmTol::GetZoneTol3d())

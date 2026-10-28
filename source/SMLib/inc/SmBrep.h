@@ -1309,7 +1309,8 @@ public:
                           const ;
 
   SmStatus RemoveTopologicalEdgesAndVertices(SmTArray<SmEdge*>   * pOptKeepEdges = NULL,       // in : List of Edges to keep even if Topological, NULL to ignore, default:[NULL] 
-                                             SmTArray<SmVertex*> * pOptKeepVertices = NULL) ;  // in : List of Vertices to keep even if Topological, NULL to ignore, default:[NULL] 
+                                             SmTArray<SmVertex*> * pOptKeepVertices = NULL,    // in : List of Vertices to keep even if Topological, NULL to ignore, default:[NULL] 
+                                             SmBoolean bFreeForm = FALSE) ;                    // in : also merge faces on copies of one B-spline surface, and a B-spline face an analytic one beside it covers, default:[FALSE] 
 // Remove Composites
 //  // Faces
 //  int ReplaceCompositeFaces(SmTArray<SmFace *> *pOptFaces=NULL) ;

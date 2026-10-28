@@ -25930,7 +25930,9 @@ NOTES:
 ***********************************************************************/
 SmStatus SmBrep::RemoveTopologicalEdgesAndVertices
  (SmTArray<SmEdge*>   * pOptKeepEdges,     // in : List of Edges to keep even if Topological, NULL to ignore, default:[NULL]
-  SmTArray<SmVertex*> * pOptKeepVertices)  // in : List of Vertices to keep even if Topological, NULL to ignore, default:[NULL]
+  SmTArray<SmVertex*> * pOptKeepVertices,  // in : List of Vertices to keep even if Topological, NULL to ignore, default:[NULL]
+  SmBoolean             bFreeForm)         // in : also merge faces on copies of one B-spline surface, and a B-spline
+                                           //      face an analytic one beside it covers (SmEdge::IsTopological), default:[FALSE]
 {
 #ifdef SM_DEBUG_CODE
 SmBoolean bDebugMe=FALSE;
@@ -25986,7 +25988,7 @@ SmBoolean bDebugMe=FALSE;
 
       // skip NonTopological edges - side effect - one Surface may be expanded to 'cover' the other
       SmExtent2d sMergedFaceDomain;
-      if(!pEdge->IsTopological(pSurfToKeep, dDistBetween, 1.0, &sMergedFaceDomain)) // note: ApproxTol3d Gain = 1.0 is different than
+      if(!pEdge->IsTopological(pSurfToKeep, dDistBetween, 1.0, &sMergedFaceDomain, bFreeForm)) // note: ApproxTol3d Gain = 1.0 is different than
         { continue ; }                                          //       Gain 10.0 Tol used in SmMerge::BooleanPostProcess
 
    // code moved to SmEdge::IsTopological()
