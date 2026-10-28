@@ -1542,6 +1542,78 @@ static SmBoolean sm_LiftedMidpointIsOnOther
 } // end sm_LiftedMidpointIsOnOther
 
 /*******************************************************************//**
+PURPOSE: The other side's UV trim curve of a seam edge, whose two uses
+         lie on one face: the extended UV curve moved across the surface's
+         period, by as much as the edge's other UV curve lies from this
+         side's. NULL when the two original UV curves aren't the same
+         curve moved (checked at five points), so the caller drops as
+         before.
+
+NOTES: Dropping the lifted curve onto the extended surface can't tell
+       the seam's two sides apart, and onto the far extension of an
+       inward offset, which folds where the extended surface runs
+       through its axis, it can land on the wrong sheet.
+***********************************************************************/
+static SmStatus sm_SeamPartner
+  (const SmContext      & crContext,     // in : context for new object construction
+   const SmEdgeuse      * pEdgeuse,      // in : edgeuse from the original brep
+   const SmBSplineCurve * pUVCurve,      // in : this side's original UV curve
+   const SmBSplineCurve * pOtherUVCurve, // in : the other side's original UV curve
+   const SmSurface      * pExtSurf,      // in : this side's extended surface
+   const SmSurface      * pOtherExtSurf, // in : the other side's extended surface
+   const SmBSplineCurve & crExtended,    // in : this side's extended UV curve
+   SmBSplineCurve      *& rpPartner)     // out: the other side's, or NULL
+{
+  rpPartner = NULL;
+  if (   pEdgeuse->GetEdge()->IsLamina()
+      || pEdgeuse->GetFace() != pEdgeuse->GetRadial()->GetFace()
+      || pExtSurf == NULL || pExtSurf != pOtherExtSurf
+      || pUVCurve == NULL || pOtherUVCurve == NULL || pUVCurve == pOtherUVCurve)
+    return SM_SUCCESS;
+
+  SmExtent1d sIvl      = pUVCurve->GetNaturalInterval();
+  SmExtent1d sOtherIvl = pOtherUVCurve->GetNaturalInterval();
+  double     dZero     = SM_EFF_ZERO_SQRT * (1.0 + sIvl.GetMaxDimension());
+  if (   fabs(sIvl.GetMin() - sOtherIvl.GetMin()) > dZero
+      || fabs(sIvl.GetMax() - sOtherIvl.GetMax()) > dZero)
+    return SM_SUCCESS;
+
+  SmPoint3d sOwn, sOther;
+  SER(pUVCurve->EvaluatePoint(sIvl.GetMin(), sOwn));
+  SER(pOtherUVCurve->EvaluatePoint(sIvl.GetMin(), sOther));
+  double dShiftU = sOther.x - sOwn.x;
+  double dShiftV = sOther.y - sOwn.y;
+  if (fabs(dShiftU) < SM_EFF_ZERO_SQRT && fabs(dShiftV) < SM_EFF_ZERO_SQRT)
+    return SM_SUCCESS;
+  for (int i = 1; i <= 4; i++)
+    {
+      double dT = sIvl.Evaluate(i / 4.0);
+      SER(pUVCurve->EvaluatePoint(dT, sOwn));
+      SER(pOtherUVCurve->EvaluatePoint(dT, sOther));
+      if (   fabs(sOther.x - sOwn.x - dShiftU) > SM_EFF_ZERO_SQRT
+          || fabs(sOther.y - sOwn.y - dShiftV) > SM_EFF_ZERO_SQRT)
+        return SM_SUCCESS;
+    }
+
+  SmBSplineCurve *pPartner = NULL;
+  SER(crExtended.Copy(crContext, pPartner));
+  SmObjDelete sClean(pPartner);
+  SmControlPointFormType eForm = pPartner->IsRational() ? SM_CP_EUCLIDIAN_RATIONAL : SM_CP_NON_RATIONAL;
+  for (ULONG i = 0; i < pPartner->GetNumberControlPoints(); i++)
+    {
+      SmPoint3d sPoint;
+      double    dWeight = 1.0;
+      SER(pPartner->GetControlPoint(eForm, i, sPoint, dWeight));
+      sPoint.x += dShiftU;
+      sPoint.y += dShiftV;
+      SER(pPartner->SetControlPoint(eForm, i, sPoint, dWeight));
+    }
+  sClean.Clear();
+  rpPartner = pPartner;
+  return SM_SUCCESS;
+}
+
+/*******************************************************************//**
 PURPOSE:  Extend or Trim Lamina or Tangent Edges
 
 NOTES: 
@@ -1765,15 +1837,26 @@ SmBoolean bDebugMe2 = FALSE;
       SmObjsDelete<SmBSplineCurve*> sCleanUVS(&sUVCurves);
       double dDistToOtherSurf = 0.0, dDeviation = 0.0;
 
-      // Drop Lifted Curve onto other extended surface to make 2nd UVTrimCurve
-      SER(pOtherExtSurf->DropAndTrimCurve( crContext, sOtherExtDomain,
-                                          *pLiftedCurve,
-                                           pLiftedCurve->GetNaturalInterval(),
-                                           pOffsetEdgeuse->GetEdge()->GetTolerance()/3.0,
-                                           dDistToOtherSurf,
-                                           dDeviation,
-                                           sUVCurves, 
-                                           TRUE, TRUE ));
+      // A seam's other side is this side moved across the period;
+      // otherwise drop Lifted Curve onto other extended surface to make 2nd UVTrimCurve
+      SmBSplineCurve *pSeamPartner = NULL;
+      SER(sm_SeamPartner(crContext, pEdgeuse, pUVCurve, pOtherUVCurve,
+                         pExtSurf, pOtherExtSurf, *pUVCurveExtended, pSeamPartner));
+      if (pSeamPartner != NULL)
+        {
+          sUVCurves.Add(pSeamPartner);
+        }
+      else
+        {
+          SER(pOtherExtSurf->DropAndTrimCurve( crContext, sOtherExtDomain,
+                                              *pLiftedCurve,
+                                               pLiftedCurve->GetNaturalInterval(),
+                                               pOffsetEdgeuse->GetEdge()->GetTolerance()/3.0,
+                                               dDistToOtherSurf,
+                                               dDeviation,
+                                               sUVCurves, 
+                                               TRUE, TRUE ));
+        }
 //        SmBSplineCurve *pUVCurve2Found = NULL;
       ULONG lClosestIdx = 0;
 
