@@ -21,6 +21,9 @@ from `v1.0.0` (`c9c5979`).
 | `c7639c2` | `SmTorus.cpp` | Found piping and revolving: `SmTorus::IsNurbSurfaceTorus` took the major radius as the distance between the first parallel circle's centre and the generator circle's, too long whenever that circle isn't the equator (a pipe bent round 10 came back a torus of 11.18), and the generator's start and end angles unsigned, so a point below the torus's plane read as one above and the torus ran half a turn round the tube from its surface. | Drop the height between the centres, and sign the angles towards the torus's z axis, the generator circle's y axis. Of 30 circles revolved about axes every way on two planes, 22 were recognised before and 30 after. |
 | `23281a6` | `SmBSplineSurface.h`, `SmBSplineSurfaceNLib.cpp` | Found sweeping grooves off one plane: `SmBSplineSurface::CreateSweepSurface` starts the section's frame from any vector square to the trajectory's start tangent (`MakeUnitOrthoVectors`) and gives `N_CreateSweepScale` no orientation curve, so a profile swept along a path across a round has no way to stay square to the surface. `N_CreateSweepScale` takes one (`curZ`), but nothing outside NLib reaches it. | Add `SmBSplineSurface::CreateOrientedSweepSurface`, which passes an orientation curve as `curZ`, the section given in the local frame (x along the trajectory, z along the curve), cubic along the sweep. Only adds a method; the shim's `sweep_profile_along` calls it. |
 | `4c47959` | `SmEdge.h`, `SmEdge.cpp`, `SmBrep.h`, `SmBrep.cpp` | Found carrying a panel line onto one of a free-form corner's patches: `SmEdge::IsTopological` merges faces on different surfaces only when both are analytic or planar ([cbi660]), and a boolean or imprint that splits a B-spline face gives each piece its own copy of the surface, so the pieces never merge again. Taking an imprint back off the corner's other patches left all 12 of its new edges, 11 of which should have gone, and the groove ran on round the loop. Pieces of a ruled round that come back as surfaces of extrusion beside B-spline ones stayed apart too. | `RemoveTopologicalEdgesAndVertices` and `IsTopological` take `bFreeForm`, default FALSE: faces on two copies of one B-spline surface (degrees, knots, weights and control points equal exactly) are on one surface, and a B-spline face beside an analytic one goes on to the covering test two analytic faces get (`sm_CoverOtherCoincidentFace`), which checks that they coincide. Existing calls are unchanged; the shim's `sm_brep_merge_faces` and `sm_brep_merge_faces_keeping` pass TRUE. |
+| `22e9929` | `SmOffsetGeometryCreation.cpp` | Found offsetting free-form faces: `ReplaceEdgeCurves` keeps an edge's own curve whenever a candidate's ends match the edge's. Offsetting a dome whose normal is upright at its corners, the lifted trim curve and the intersection with a wall share their ends and part between them, so the edge kept a curve the moved face no longer had: every offset of the domed box's top came back open (`SHIM_ERR_BROKE_SOLID`). | Both shortcuts also need seven points inside the candidate to lie on the edge, within its tolerance (`SmEdge::ClosestPoint`). |
+| `932635a` | `SmOffsetGeometryCreation.cpp` | Found offsetting and shelling a lofted tank: `TrimExtendedEdge` looks for a trim point at each of an edge's two vertices. A closed ring edge, a cap's rim, has one: the second search skips the first point, finds nothing, and the edge is left unmated. Every outward offset of the tank's skin failed, and so did shelling it 3 mm open at a cap when its last ring was 24.75 across (`SM_ERR_NULL_POINTER` in the boolean after). | When the one trim point is the new closed curve's own start or end, the whole curve is the edge. A closed curve that starts anywhere else still fails, as before; no case seen does. |
+| `e98c8d9` | `SmOffsetGeometryCreation.cpp` | Found offsetting a lofted tank's skin in: `ExtendTrimEdges` finds a non-lamina edge's other UV curve by dropping the curve lifted on one side onto the other side's extended surface. For a seam both sides are one surface, and onto the far extension of an inward offset, which folds where the extended surface runs through its axis, the drop landed 120 mm away at 5 mm in and the solid came back open. | When both uses of the edge lie on one face and its two original UV curves are one curve moved (checked at five points), the other side's is this side's extended curve moved likewise (`sm_SeamPartner`); otherwise it drops as before. |
 
 Dropped at the 1.0.1 merge: `a9a7a28` and `0afdfdb`, which mated a local
 operation's and a solid offset's edges in the original brep's order
@@ -30,9 +33,13 @@ offset (`sm_OrderEdgeusesByBrep`: the brep's faces, their faceuses and
 loops, reversed; GitHub #10 and #21), and the merge takes its
 `SmOffsetExecutive.cpp` whole.
 
-`source/SM_API` is unmodified. Each offset patch changes only
+`source/SM_API` is unmodified. The first three offset patches change only
 `SM_OO_LOCAL_OPERATION` (`SmBrep::LocalOperation` and the shim's face
-offset). The tessellation patches only add methods and a class
+offset). The free-form offset patches (`22e9929`, `932635a`, `e98c8d9`)
+change the solid offset too, which the shell uses: the first turns down a
+shortcut that kept a curve off its edge, the second trims only what had no
+trim, and the third replaces the drop for every seam whose two UV curves
+are one curve moved. The tessellation patches only add methods and a class
 (`SmMemBlockMgr` gains a block copy and block accessors): `SmApiTessellate`
 and `Phase1SetupBrep` take the code paths they always did, and 1.0.1's
 faster tessellation is in the triangulation after them (loop nesting and
@@ -1194,7 +1201,8 @@ into solids. No kernel source changes.
   ignored; about five minutes in release): booleans and fillets hold
   (416 of 417 cases), offsets don't (2 of 16, `SHIM_ERR_BROKE_SOLID`), and
   shells work on one patch but not across the N-sided fills, taking 27 s
-  each to fail there.
+  each to fail there. Offsets are fixed below (Notes from free-form
+  offsets and shells); shells across the fills aren't.
 - **Split free-form faces merge back** with `4c47959`: a slab imprinted
   through the rounded box's corner splits it into 66 faces, and merging
   the new edges away, or every edge that can be, gives the 42 it had, the
@@ -1203,6 +1211,68 @@ into solids. No kernel source changes.
   bit, and some pieces of a round lofted through arcs come back as
   surfaces of extrusion (kernel type 15030), which the covering test merges
   into the B-spline beside them.
+
+## Notes from free-form offsets and shells
+
+Patches `22e9929`, `932635a` and `e98c8d9`, and the shim's
+`approximate_freeform_offsets`, from free-form work on the domed box and
+the lofted tank (`samples`). Results in `rust/smlib/tests/freeform_offsets.rs`:
+the dome's top and the tank's skin each offset 10, 5, 2 and 0.5 mm out and
+in, manifold, the volume moving the right way and the new face within
+1e-4 mm of the exact offset at 25 points (6e-6 mm measured); and the tank,
+its last ring 24.8 or 24.75 across, opened at either cap at 1, 2, 3, 5 and
+8 mm. Each edge's crease, below.
+
+- **Implicit offsets of B-spline faces are approximated.** A local
+  operation leaves a moved free-form face on an `SmOffsetSurface`, exact but
+  evaluated by marching: the shim's volume check took 11 s on the tank's
+  skin moved 10 mm in, then disagreed. So after the operation, and after
+  `restore_analytic_surfaces`, each face on an offset of a B-spline surface
+  curved both ways (degree 2 or more each way) is shrunk to what it uses
+  (`SmFace::ShrinkGeometry`) and takes NLib's B-spline approximation of the
+  offset (`ApproximateOffsetSurface`, at a tenth of the brep's tolerance),
+  face by face as `SmOffsetExecutive::ReplaceImplicitOffsets` does for the
+  whole brep. Any other offset stays exact: an analytic surface's, whose
+  extension can be a B-spline, and a ruled B-spline's, as SMLib makes a
+  chamfer (degree 1 across: a chamfered hole's rim is 541 by 2), which a
+  stretch then refuses as before (`SHIM_ERR_BAD_SCALE`). A face whose
+  approximation fails keeps its exact offset. Without the shrink the
+  tank's skin doesn't offset.
+- **Its limit: denser surfaces.** The approximated face is a cubic NURBS
+  with a far denser net than its source: the dome's top, 5 by 5, comes back
+  63 by 63 to 99 by 99 (67 by 70 at 2 mm in), and the tank's skin 97 to 141
+  by 39 to 67. Its volume
+  differs from the exact offset's by 2e-5 of the whole (517526.78 against
+  517536.99 mm³, the dome at 2 mm in). Every free-form offset gets faster
+  with it (the tank 10 mm in: 11 s failing before).
+- **Shells across nearly smooth edges fail, and can crash.** SMLib's shell
+  takes an edge as smooth when its faces' normals agree within its tangency
+  tolerance at five points inside it, never its ends
+  (`SmEdgeuse::IsTangentSector`), and offsets both faces as if they met.
+  Faces a hair off smooth then no longer meet, by the wall times the sine
+  of the crease, the edge mating fails (`MateEdges` reports "Will be Fixed
+  Later" and goes on), and the booleans after it fail or grind. Measured at
+  nine points along each smooth edge, ends included: the domed box, the
+  tank and a filleted Block's rounds meet exactly (0°, and 0.00007° at
+  worst on the Block); the N-sided fills meet the rounds and each other up
+  to 0.076° off (0.046° inside the edges), and SMLib's own fillets on
+  NURBS faces 0.003° to 0.005°. The rounded box's shells fail every way,
+  3 to 20 s each; the domed box with its rim filleted r 2 fails at every
+  wall down to 0.01 mm (its fillet also leaves one rim edge with a 1.3 mm
+  tolerance, and corner blends whose edges don't mate, `SM_ERR_NULL_POINTER`);
+  the tank with its cap rims filleted r 2 fails at 1 mm and at 2 mm
+  crashes the process (`SIGSEGV`). Shelling at a looser model tolerance,
+  1e-4 or 1e-3 mm, makes shells 4 to 5 mm wrong. Not patched: a caller
+  should refuse a solid with an edge between about 0.0005° and its
+  tangency tolerance off smooth before shelling it.
+- **`Brep::edge_creases`** (`sm_brep_edge_creases`) says how far off
+  smooth each edge is: the largest angle between its two faces' normals at
+  twelve points along it, its ends and a thousandth of it in from them
+  among them, read from its faceuses as `IsTangentSector` reads them. An
+  edge's middle alone (`EdgeGeometry::bend_deg`) misses the tank's fillet,
+  0.00004° off there (`edge_creases_find_where_faces_part_from_smooth`: a
+  box's edges read 90°, a Block filleted all round under 0.0005°, the
+  fills 0.05° to 0.11°, the tank's rounded rims more than 0.0005°).
 
 ## Notes from the 1.0.1 merge
 
