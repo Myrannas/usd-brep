@@ -8379,8 +8379,11 @@ sm_status sweep_profile_along(const SmBrep& brep, const std::vector<const SmEdge
     }
     // Where the edges meet they must run on smoothly. Across a sharp edge of
     // the part the interpolated normal rounds the corner, and the groove came
-    // out 2 to 8% off its volume, or not at all, by the samples.
-    const double kink = 1e-3;
+    // out 2 to 8% off its volume, or not at all, by the samples. Within a
+    // degree they run on: free-form patches stitched a hair off smooth, as
+    // an N-sided fill meets its rounds 0.08 degrees off, turn an edge
+    // crossing them by as much, and the path takes the kink.
+    const double kink = SM_PI / 180.0;
     for (size_t i = 1; i < chain.size(); ++i) {
         const SmExtent1d before = splines[i - 1]->GetNaturalInterval();
         const SmExtent1d after = splines[i]->GetNaturalInterval();

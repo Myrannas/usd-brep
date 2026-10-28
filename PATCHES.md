@@ -1136,11 +1136,29 @@ line along its normal makes them, its y following the faces' normal.
   What a cut removes is 3e-3 to 9e-3 under the profile's area times the
   length, as it should be on a convex round, and agrees across the
   tolerances to 4e-4.
-- Edges must meet tangentially, within 1e-3 radians, or the chain is
-  refused (`SM_SHIM_ERR_ARC_CORNER`). Over a box's sharp edge the
-  interpolated normal rounds the corner: the groove came out 2 to 8% off
-  its volume at 16 and 32 samples an edge, and at 64 the sweep failed
-  (`SM_SHIM_ERR_BAD_SWEEP`) or the cut did (`SM_ERR`).
+- Edges must meet tangentially, within a degree, or the chain is refused
+  (`SM_SHIM_ERR_ARC_CORNER`). Over a box's sharp edge the interpolated
+  normal rounds the corner: the groove came out 2 to 8% off its volume at
+  16 and 32 samples an edge, and at 64 the sweep failed
+  (`SM_SHIM_ERR_BAD_SWEEP`) or the cut did (`SM_ERR`). The limit was 1e-3
+  radians until free-form parts: patches stitched a hair off smooth, as an
+  N-sided fill meets its rounds 0.046 to 0.076 degrees off, turn an edge
+  crossing them by as much, and a groove over them was refused. Within a
+  degree the path takes the kink: a square groove over a fold of half a
+  degree between two planes sweeps manifold within 1e-3 of its area times
+  its length and cuts manifold, and one over two degrees is refused
+  (`runs_on_across_a_crease_within_a_degree`).
+- A groove round a sharp corner of its path on a curved face can't be one
+  sweep, and two pieces mitred at the corner unite badly: both end square
+  to the path there, sharing the profile's apex and the normal's line, and
+  their union failed (`SM_ERR`, status 1001) 22 times in 24 on the dome and
+  the tank. Rounded instead, the round must clear the profile's reach
+  where its sides run on above the surface: a V 2 wide and 1.5 deep, its
+  sides on 1 mm, reaches 1.667 either side there, and round corners of 1
+  to 1.5 mm failed to sweep (status 2024); at 2 mm one of four crashed
+  uniting a loop's two halves (`SIGSEGV` in `SmMerge::ManifoldBoolean`)
+  and another failed to sweep; at 2.5 mm one in 24 failed; and from 2.7 mm
+  every one of 24 built.
 - A V whose corners lie on the surface crashed in the cut, on the 15°
   diagonal at 1e-3 (`SIGSEGV` in `SmApiBooleanDifference`, at
   `sm_WhichPVToCombine`); at 1e-2 it cut, leaving slivers of its walls.
