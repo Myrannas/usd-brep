@@ -228,7 +228,7 @@ fn arcs_run_either_way() {
         let curves = curves
             .iter()
             .enumerate()
-            .map(|(i, &c)| BoundaryCurve::labelled(c, side(i as u32)))
+            .map(|(i, c)| BoundaryCurve::labelled(c.clone(), side(i as u32)))
             .collect();
         let swept = sweep(
             vec![curves],

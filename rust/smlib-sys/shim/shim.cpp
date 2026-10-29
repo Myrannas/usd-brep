@@ -236,7 +236,10 @@ sm_face_info describe_face(const SmFace* face) {
         describe_placement(info, torus->GetPosition());
         info.radius = torus->GetMajorRadius();
         info.minor_radius = torus->GetMinorRadius();
-    } else if (type == SmBSplineSurface_TYPE) {
+    } else if (type == SmBSplineSurface_TYPE || type == SmSurfOfRevolution_TYPE) {
+        // A surface of revolution is a B-spline surface on its own net, which
+        // its (u, v) are (SmSurfOfRevolution.h), so it reads as the NURBS it
+        // is; kernel_type still says what it is.
         const SmBSplineSurface* nurbs = static_cast<const SmBSplineSurface*>(surface);
         info.kind = SM_SURFACE_NURBS;
         info.degree_u = static_cast<uint32_t>(nurbs->GetDegree(SM_SP_U));
@@ -773,10 +776,60 @@ sm_status sweep_face(const SmBrep& brep, SmFace* face, double distance, SmBrep*&
     return SM_SUCCESS;
 }
 
+// A spline of sm_plane_curve in the plane z = 0, from its poles and its whole
+// knot vector (SmApiCreateCanonicalCurve): non-rational, its knots rising,
+// clamped at both ends and repeated no more than its degree inside, or
+// SM_ERR_INVALID_INPUT.
+sm_status spline_curve(const sm_plane_curve& curve, SmBSplineCurve*& out) {
+    out = nullptr;
+    if (curve.degree < 1 || !curve.poles || !curve.knots) return SM_ERR_INVALID_INPUT;
+    const ULONG degree = static_cast<ULONG>(curve.degree);
+    if (curve.pole_count < degree + 1) return SM_ERR_INVALID_INPUT;
+    SmTArray<SmPoint3d> poles;
+    for (size_t i = 0; i < curve.pole_count; ++i) {
+        const double x = curve.poles[2 * i], y = curve.poles[2 * i + 1];
+        if (!std::isfinite(x) || !std::isfinite(y)) return SM_ERR_INVALID_INPUT;
+        poles.Add(SmPoint3d(x, y, 0.0));
+    }
+    SmTArray<double> knots;
+    SmTArray<ULONG> multiplicities;
+    for (size_t i = 0; i < curve.pole_count + degree + 1; ++i) {
+        const double knot = curve.knots[i];
+        if (!std::isfinite(knot) || (i > 0 && knot < curve.knots[i - 1])) return SM_ERR_INVALID_INPUT;
+        if (i > 0 && knot == curve.knots[i - 1]) {
+            multiplicities[multiplicities.GetSize() - 1] += 1;
+        } else {
+            knots.Add(knot);
+            multiplicities.Add(1);
+        }
+    }
+    const ULONG last = knots.GetSize() - 1;
+    if (knots.GetSize() < 2 || multiplicities[0] != degree + 1 || multiplicities[last] != degree + 1) {
+        return SM_ERR_INVALID_INPUT;
+    }
+    for (ULONG i = 1; i < last; ++i) {
+        if (multiplicities[i] > degree) return SM_ERR_INVALID_INPUT;
+    }
+    const SmApiStatus status =
+        SmApiCreateCanonicalCurve(poles, knots, multiplicities, nullptr, degree, SM_CF_UNSPECIFIED, out);
+    if (status != SM_SUCCESS || !out) {
+        delete out;
+        out = nullptr;
+        return status != SM_SUCCESS ? static_cast<sm_status>(status) : SM_ERR;
+    }
+    return SM_SUCCESS;
+}
+
 // A curve of sm_brep_create_planar_faces, made in the plane z = 0, where
 // SM_API makes its lines, arcs and circles.
 sm_status plane_curve(const sm_plane_curve& curve, SmCurve*& out) {
     out = nullptr;
+    if (curve.kind == SM_PLANE_SPLINE) {
+        SmBSplineCurve* spline = nullptr;
+        const sm_status status = spline_curve(curve, spline);
+        out = spline;
+        return status;
+    }
     const SmPoint3d a(curve.a[0], curve.a[1], 0.0);
     if (!std::isfinite(a.x) || !std::isfinite(a.y)) return SM_ERR_INVALID_INPUT;
     const bool round = curve.kind == SM_PLANE_ARC || curve.kind == SM_PLANE_CIRCLE;
@@ -7550,17 +7603,67 @@ sm_status taper_face(const SmBrep& brep, const SmFace* face, double distance, do
 // ends and its unit tangents there, along the way it runs.
 struct PipeSegment {
     sm_plane_curve curve;
-    bool round = false;  // an arc or a circle
+    bool round = false;   // an arc or a circle
+    bool spline = false;  // a spline
     double start[2] = {0.0, 0.0};
     double end[2] = {0.0, 0.0};
     double start_tangent[2] = {0.0, 0.0};
     double end_tangent[2] = {0.0, 0.0};
     double sweep = 0.0;  // an arc's turn in degrees, signed; a circle's 360
+    // An arc, a circle or a spline: a curve that meets another only
+    // tangentially, since a plane can't mitre it.
+    bool curved() const { return round || spline; }
+    // A spline whose ends meet, a ring on its own.
+    bool ring() const { return spline && std::hypot(end[0] - start[0], end[1] - start[1]) <= 1e-9; }
 };
+
+// Where a clamped spline starts and ends and which way it runs there: its
+// first and last poles, towards the first pole that differs from each, as a
+// clamped B-spline's lowest derivative that doesn't vanish runs.
+void spline_ends(const sm_plane_curve& curve, PipeSegment& segment) {
+    const size_t count = curve.pole_count;
+    const double* p = curve.poles;
+    if (count == 0 || !p) return;  // spline_curve refuses it
+    const auto direction = [&](size_t from, bool forward, double out[2]) {
+        out[0] = out[1] = 0.0;
+        for (size_t k = 1; k < count; ++k) {
+            const size_t to = forward ? from + k : from - k;
+            const double dx = p[2 * to] - p[2 * from], dy = p[2 * to + 1] - p[2 * from + 1];
+            const double length = std::hypot(dx, dy);
+            if (length > 1e-12) {
+                out[0] = (forward ? dx : -dx) / length;
+                out[1] = (forward ? dy : -dy) / length;
+                return;
+            }
+        }
+    };
+    segment.start[0] = p[0];
+    segment.start[1] = p[1];
+    segment.end[0] = p[2 * (count - 1)];
+    segment.end[1] = p[2 * (count - 1) + 1];
+    direction(0, true, segment.start_tangent);
+    direction(count - 1, false, segment.end_tangent);
+}
+
+struct Profile;
+
+// A spline's piece of a pipe and of a swept profile, beside the oriented
+// sweep that makes them (below).
+sm_status spline_pipe_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame, double radius,
+                            int32_t wall, double before, double after, bool first, bool last,
+                            std::unique_ptr<SmBrep>& piece);
+sm_status spline_profile_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame,
+                               const Profile& profile, double before, double after, bool first, bool last,
+                               std::unique_ptr<SmBrep>& piece);
 
 PipeSegment pipe_segment(const sm_plane_curve& curve) {
     PipeSegment segment;
     segment.curve = curve;
+    if (curve.kind == SM_PLANE_SPLINE) {
+        segment.spline = true;
+        spline_ends(curve, segment);
+        return segment;
+    }
     if (curve.kind == SM_PLANE_LINE) {
         const double dx = curve.b[0] - curve.a[0], dy = curve.b[1] - curve.a[1];
         const double length = std::hypot(dx, dy);
@@ -7587,6 +7690,16 @@ PipeSegment pipe_segment(const sm_plane_curve& curve) {
     segment.end_tangent[0] = -turn * std::sin(b);
     segment.end_tangent[1] = turn * std::cos(b);
     return segment;
+}
+
+// How far a spline's poles, and so the spline, reach from the frame's
+// origin; 0 for any other curve.
+double spline_reach(const PipeSegment& segment) {
+    double reach = 0.0;
+    for (size_t k = 0; segment.spline && k < segment.curve.pole_count; ++k) {
+        reach = std::max(reach, std::hypot(segment.curve.poles[2 * k], segment.curve.poles[2 * k + 1]));
+    }
+    return reach;
 }
 
 // The sharpest turn a pipe's path may take where two curves meet: 179
@@ -7637,6 +7750,7 @@ void mark_pipe(SmFace& face, int32_t role, int32_t segment) {
 sm_status pipe_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame, double radius,
                      int32_t wall, double before, double after, bool first, bool last,
                      std::unique_ptr<SmBrep>& piece) {
+    if (segment.spline) return spline_pipe_piece(segment, index, frame, radius, wall, before, after, first, last, piece);
     const SmVector3d x = frame.GetXAxis(), y = frame.GetYAxis(), normal = frame.GetZAxis();
     const auto world = [&](double u, double v) { return frame.GetOrigin() + x * u + y * v; };
     // Where the piece starts, extended back along the curve.
@@ -7781,15 +7895,17 @@ sm_status create_pipe(const sm_plane_curve* path, size_t count, const SmAxis2Pla
     for (size_t i = 0; i + 1 < count; ++i) joints.push_back(pipe_joint(segments[i], segments[i + 1]));
     if (closed && count > 1) joints.push_back(pipe_joint(last, first));
     for (size_t i = 0; i < joints.size(); ++i) {
-        const bool round = segments[i].round || segments[(i + 1) % count].round;
+        const bool round = segments[i].curved() || segments[(i + 1) % count].curved();
         if (joints[i].turn > MAX_PIPE_TURN) return SM_SHIM_ERR_BAD_PATH;
         if (round && joints[i].mitred()) return SM_SHIM_ERR_ARC_CORNER;
     }
+    if (count == 1 && first.ring() && pipe_joint(first, first).mitred()) return SM_SHIM_ERR_ARC_CORNER;
     // Big enough for a box to cover any piece beyond a mitre.
     double size = 8.0 * radius;
     for (const PipeSegment& segment : segments) {
         for (const double* p : {segment.start, segment.end}) size += std::hypot(p[0], p[1]);
         if (segment.round) size += 2.0 * segment.curve.radius;
+        size += 2.0 * spline_reach(segment);
     }
     for (const PipeJoint& joint : joints) size += 2.0 * radius * (std::tan(joint.turn / 2.0) + 1.0);
 
@@ -8026,6 +8142,9 @@ void mark_profile(SmFace& face, int32_t role, int32_t path, int32_t segment) {
 sm_status profile_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame,
                         const Profile& profile, double before, double after, bool first, bool last,
                         std::unique_ptr<SmBrep>& piece) {
+    if (segment.spline) {
+        return spline_profile_piece(segment, index, frame, profile, before, after, first, last, piece);
+    }
     const SmVector3d x = frame.GetXAxis(), y = frame.GetYAxis(), normal = frame.GetZAxis();
     const auto world = [&](double u, double v) { return frame.GetOrigin() + x * u + y * v; };
     SmPoint3d origin;
@@ -8148,10 +8267,11 @@ sm_status sweep_profile(const sm_plane_curve* path, size_t count, const Profile&
     for (size_t i = 0; i + 1 < count; ++i) joints.push_back(pipe_joint(segments[i], segments[i + 1]));
     if (closed && count > 1) joints.push_back(pipe_joint(last, first));
     for (size_t i = 0; i < joints.size(); ++i) {
-        const bool round = segments[i].round || segments[(i + 1) % count].round;
+        const bool round = segments[i].curved() || segments[(i + 1) % count].curved();
         if (joints[i].turn > MAX_PIPE_TURN) return SM_SHIM_ERR_BAD_PATH;
         if (round && joints[i].mitred()) return SM_SHIM_ERR_ARC_CORNER;
     }
+    if (count == 1 && first.ring() && pipe_joint(first, first).mitred()) return SM_SHIM_ERR_ARC_CORNER;
     // A bend turns the profile about its centre, which must lie beyond the
     // profile: the left reaches towards an anticlockwise bend's centre, the
     // right towards a clockwise one's.
@@ -8171,6 +8291,7 @@ sm_status sweep_profile(const sm_plane_curve* path, size_t count, const Profile&
     for (const PipeSegment& segment : segments) {
         for (const double* p : {segment.start, segment.end}) size += std::hypot(p[0], p[1]);
         if (segment.round) size += 2.0 * segment.curve.radius;
+        size += 2.0 * spline_reach(segment);
     }
     for (const PipeJoint& joint : joints) size += 2.0 * reach * (std::tan(joint.turn / 2.0) + 1.0);
 
@@ -8343,6 +8464,176 @@ int32_t piece_at(const std::vector<double>& ends, double t) {
         if (t <= ends[i]) return static_cast<int32_t>(i);
     }
     return -1;
+}
+
+// How far a spline piece's walls may stray from the exact sweep, in model
+// units: the oriented sweep's approximation tolerance.
+const double SPLINE_SWEEP_TOLERANCE = 1e-5;
+
+// What a face of a spline piece is, for the caller's marks: a side, swept
+// from a profile segment, or the cap at the spline's start or end.
+enum SplineFace { SPLINE_SIDE, SPLINE_START, SPLINE_END };
+
+// Where each profile segment ends along its closed section (profile_section).
+sm_status section_ends(const Profile& profile, const SmBSplineCurve& section, std::vector<double>& ends) {
+    const SmExtent1d range = section.GetNaturalInterval();
+    for (size_t i = 0; i < profile.curves.size(); ++i) {
+        double start[2], end[2], middle[2];
+        curve_points(profile.curves[i], start, end, middle);
+        double t = 0.0, distance = 0.0;
+        SmPoint3d closest;
+        if (i + 1 == profile.curves.size()) {
+            t = range.GetMax();
+        } else if (SmApiCurveClosestPoint(&section, SmPoint3d(0.0, end[0], end[1]), closest, t, distance) !=
+                   SM_SUCCESS) {
+            return SM_ERR;
+        }
+        ends.push_back(t);
+    }
+    return SM_SUCCESS;
+}
+
+// A spline's piece: the profile standing square to the spline where it
+// starts, as profile_piece stands it (its x to the left, its y along the
+// frame's z), carried along it by the oriented sweep
+// (SmBSplineSurface::CreateOrientedSweepSurface, a fork patch) with its y
+// held along the frame's z, which for a path in one plane is the frame that
+// turns least, approximated to SPLINE_SWEEP_TOLERANCE. The sides are the
+// swept surface's faces, split where it isn't smooth; an open spline is capped
+// with its sections at each end, and one whose ends meet closes on itself.
+// Each face is marked as `mark` says, a side with the profile segment its
+// middle was swept from.
+template <typename Mark>
+sm_status spline_piece(const PipeSegment& segment, const SmAxis2Placement& frame, const Profile& profile,
+                       const Mark& mark, std::unique_ptr<SmBrep>& piece) {
+    const SmContext* context = SmApiGetOrCreateContext();
+    SmBSplineCurve* raw = nullptr;
+    sm_status status = spline_curve(segment.curve, raw);
+    if (status != SM_SUCCESS) return status;
+    std::unique_ptr<SmBSplineCurve> path(raw);
+    SmStatus done = path->Transform(frame);
+    if (done != SM_SUCCESS) return static_cast<sm_status>(done);
+    // The sweep fails along a spline of degree 1 (sweep_profile_along).
+    if (path->GetDegree() < 3 && path->DegreeElevate(3) != SM_SUCCESS) return SM_ERR;
+    // The frame's z all along, on the path's parameters: the path with
+    // every pole there.
+    SmCurve* copy = nullptr;
+    done = path->Copy(*context, copy);
+    if (done != SM_SUCCESS || !copy) return done != SM_SUCCESS ? static_cast<sm_status>(done) : SM_ERR;
+    std::unique_ptr<SmBSplineCurve> up(static_cast<SmBSplineCurve*>(copy));
+    const SmVector3d z = frame.GetZAxis();
+    for (ULONG i = 0; i < up->GetNumberControlPoints(); ++i) {
+        done = up->SetControlPoint(SM_CP_NON_RATIONAL, i, SmPoint3d(z.x, z.y, z.z), 1.0);
+        if (done != SM_SUCCESS) return static_cast<sm_status>(done);
+    }
+    std::unique_ptr<SmBSplineCurve> section;
+    status = profile_section(profile, section);
+    if (status != SM_SUCCESS) return status;
+    std::vector<double> segment_ends;
+    status = section_ends(profile, *section, segment_ends);
+    if (status != SM_SUCCESS) return status;
+
+    SmBSplineSurface* surface = nullptr;
+    done = SmBSplineSurface::CreateOrientedSweepSurface(*context, section.get(), path.get(), up.get(),
+                                                        SPLINE_SWEEP_TOLERANCE, surface);
+    if (done != SM_SUCCESS || !surface) return done != SM_SUCCESS ? static_cast<sm_status>(done) : SM_ERR;
+    const SmExtent2d domain = surface->GetNaturalUVDomain();
+    piece.reset(new (*context) SmBrep());
+    SmTArray<SmFace*> sides;
+    done = piece->CreateFacesFromSurface(surface, domain, SM_CT_C1, sides);
+    if (done != SM_SUCCESS) return static_cast<sm_status>(done);
+    // The sweep runs along u, the section along v.
+    const bool ring = segment.ring();
+    SmTArray<SmCurve*> caps[2];
+    for (ULONG i = 0; i < sides.GetSize(); ++i) {
+        SmSurface* own = sides[i]->GetSurface();
+        const SmExtent2d part = own->GetNaturalUVDomain();
+        const double at[2] = {part.GetMin().x, part.GetMax().x};
+        const double whole[2] = {domain.GetMin().x, domain.GetMax().x};
+        for (int end = 0; end < 2 && !ring; ++end) {
+            if (std::fabs(at[end] - whole[end]) > 1e-9 * (1.0 + std::fabs(whole[end]))) continue;
+            SmBSplineCurve* iso = nullptr;
+            done = own->CreateIsoParametricCurve(*context, SM_SP_U, at[end], SPLINE_SWEEP_TOLERANCE / 10.0, iso);
+            if (done != SM_SUCCESS || !iso) return done != SM_SUCCESS ? static_cast<sm_status>(done) : SM_ERR;
+            caps[end].Add(iso);
+        }
+        mark(*sides[i], SPLINE_SIDE, piece_at(segment_ends, part.Evaluate(0.5, 0.5).y));
+    }
+    for (int end = 0; end < 2 && !ring; ++end) {
+        SmTArray<SmFace*> made;
+        done = piece->CreatePlanarFacesWith3DCurves(nullptr, caps[end], SPLINE_SWEEP_TOLERANCE, made);
+        if (done != SM_SUCCESS) return static_cast<sm_status>(done);
+        for (ULONG i = 0; i < made.GetSize(); ++i) mark(*made[i], end == 0 ? SPLINE_START : SPLINE_END, -1);
+    }
+    done = piece->StitchAndOrient();
+    if (done != SM_SUCCESS) return static_cast<sm_status>(done);
+    return is_manifold_solid(*piece) ? SM_SUCCESS : SM_SHIM_ERR_BAD_SWEEP;
+}
+
+// A straight run-out of a pipe's piece: `length` along the spline's end
+// tangent beyond its end, or back along its start tangent before its start,
+// as pipe_piece makes a line's, its wall marked as the spline's.
+sm_status run_out(const PipeSegment& segment, bool at_end, double length, int32_t index,
+                  const SmAxis2Placement& frame, double radius, int32_t wall, std::unique_ptr<SmBrep>& out) {
+    const double* point = at_end ? segment.end : segment.start;
+    const double* tangent = at_end ? segment.end_tangent : segment.start_tangent;
+    const double sign = at_end ? 1.0 : -1.0;
+    sm_plane_curve line{};
+    line.kind = SM_PLANE_LINE;
+    for (int k = 0; k < 2; ++k) {
+        line.a[k] = at_end ? point[k] : point[k] + sign * length * tangent[k];
+        line.b[k] = at_end ? point[k] + sign * length * tangent[k] : point[k];
+    }
+    return pipe_piece(pipe_segment(line), index, frame, radius, wall, 0.0, 0.0, false, false, out);
+}
+
+sm_status spline_pipe_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame, double radius,
+                            int32_t wall, double before, double after, bool first, bool last,
+                            std::unique_ptr<SmBrep>& piece) {
+    Profile disc;
+    sm_plane_curve circle{};
+    circle.kind = SM_PLANE_CIRCLE;
+    circle.radius = radius;
+    disc.curves.push_back(circle);
+    take_in(disc, circle);
+    const auto mark = [&](SmFace& face, SplineFace role, int32_t) {
+        if (role == SPLINE_SIDE) {
+            mark_pipe(face, wall, index);
+        } else if (role == SPLINE_START && first) {
+            mark_pipe(face, SM_PIPE_START, -1);
+        } else if (role == SPLINE_END && last) {
+            mark_pipe(face, SM_PIPE_END, -1);
+        }
+    };
+    sm_status status = spline_piece(segment, frame, disc, mark, piece);
+    if (status != SM_SUCCESS) return status;
+    // A spline meets its neighbours tangentially, so it's made longer only
+    // past an open path's ends: a bore's run-outs.
+    for (const auto& [length, at_end] : {std::make_pair(before, false), std::make_pair(after, true)}) {
+        if (length <= 0.0) continue;
+        std::unique_ptr<SmBrep> straight;
+        status = run_out(segment, at_end, length, index, frame, radius, wall, straight);
+        if (status == SM_SUCCESS) status = join_piece(piece, straight);
+        if (status != SM_SUCCESS) return status;
+    }
+    return SM_SUCCESS;
+}
+
+sm_status spline_profile_piece(const PipeSegment& segment, int32_t index, const SmAxis2Placement& frame,
+                               const Profile& profile, double before, double after, bool first, bool last,
+                               std::unique_ptr<SmBrep>& piece) {
+    // Only a mitre makes a profile's piece longer, and a spline isn't mitred.
+    if (before > 0.0 || after > 0.0) return SM_SHIM_ERR_ARC_CORNER;
+    const auto mark = [&](SmFace& face, SplineFace role, int32_t segment_index) {
+        if (role == SPLINE_SIDE) {
+            mark_profile(face, SM_PROFILE_SIDE, index, segment_index);
+        } else if (role == SPLINE_START && first) {
+            mark_profile(face, SM_PROFILE_START, -1, -1);
+        } else if (role == SPLINE_END && last) {
+            mark_profile(face, SM_PROFILE_END, -1, -1);
+        }
+    };
+    return spline_piece(segment, frame, profile, mark, piece);
 }
 
 // sm_brep_sweep_profile_along's work: the chain joined into one path, the
@@ -8755,6 +9046,7 @@ sm_status sm_brep_sweep_profile(const sm_plane_curve* path, size_t path_count, c
     return guarded([&] {
         Profile shape;
         for (size_t i = 0; i < profile_count; ++i) {
+            if (profile[i].kind == SM_PLANE_SPLINE) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
             sm_plane_curve curve = profile[i];
             curve.label = profile_label(static_cast<int32_t>(i));
             shape.curves.push_back(curve);
@@ -8797,6 +9089,7 @@ sm_status sm_brep_sweep_profile_along(const sm_brep* brep, const uint32_t* edges
         }
         Profile shape;
         for (size_t i = 0; i < profile_count; ++i) {
+            if (profile[i].kind == SM_PLANE_SPLINE) return static_cast<sm_status>(SM_ERR_INVALID_INPUT);
             shape.curves.push_back(profile[i]);
             take_in(shape, profile[i]);
         }

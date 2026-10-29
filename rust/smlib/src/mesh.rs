@@ -361,7 +361,10 @@ pub enum Surface {
         /// The tube's radius.
         minor_radius: f64,
     },
-    /// A NURBS surface.
+    /// A NURBS surface: a B-spline surface, or a surface of revolution, such
+    /// as a spline turned by [`Brep::revolve_face`](crate::Brep::revolve_face)
+    /// makes, which SMLib holds as the B-spline on its own net, its (u, v) the
+    /// net's (`FreeSurface::net` reads it).
     Nurbs {
         /// Degree in u and v.
         degree: [u32; 2],

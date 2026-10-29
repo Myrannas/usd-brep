@@ -12,8 +12,8 @@
 //! mirrored ([`Brep::transform`], [`Brep::scale_about`], [`Brep::mirror`]),
 //! and planar faces swept into prisms ([`Brep::sweep_face`], with draft
 //! [`Brep::sweep_face_tapered`]) or revolved ([`Brep::revolve_face`]),
-//! whether a solid's or ones built from lines, arcs and circles in a plane
-//! ([`Brep::planar_faces`]), and circles swept along paths into pipes
+//! whether a solid's or ones built from lines, arcs, circles and splines in
+//! a plane ([`Brep::planar_faces`]), and circles swept along paths into pipes
 //! ([`Brep::pipe`]), or any closed profile ([`Brep::sweep_profile`]).
 //! [`Brep::shell`] hollows a solid, leaving chosen faces
 //! open. [`Brep::offset_faces`]
@@ -58,6 +58,7 @@ mod motion;
 mod pipe;
 mod rebuild;
 mod shell;
+mod spline;
 mod tessellation;
 
 pub use brep::Brep;

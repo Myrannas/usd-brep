@@ -405,8 +405,9 @@ fn a_mirror_keeps_every_surface_analytic_and_every_label() {
                             assert!((major - major_radius).abs() < 1e-12);
                             assert!((minor - minor_radius).abs() < 1e-12);
                         }
+                        // The bracket's rounded rims too: surfaces of
+                        // revolution, which read as NURBS.
                         (Surface::Nurbs { .. }, Surface::Nurbs { .. }) => {}
-                        // The bracket's rounded rims: surfaces of revolution.
                         (Surface::Other { kernel_type: a }, Surface::Other { kernel_type: b }) => {
                             assert_eq!(a, b, "{name}")
                         }
@@ -532,7 +533,8 @@ fn half_mirrored_and_joined_is_the_whole() {
     on_kernel(|k| {
         let whole = bracket(k);
         let volume = whole.volume(1e-8).unwrap();
-        assert!(sorted_kinds(&whole).contains(&"other"));
+        // The rims are surfaces of revolution, read as NURBS.
+        assert!(sorted_kinds(&whole).contains(&"nurbs"));
         // The half on +x, mirrored across x = 0 and joined back.
         let keep = Brep::cuboid(k, [0.0, -100.0, -100.0], [200.0, 200.0, 200.0]).unwrap();
         let half = bracket(k).intersection(keep).unwrap();
@@ -569,7 +571,7 @@ fn half_mirrored_and_joined_is_the_whole() {
                 .filter(|&kind| kind == wanted)
                 .count()
         };
-        for kind in ["plane", "cylinder", "other"] {
+        for kind in ["plane", "cylinder", "nurbs"] {
             assert_eq!(count(&joined, kind), count(&whole, kind), "{kind}");
         }
         assert_eq!((count(&whole, "sphere"), count(&joined, "sphere")), (1, 4));
