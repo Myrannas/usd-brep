@@ -265,7 +265,7 @@ fn raws(curves: &[&Curve]) -> Vec<*const sys::sm_curve> {
 }
 
 impl FreeSurface {
-    fn wrap(operation: &'static str, raw: *mut sys::sm_surface) -> Result<FreeSurface, Error> {
+    pub(crate) fn wrap(operation: &'static str, raw: *mut sys::sm_surface) -> Result<FreeSurface, Error> {
         NonNull::new(raw)
             .map(|raw| FreeSurface {
                 raw,
@@ -441,6 +441,11 @@ impl FreeSurface {
         let status = unsafe { sys::sm_surface_of_face(brep.as_raw(), face, &mut out) };
         Error::check(OP, status)?;
         FreeSurface::wrap(OP, out)
+    }
+
+    /// The shim's handle, for the crate's other modules.
+    pub(crate) fn as_raw(&self) -> *const sys::sm_surface {
+        self.raw.as_ptr()
     }
 
     /// The surface's (u, v) domain, its lower and upper corners.

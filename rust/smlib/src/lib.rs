@@ -56,6 +56,7 @@ mod label;
 mod mesh;
 mod motion;
 mod pipe;
+mod rebuild;
 mod shell;
 mod tessellation;
 
@@ -76,5 +77,9 @@ pub use label::{Label, LabelMatch, MAX_ROLE_LEN};
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};
 pub use motion::{Moved, MovedFace, RigidMotion, Turn};
 pub use pipe::{PathEnd, Pipe, PipeFace, ProfileFace, ProfileSweep};
+pub use rebuild::{
+    EdgeCurvature, ExtendShape, Meets, RebuildError, RebuildReport, RebuildSurface, Rebuilt, Side,
+    SurfaceSide, Tool,
+};
 pub use shell::{Shell, ShellFace};
 pub use tessellation::{FaceKey, SurfaceCaches, Tessellation};

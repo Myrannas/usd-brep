@@ -19,3 +19,6 @@
 mod bindings;
 
 pub use bindings::*;
+
+#[allow(non_camel_case_types, missing_docs)]
+pub mod rebuild;

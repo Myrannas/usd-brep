@@ -24,6 +24,8 @@ from `v1.0.0` (`c9c5979`).
 | `22e9929` | `SmOffsetGeometryCreation.cpp` | Found offsetting free-form faces: `ReplaceEdgeCurves` keeps an edge's own curve whenever a candidate's ends match the edge's. Offsetting a dome whose normal is upright at its corners, the lifted trim curve and the intersection with a wall share their ends and part between them, so the edge kept a curve the moved face no longer had: every offset of the domed box's top came back open (`SHIM_ERR_BROKE_SOLID`). | Both shortcuts also need seven points inside the candidate to lie on the edge, within its tolerance (`SmEdge::ClosestPoint`). |
 | `932635a` | `SmOffsetGeometryCreation.cpp` | Found offsetting and shelling a lofted tank: `TrimExtendedEdge` looks for a trim point at each of an edge's two vertices. A closed ring edge, a cap's rim, has one: the second search skips the first point, finds nothing, and the edge is left unmated. Every outward offset of the tank's skin failed, and so did shelling it 3 mm open at a cap when its last ring was 24.75 across (`SM_ERR_NULL_POINTER` in the boolean after). | When the one trim point is the new closed curve's own start or end, the whole curve is the edge. A closed curve that starts anywhere else still fails, as before; no case seen does. |
 | `e98c8d9` | `SmOffsetGeometryCreation.cpp` | Found offsetting a lofted tank's skin in: `ExtendTrimEdges` finds a non-lamina edge's other UV curve by dropping the curve lifted on one side onto the other side's extended surface. For a seam both sides are one surface, and onto the far extension of an inward offset, which folds where the extended surface runs through its axis, the drop landed 120 mm away at 5 mm in and the solid came back open. | When both uses of the edge lie on one face and its two original UV curves are one curve moved (checked at five points), the other side's is this side's extended curve moved likewise (`sm_SeamPartner`); otherwise it drops as before. |
+| `838fd7b` | `SmSurface.cpp` | Found rebuilding faces (the continuity spike): `SmSurface::CreateBlendSurface`, under `SmBrep::CreateEdgeEdgeBlend`, ignores the statuses of sampling its two curves and making its cross sections, and skins whatever it has. | Check each step's status, and that both curves' samples and the cross sections agree in number; a failure is `SM_ERR`. |
+| `771389b` | `SmBSplineSurfaceNLib.cpp` | Found rebuilding faces: `CreateSkinnedSurface` with two rails finds their cross sections' parameters again when synchronising their knots moves a rail's domain, rail 2's at `[lNumSections + i]`; NLib takes one set for both, and `CreateBlendSurface` passes one a section, so rail 2's read and wrote past the array. An edge blend between the free-form dome and a wall crashed the process (`EXC_BAD_ACCESS`). | Find rail 2's again only when the set holds them apart. |
 
 Dropped at the 1.0.1 merge: `a9a7a28` and `0afdfdb`, which mated a local
 operation's and a solid offset's edges in the original brep's order
@@ -51,7 +53,11 @@ shim's merges pass (`Brep::merge_faces`, `merge_faces_keeping`); every
 merge inside the kernel, the fillets' and booleans' among them, is as it
 was.
 The torus patches change only `SmTorus::IsNurbSurfaceTorus`, which only the
-shim calls. Patch `23281a6` only adds a method.
+shim calls. Patch `23281a6` only adds a method. The blend patch `838fd7b`
+changes only what a failed sample returns, and `771389b` only a skin with
+two rails whose second rail's domain synchronising moves, which read past
+its array before: both reach the kernel's own edge blends (its offsets'
+`CreateEdgeEdgeBlend`), which behave as before wherever they didn't fail.
 
 ## Notes from the bring-up (no patch needed)
 
@@ -1291,6 +1297,80 @@ its last ring 24.8 or 24.75 across, opened at either cap at 1, 2, 3, 5 and
   0.00004° off there (`edge_creases_find_where_faces_part_from_smooth`: a
   box's edges read 90°, a Block filleted all round under 0.0005°, the
   fills 0.05° to 0.11°, the tank's rounded rims more than 0.0005°).
+
+## Notes from the continuity spike
+
+Patches `838fd7b` and `771389b`, and the shim's `rebuild.cpp` (its own
+header, `rebuild.h`, with `smlib-sys`'s `rebuild` module written out by
+hand rather than by bindgen while it's a spike), from game-cad's free-form
+step 2, a spike on how rebuilt faces meet the faces beyond them. Results
+in `rust/smlib/tests/rebuild.rs` and game-cad's
+`crates/smlib-backend/examples/continuity.rs`.
+
+- **`Brep::rebuild_faces`** (`sm_brep_rebuild_faces`) takes faces out of a
+  copy of the solid, builds surfaces from the rim's edges and the kept
+  faces beyond them, adds them as faces (`CreateFacesFromSurface`, split
+  only where C0: split at C1, a corner blend's patch came back 725 faces)
+  and stitches them back in, all in one call, so no open body reaches
+  Rust. `RemoveFaces` needs `m_bEditingEnabled`, which the call sets while
+  it runs. Each side is a rim edge and how it meets the kept face:
+  Position, Tangent or Curvature.
+- **Its tools.** `Fill`, `CreateNSidedPatch` through 3 to 8 sides, a patch
+  a side; `Coons`, `CreateCoonsPatch`, bicubic, four sides; `Corner`,
+  `SmBrep::CreateCornerBlend` from the rim's edgeuses, three or four
+  sides, every one Tangent (a Position side is `SM_ERR_NULL_POINTER`);
+  `EdgeBlend`, `CreateEdgeEdgeBlend` between two; `Skin`,
+  `CreateSkinnedSurface` through two, a Tangent end with a derivative
+  surface of the kept face (`SmDerivSurfDefinition`,
+  `SM_TT_DIR_TO_REFERENCE_CURVE`). A fill's or Coons patch's Tangent side
+  takes its cross-derivatives from `SmTangentField` along the edge's trim
+  curve on the kept face, its ends from the sides beside it, fitted with
+  matching parameters (`ApproximateCurve`; it reports no gap so fitted).
+  None takes Curvature: the corner blend, the Coons patch, the fill and
+  NLib's skin are G1 at most, and only the edge blend's default
+  (`SM_CT_G2_FROM_SURFACE`) matches curvature, whatever its order.
+- **A rational edge is fitted first.** The fill refuses rational curves
+  (`SM_ERR_INVALID_INPUT`), so an arc is approximated as
+  `sm_CreateNonRationalCurve` does (`ApproximateRationalCurve`) and its
+  trim curve dropped on the kept face again; `fit_tolerance`, by default
+  the brep's tolerance, is how near. It limits the crease: a corner blend
+  at the sample crate's lid corner meets the lid rounds 2.8e-4° off fitted
+  to the brep's tolerance, 9.4e-5° to 1e-6 mm, 2.1e-5° to 1e-8 mm (but its
+  Hollow then takes 40 s); a Coons patch 2e-3°, 1.1e-4° and 5.5e-6°.
+- **A Coons patch's corners need twists.** A Position side's
+  cross-derivative is a cubic between the sides beside it; with no twist
+  at its ends (as `CreateCornerBlend` makes one), a patch between a NURBS
+  dome and a wall met the dome 18° off at its corners. Taking each
+  corner's twist from the Tangent side's field there brings it to 5.4e-4°.
+- **Sides on one face are joined.** The free-form corner part's corner
+  rim is six edges, each round's end two where its fill's patches met, so
+  a fill or Coons patch joins a run of sides on one kept face, meeting it
+  alike, into one (`CreateByJoining`). The corner blend can't: it takes
+  one edgeuse a side.
+- **The stitch.** `SmStitch::DoStitching` at the tolerance given, edges
+  split at another's vertex (a fill's patches split the rim's edges), its
+  narrowest unstitched vertex and edge gaps reported: what it left open,
+  and how far apart. `SmStitch::StitchIntoSolid` (tolerance 0) widens its
+  tolerance from a tenth of the brep's to 1/200 of the diagonal and glues
+  what it finds, reporting only the widest gap glued: an edge blend whose
+  ends stop 0.196 mm off the faces beside them came back a "solid" with a
+  0.2 mm gap glued shut. Neither names the edge it left open.
+- **Edge blends and skins leave their ends open.** Between two rim runs
+  their ends' cross sections aren't the gap's other sides, so a round's
+  ends stay off the faces at its ends: 0.196 mm on a block's rounded edge
+  (2.93 mm ruled, the arc's sagitta), 2.28 mm on the dome's rim. Round a
+  ring, with no ends, they close: a boss's foot rounded r 5, rebuilt by an
+  edge blend, meets the top and the wall within 1.4e-5° and shells.
+- **`Brep::edge_curvatures`** (`sm_brep_edge_curvatures`) gives each face's
+  normal curvature square to an edge at the twelve points `edge_creases`
+  reads (`SmSurface::EvaluateNormalSection` along the edgeuse's binormal),
+  signed against the face's outward normal, for checking Curvature.
+- **`FreeSurface::extended`** (`sm_surface_extend`,
+  `SmSurface::CreateExtendedSurface`, one side or all four): Linear
+  (`SM_CT_G1`), Smooth (`SM_CT_G1_G2`), Natural (`SM_CT_CINFINITY`) and
+  Ruled (`SM_CT_G1R`). The dome's NURBS carried 20 mm on meets itself
+  within 1e-11 mm and 8.5e-7°, Smooth and Natural keeping its curvature
+  across; a plane and a cylinder extend as themselves.
 
 ## Notes from the 1.0.1 merge
 
