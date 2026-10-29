@@ -15439,26 +15439,35 @@ SmStatus SmSurface::CreateBlendSurface
                       }
 
   // Get Sample Values from Face1/Edge1 using edge2 as tangentReference
+  // game-cad: each step's status is checked, as a failed sample left the
+  // cross sections short and the skinning read past them.
   pDSDef->m_pTangentReference = &crCurve2 ;
-  pDSDef->GetSampleValues(*this, crCurve1, rIvl1,
+  SER_MSG(pDSDef->GetSampleValues(*this, crCurve1, rIvl1,
                           bOffToTheRight,
                           TRUE,             // TRUE = blend starts at crCurve1 and moves to m_pTangentReference
-                          sParams, sStartPos, sStart1stDerivs, pOptStart2ndDerivs, pOptStart3rdDerivs) ;
+                          sParams, sStartPos, sStart1stDerivs, pOptStart2ndDerivs, pOptStart3rdDerivs),
+          _T("Sampling the blend's start failed")) ;
 
   // Get Sample Values from Face2/Edge2 using edge1 as tangentReference
   pDSDef->m_pTangentReference = &crCurve1 ;
-  pDSDef->GetSampleValues(crSurface2, crCurve2, rIvl2,
+  SER_MSG(pDSDef->GetSampleValues(crSurface2, crCurve2, rIvl2,
                           bInFromTheLeft,
                           FALSE,           // FALSE = blend stops at crCurve2 starting from m_pTangentReference
-                          sParams, sEndPos, sEnd1stDerivs, pOptEnd2ndDerivs, pOptEnd3rdDerivs) ;
+                          sParams, sEndPos, sEnd1stDerivs, pOptEnd2ndDerivs, pOptEnd3rdDerivs),
+          _T("Sampling the blend's end failed")) ;
+  SER_MSG(sStartPos.GetSize() == sEndPos.GetSize() && sStartPos.GetSize() > 1 ? SM_SUCCESS : SM_ERR,
+          _T("The blend's ends sampled differently")) ;
 
   // use samples to build cross-section curves that capture the G1/G2/G3 shapes
   SmTArray<SmBSplineCurve *> sCrossSections ;
   SmObjsDelete<SmBSplineCurve *> sClean3(&sCrossSections) ;
-  pDSDef->CreateCrossSectionCurves( crContext,
+  SER_MSG(pDSDef->CreateCrossSectionCurves( crContext,
                                     sCrossSections,
                                     sStartPos, sStart1stDerivs, pOptStart2ndDerivs, pOptStart3rdDerivs,
-                                    &sEndPos, &sEnd1stDerivs, pOptEnd2ndDerivs, pOptEnd3rdDerivs) ;
+                                    &sEndPos, &sEnd1stDerivs, pOptEnd2ndDerivs, pOptEnd3rdDerivs),
+          _T("The blend's cross sections failed")) ;
+  SER_MSG(sCrossSections.GetSize() == sParams.GetSize() ? SM_SUCCESS : SM_ERR,
+          _T("The blend's cross sections don't match its samples")) ;
 
   // Skin cross sections with blend endCurves as Rail constraints to build the G1/G2/G3 blend
   SmBSplineSurface *pBlendSurface = NULL ;
