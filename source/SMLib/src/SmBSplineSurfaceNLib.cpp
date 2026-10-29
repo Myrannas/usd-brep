@@ -5357,8 +5357,13 @@ SmStatus SmBSplineSurface::CreateSkinnedSurface
             } // end if domains don't match
 
           // Check rail 2.
-          if ( smos_Fabs( sDomain2After.GetMin() - sDomain2Before.GetMin() ) > SM_EFF_ZERO
-           ||  smos_Fabs( sDomain2After.GetMax() - sDomain2Before.GetMax() ) > SM_EFF_ZERO )
+          // game-cad: NLib takes one set of rail parameters for both rails,
+          // and callers (CreateBlendSurface) pass one a cross section, so
+          // rail 2's are only found again when they were given apart; this
+          // read and wrote past the end of a set for one rail.
+          if ( sIntParams.GetSize() >= 2 * lNumSections
+           && ( smos_Fabs( sDomain2After.GetMin() - sDomain2Before.GetMin() ) > SM_EFF_ZERO
+           ||  smos_Fabs( sDomain2After.GetMax() - sDomain2Before.GetMax() ) > SM_EFF_ZERO ) )
             {
               for ( ii = 0; ii < lNumSections; ii++ )
                 {
