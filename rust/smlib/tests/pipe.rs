@@ -377,7 +377,7 @@ fn refuses_paths_it_cant_follow() {
             Brep::pipe(
                 k,
                 &frame,
-                &[circle, line([20.0, 0.0], [30.0, 0.0])],
+                &[circle.clone(), line([20.0, 0.0], [30.0, 0.0])],
                 R,
                 None,
             ),

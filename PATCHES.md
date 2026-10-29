@@ -1078,7 +1078,8 @@ turn about the frame's z through the path's end and joins it.
   curve, and a line carrying straight on from the one before it merges its
   sides into that one's. Names must come from the roles that survive.
 - A half circle's floor turned round a bend comes back a surface of
-  revolution (`SmSurfOfRevolution`, `Surface::Other` 15020), not a torus.
+  revolution (`SmSurfOfRevolution`), not a torus, read as `Surface::Nurbs`
+  since splines (below; `Surface::Other` 15020 before).
 - Results (`rust/smlib/tests/sweep_profile.rs`): square, V, round and
   stepped profiles straight, round a rounded rectangle's bends, mitred at a
   square frame's corners and a zig-zag's (51° to 90°), with round ends,
@@ -1345,3 +1346,82 @@ What 1.0.1 changes for the shim and its callers:
   `SmApiShellBrepFull` returns an error rather than crashing when an inward
   shell exactly closes the cavity.
 - `SmApiCreateCylinder` builds an `SmCylinder` (the bring-up notes, above).
+
+## Notes from splines (no patch needed)
+
+Shim and Rust only (`rust/smlib-sys/shim/shim.cpp`, `rust/smlib/src/spline.rs`,
+`rust/smlib/src/faces.rs`, `rust/smlib/tests/splines.rs`), for the free-form
+parts spec's sketch splines: a non-rational clamped B-spline in the sketch
+plane, `PlaneCurve::Spline { degree, poles, knots }`, degree 1 to 9 with
+`poles.len() + degree + 1` knots. `PlaneCurve` is `Clone` rather than `Copy`
+now, since a spline holds its poles and knots. No kernel source changes.
+
+- **Planar faces.** The shim makes a spline with `SmApiCreateCanonicalCurve`
+  from its poles and knots (as `Curve::from_poles` does), checking first
+  what the kernel would take wrongly: clamped ends, rising knots, no inner
+  knot of more than the degree's multiplicity. Rust refuses the same and a
+  spline whose poles are all one point (`spline::problem`). A spline bounds
+  a planar face beside lines and arcs, or on its own when its ends meet, a
+  loop as a circle is: the face's area and centroid are the spline's own to
+  1e-7, flat and on a tilted plane, its edge on the spline within 1e-9 and
+  labelled as any curve. A face extruded has a NURBS wall over each spline,
+  `Surface::Nurbs`, its net the kernel's surface within 1e-9.
+- **Pipes and profiles along a spline.** `Brep::pipe` and
+  `Brep::sweep_profile` take a spline in their path: its piece is the disc
+  or the profile swept along it with `CreateOrientedSweepSurface` (`23281a6`),
+  the orientation curve the path's own net with every pole the plane's
+  normal, so the section stays square to the plane, cubic along the sweep
+  (a lower degree is raised to 3 first), approximated to 1e-5
+  (`SPLINE_SWEEP_TOLERANCE`). Its sides come out one NURBS face per profile
+  segment (`CreateFacesFromSurface`, split where only C0), labelled as an
+  arc's; an open spline's ends are capped flat with the section. A spline
+  meets the curves either side of it tangentially, face to face as an arc
+  does (an angle is refused, as an arc's, `SHIM_ERR_ARC_CORNER`), and the
+  lines' and arcs' walls beside it stay cylinders and tori. A closed spline
+  is a ring on its own, its seam a joint that must be smooth; it can't be
+  hollow (the bore would be sealed inside). A hollow pipe's bore runs out
+  past a spline's ends as a line piece of the margin's length, as past a
+  line, so it opens through the caps. Measured on the S-shaped rail
+  (90 × 30): the walls within 3.4e-6 mm of the radius from the spline, the
+  volume within 1e-6 of πr² times its length, flat and tilted, solid and
+  hollow; a ring of the closed blob; a line, the rail, a quarter arc and a
+  line. On an M-series Mac, with the kernel optimised: a pipe along the
+  rail 58 to 92 ms, hollow 272 to 280 ms, the four-curve path 175 to
+  245 ms, a profile swept along it 32 to 39 ms.
+- **Where a pipe can't follow.** Rust refuses, before the kernel: a spline
+  with a corner inside it (an inner knot of the degree's multiplicity where
+  it turns, `Spline::has_corner`), a spline meeting its neighbours at an
+  angle, a spline that closes beside other curves, and a pipe as wide as the
+  spline's tightest bend or wider, or a profile reaching past it on either
+  side (`Spline::sharpest_bends`: the curvature either way, 32 samples a
+  knot span refined by golden section). The shim doesn't measure a
+  spline's bend; a caller of the raw shim gets the kernel's failure.
+- **Profiles hold no splines.** A profile's curves are lines, arcs and
+  circles (`sweep_profile` and `sweep_profile_along` refuse a spline, as the
+  shim does): its pieces are made for a section of lines and arcs.
+- **Level sides merge.** As along lines and arcs, a level profile side
+  swept along a spline (a square bar's top and bottom) is one plane all
+  along, and the unions merge it into the first curve's face: only the
+  sides that aren't level are the spline's by role.
+- **Turned splines read as NURBS.** A face turned from a spline
+  (`revolve_face`) has a side that's an `SmSurfOfRevolution`, which is an
+  `SmBSplineSurface` on its own rational net. `describe_face` now reports it
+  `Surface::Nurbs` with that net (it was `Surface::Other` 15020), exact: the
+  net evaluates to the kernel's points and closest points within 1e-9, and
+  its points lie on the spline turned within 1e-8. Every surface of
+  revolution reads so, the kernel's own too: the half circle's floor turned
+  round a bend (grooves, above), and the tori a mirror leaves as surfaces
+  of revolution (mirrors, above). The shim's face description still gives
+  the class's kernel type, which `Surface::Nurbs` doesn't carry. The volume of a turned spline's solid can't be integrated to 1e-9
+  (`SM_ERR`); 1e-7 holds it to Pappus's within 1e-6.
+- **The probe's cases** (the spec's spline probe) are tests: the D (a line
+  and a cubic arching back to it at an angle), the D meeting its line
+  tangentially, and a closed blob, as faces, extruded, cut from and joined
+  to a block exactly and imprinted onto one (two more faces). Drafted in,
+  every one builds; drafted out, the D whose spline meets its line at an
+  angle is refused at those corners, as an arc's is, and the tangent D and
+  the blob build. The tangent D drafted 15° out took 96 s to integrate to
+  1e-8, so the tests ask 1e-6. Unlike sections (a rectangle, an ellipse, a
+  circle) loft into one skin of 8 pieces, which `StitchAndOrient` closes
+  into a manifold solid with flat caps; the probe found `StitchIntoSolid`
+  doesn't.

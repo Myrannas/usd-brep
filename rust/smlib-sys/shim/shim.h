@@ -307,11 +307,18 @@ enum sm_plane_curve_kind {
     SM_PLANE_ARC = 1,
     /* The whole circle round centre a of radius, a loop on its own
      * (SmApiCreateCircle). */
-    SM_PLANE_CIRCLE = 2
+    SM_PLANE_CIRCLE = 2,
+    /* A non-rational B-spline of degree 1 or more on its pole_count poles at
+     * poles, (x, y) pairs, with the whole knot vector at knots, pole_count +
+     * degree + 1 of them, rising and clamped: the first degree + 1 alike and
+     * the last, so it starts at its first pole and ends at its last
+     * (SmApiCreateCanonicalCurve). One whose ends meet is a loop on its own. */
+    SM_PLANE_SPLINE = 3
 };
 
-/* A line, arc or circle in a plane's own (x, y), and the label for its edge.
- * Fields a kind doesn't use are ignored. */
+/* A line, arc, circle or spline in a plane's own (x, y), and the label for
+ * its edge. Fields a kind doesn't use are ignored; a spline's poles and knots
+ * are the caller's, read during the call alone. */
 typedef struct sm_plane_curve {
     int32_t kind;
     double a[2];
@@ -320,12 +327,17 @@ typedef struct sm_plane_curve {
     double start_deg;
     double sweep_deg;
     sm_label label;
+    int32_t degree;
+    const double *poles;
+    size_t pole_count;
+    const double *knots;
 } sm_plane_curve;
 
 /* Planar faces bounded by closed loops of curves in the plane through origin
  * spanned by x_axis and y_axis (unit and perpendicular, as for
  * sm_brep_place): the curves are made with SmApiCreateLineSegment,
- * SmApiCreateArc and SmApiCreateCircle in the plane's (x, y), and the faces
+ * SmApiCreateArc, SmApiCreateCircle and, for splines,
+ * SmApiCreateCanonicalCurve in the plane's (x, y), and the faces
  * with SmApiCreatePlanarFaces. Curves may come in any order and direction;
  * every end must meet exactly one other curve's end, and loops mustn't cross
  * or touch. Outer loops bound faces, loops inside them holes, and loops inside
@@ -573,28 +585,34 @@ typedef struct sm_pipe_face {
     int32_t segment;
 } sm_pipe_face;
 
-/* A pipe: a circle of `radius` swept along a path of lines and arcs in the
- * plane through origin spanned by x_axis and y_axis (unit and perpendicular),
- * as sm_brep_create_planar_faces takes its curves but in order, each
- * starting where the last ended and running its own way (an arc's sweep_deg
- * may be negative); a circle is a closed path on its own. With inner_radius
- * above 0 (and below radius) an open path's pipe is hollow. Each curve gets a piece: a disc
- * square to it at its start, swept along a line (as
- * sm_brep_sweep_face) or turned about an arc's centre (as
- * sm_brep_revolve_face), so walls along lines are cylinders and along arcs
- * tori. Where two curves meet tangentially the pieces meet face to face;
- * where they meet at an angle both are made longer and cut at the plane
- * halfway between them, a mitre: only between lines, since a plane can't
- * mitre a cylinder against a torus. The pieces are joined
- * (SmApiBooleanUnion); a hollow pipe is the solid one less a solid pipe of
- * inner_radius. An open path is capped at both ends, a closed one isn't.
+/* A pipe: a circle of `radius` swept along a path of lines, arcs and splines
+ * in the plane through origin spanned by x_axis and y_axis (unit and
+ * perpendicular), as sm_brep_create_planar_faces takes its curves but in
+ * order, each starting where the last ended and running its own way (an
+ * arc's sweep_deg may be negative); a circle, or a spline whose ends meet, is
+ * a closed path on its own. With inner_radius above 0 (and below radius) an
+ * open path's pipe is hollow. Each curve gets a piece: a disc square to it at
+ * its start, swept along a line (as sm_brep_sweep_face) or turned about an
+ * arc's centre (as sm_brep_revolve_face), so walls along lines are cylinders
+ * and along arcs tori, or carried along a spline by the oriented sweep
+ * (SmBSplineSurface::CreateOrientedSweepSurface, a fork patch) with its frame's
+ * z held along the plane's normal, its wall a NURBS within 1e-5 of the true
+ * pipe's and capped with its sections. Where two curves meet tangentially the
+ * pieces meet face to face; where they meet at an angle both are made longer
+ * and cut at the plane halfway between them, a mitre: only between lines,
+ * since a plane can't mitre a cylinder against a torus or a spline's sweep.
+ * The pieces are joined (SmApiBooleanUnion); a hollow pipe is the solid one
+ * less a solid pipe of inner_radius, run out straight past a spline's open
+ * end. An open path is capped at both ends, a closed one isn't.
  * *faces says what each face is (sm_pipe_face); free it with
- * sm_pipe_faces_free. SM_ERR_INVALID_INPUT for an empty path or bad radii;
- * SM_SHIM_ERR_BAD_PATH when the path turns back on itself (by more than 179
- * degrees), a bend would overlap itself, or a closed path's pipe is hollow
- * (its bore would be sealed inside); SM_SHIM_ERR_ARC_CORNER when an arc
- * meets a curve beside it at an angle; the kernel's status, or
- * SM_SHIM_ERR_BAD_SWEEP, when it builds no solid. */
+ * sm_pipe_faces_free. SM_ERR_INVALID_INPUT for an empty path, bad radii or a
+ * spline sm_brep_create_planar_faces refuses; SM_SHIM_ERR_BAD_PATH when the
+ * path turns back on itself (by more than 179 degrees), an arc's bend would
+ * overlap itself, or a closed path's pipe is hollow (its bore would be sealed
+ * inside); SM_SHIM_ERR_ARC_CORNER when an arc or a spline meets a curve beside
+ * it at an angle, or a spline that closes on its own meets itself at one; the
+ * kernel's status, or SM_SHIM_ERR_BAD_SWEEP, when it builds no solid. A
+ * spline's bend tighter than the pipe isn't caught here: smlib refuses it. */
 sm_status sm_brep_create_pipe(const sm_plane_curve *path, size_t count, sm_vec3 origin, sm_vec3 x_axis,
                               sm_vec3 y_axis, double radius, double inner_radius, sm_brep **out, sm_pipe_face **faces,
                               size_t *face_count);
@@ -632,26 +650,31 @@ typedef struct sm_profile_face {
     int32_t profile;
 } sm_profile_face;
 
-/* A closed profile swept along a path of lines and arcs in the plane through
- * origin spanned by x_axis and y_axis (unit and perpendicular), the path as
- * sm_brep_create_pipe takes it. The profile is a loop of lines and arcs (or a
- * circle) in its own (x, y): it stands square to the path, x across it,
+/* A closed profile swept along a path of lines, arcs and splines in the plane
+ * through origin spanned by x_axis and y_axis (unit and perpendicular), the
+ * path as sm_brep_create_pipe takes it. The profile is a loop of lines and
+ * arcs (or a circle), no splines, in its own (x, y): it stands square to the
+ * path, x across it,
  * positive to the left (the frame's z cross the path's direction), and y
  * along the frame's z, so a groove on a face, where z is the face's outward
  * normal, has its profile below y = 0, and a belt round a part, where z runs
  * along the walls, has it across x. It's sm_brep_create_pipe's construction
  * with the profile in place of the disc: a piece per curve, the profile swept
- * along a line or turned about an arc's centre, mitred where lines meet at an
- * angle (any profile's sections match on the plane halfway between them),
- * and the pieces joined. An open path ends as start_end and end_end say
+ * along a line, turned about an arc's centre or carried along a spline by the
+ * oriented sweep, its sides split where the sweep isn't smooth, mitred where
+ * lines meet at an angle (any profile's sections match on the plane halfway
+ * between them), and the pieces joined. An open path ends as start_end and
+ * end_end say
  * (sm_path_end); a closed one has no ends. *faces says what each face is
  * (sm_profile_face); free it with sm_profile_faces_free.
  * SM_ERR_INVALID_INPUT for an empty path or profile, or a profile that isn't
- * one face; SM_SHIM_ERR_BAD_PATH when the path turns back on itself, a bend
- * is no wider than the profile reaches towards its centre, or a round end's
- * profile doesn't straddle the path; SM_SHIM_ERR_ARC_CORNER when an arc meets
- * a curve beside it at an angle; the kernel's status, or
- * SM_SHIM_ERR_BAD_SWEEP, when it builds no solid. */
+ * one face, or has a spline; SM_SHIM_ERR_BAD_PATH when the path turns back on
+ * itself, an arc's bend is no wider than the profile reaches towards its
+ * centre, or a round end's profile doesn't straddle the path;
+ * SM_SHIM_ERR_ARC_CORNER when an arc or a spline meets a curve beside it at
+ * an angle; the kernel's status, or SM_SHIM_ERR_BAD_SWEEP, when it builds no
+ * solid. A spline's bend too tight for the profile isn't caught here: smlib
+ * refuses it. */
 sm_status sm_brep_sweep_profile(const sm_plane_curve *path, size_t path_count, const sm_plane_curve *profile,
                                 size_t profile_count, sm_vec3 origin, sm_vec3 x_axis, sm_vec3 y_axis,
                                 int32_t start_end, int32_t end_end, sm_brep **out, sm_profile_face **faces,

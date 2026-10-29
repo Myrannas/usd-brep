@@ -212,8 +212,8 @@ fn assert_swept(swept: &Swept, path: &[PlaneCurve], profile: &[PlaneCurve], volu
         let ([x1, y1], [x2, y2]) = (path[path.len() - 1].end(), path[0].start());
         (x1 - x2).hypot(y1 - y2) < 1e-6
     };
-    let collinear = |a: PlaneCurve, b: PlaneCurve| match (a, b) {
-        (PlaneCurve::Line { start: p, end: q }, PlaneCurve::Line { start: r, end: t }) => [r, t]
+    let collinear = |a: &PlaneCurve, b: &PlaneCurve| match (a, b) {
+        (&PlaneCurve::Line { start: p, end: q }, &PlaneCurve::Line { start: r, end: t }) => [r, t]
             .iter()
             .all(|u| ((q[0] - p[0]) * (u[1] - p[1]) - (q[1] - p[1]) * (u[0] - p[0])).abs() < 1e-9),
         _ => false,
@@ -223,7 +223,7 @@ fn assert_swept(swept: &Swept, path: &[PlaneCurve], profile: &[PlaneCurve], volu
         let neighbours = [(c + n - 1) % n, (c + 1) % n];
         neighbours.iter().any(|&m| {
             let adjacent = closed || m.abs_diff(c) == 1;
-            m < c && adjacent && collinear(path[m], path[c])
+            m < c && adjacent && collinear(&path[m], &path[c])
         })
     };
     for s in 0..profile.len() {
@@ -286,10 +286,10 @@ fn bends_are_turned_and_corners_mitred() {
             );
             // SMLib's torus recogniser misses a half circle turned round a
             // bend, the round floor's, which stays an exact surface of
-            // revolution.
+            // revolution, read as the NURBS it is.
             let half_torus = matches!(role, ProfileFace::Side { profile: Some(0), .. })
                 && matches!(profile[0], PlaneCurve::Arc { .. })
-                && matches!(swept.surfaces[i], Surface::Other { kernel_type: 15020 });
+                && matches!(swept.surfaces[i], Surface::Nurbs { rational: true, .. });
             assert!(analytic || half_torus, "{role:?}: {:?}", swept.surfaces[i]);
         }
         // A frame of four lines, mitred at each corner, and an open zig-zag.

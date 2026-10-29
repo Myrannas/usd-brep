@@ -10,6 +10,7 @@ use crate::edges::Tolerance;
 use crate::error::Error;
 use crate::label::{Label, LabelMatch, NO_LABEL};
 use crate::mesh::{Face, Surface};
+use crate::spline;
 
 /// Where a B-rep face is, for finding faces and placing solids on them. For
 /// its area and centroid, which take longer to find, see
@@ -238,10 +239,11 @@ impl SweptFace {
     }
 }
 
-/// A line, arc or circle in a plane, for
+/// A line, arc, circle or spline in a plane, for
 /// [`Brep::planar_faces`](crate::Brep::planar_faces). Points are in the
-/// plane's own (x, y); angles are in degrees from x towards y.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// plane's own (x, y); angles are in degrees from x towards y. `Clone`, not
+/// `Copy`: a spline holds its poles and knots.
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlaneCurve {
     /// The segment from `start` to `end` (`SmApiCreateLineSegment`).
     Line {
@@ -269,10 +271,26 @@ pub enum PlaneCurve {
         /// Its radius.
         radius: f64,
     },
+    /// A non-rational B-spline, clamped, so it starts at its first pole and
+    /// ends at its last (`SmApiCreateCanonicalCurve`). One whose ends meet is
+    /// a loop on its own. Its side swept by
+    /// [`Brep::sweep_face`](crate::Brep::sweep_face) is a NURBS surface.
+    Spline {
+        /// Its degree, from 1 to 9: a sketch's are 2 to 5, and cubic through
+        /// points.
+        degree: u32,
+        /// Its control points, more of them than its degree.
+        poles: Vec<[f64; 2]>,
+        /// Its whole knot vector, `poles.len() + degree + 1` knots, rising,
+        /// the first `degree + 1` alike and the last, and none inside
+        /// repeated more than `degree` times.
+        knots: Vec<f64>,
+    },
 }
 
 impl PlaneCurve {
-    /// Where the curve starts; a circle starts and ends on its x side.
+    /// Where the curve starts; a circle starts and ends on its x side, and a
+    /// spline at its first pole.
     pub fn start(&self) -> [f64; 2] {
         match *self {
             PlaneCurve::Line { start, .. } => start,
@@ -283,10 +301,11 @@ impl PlaneCurve {
                 ..
             } => on_circle(centre, radius, start_deg),
             PlaneCurve::Circle { centre, radius } => on_circle(centre, radius, 0.0),
+            PlaneCurve::Spline { ref poles, .. } => poles.first().copied().unwrap_or([f64::NAN; 2]),
         }
     }
 
-    /// Where the curve ends.
+    /// Where the curve ends; a spline at its last pole.
     pub fn end(&self) -> [f64; 2] {
         match *self {
             PlaneCurve::Line { end, .. } => end,
@@ -297,12 +316,24 @@ impl PlaneCurve {
                 sweep_deg,
             } => on_circle(centre, radius, start_deg + sweep_deg),
             PlaneCurve::Circle { centre, radius } => on_circle(centre, radius, 0.0),
+            PlaneCurve::Spline { ref poles, .. } => poles.last().copied().unwrap_or([f64::NAN; 2]),
+        }
+    }
+
+    /// Whether the curve is a loop on its own: a circle, or a spline whose
+    /// ends meet.
+    pub(crate) fn closes_alone(&self) -> bool {
+        match self {
+            PlaneCurve::Circle { .. } => true,
+            PlaneCurve::Spline { .. } => self.start() == self.end(),
+            _ => false,
         }
     }
 
     /// The unit direction the curve runs in where it starts; a circle runs
-    /// anticlockwise.
-    pub(crate) fn start_tangent(&self) -> [f64; 2] {
+    /// anticlockwise, and a spline towards its first pole apart from its
+    /// start.
+    pub fn start_tangent(&self) -> [f64; 2] {
         match *self {
             PlaneCurve::Line { start, end } => unit([end[0] - start[0], end[1] - start[1]]),
             PlaneCurve::Arc {
@@ -311,18 +342,37 @@ impl PlaneCurve {
                 ..
             } => along_circle(start_deg, sweep_deg),
             PlaneCurve::Circle { .. } => along_circle(0.0, 1.0),
+            PlaneCurve::Spline { ref poles, .. } => spline::end_tangent(poles, false),
         }
     }
 
     /// The unit direction the curve runs in where it ends.
-    pub(crate) fn end_tangent(&self) -> [f64; 2] {
+    pub fn end_tangent(&self) -> [f64; 2] {
         match *self {
             PlaneCurve::Arc {
                 start_deg,
                 sweep_deg,
                 ..
             } => along_circle(start_deg + sweep_deg, sweep_deg),
+            PlaneCurve::Spline { ref poles, .. } => spline::end_tangent(poles, true),
             _ => self.start_tangent(),
+        }
+    }
+
+    /// For a spline, the most it bends to its left and to its right, as
+    /// curvatures (one over the tightest bend's radius), and whether it turns
+    /// a corner inside; `None` for a line, arc or circle.
+    pub(crate) fn spline_bends(&self) -> Option<([f64; 2], bool)> {
+        match self {
+            PlaneCurve::Spline {
+                degree,
+                poles,
+                knots,
+            } => {
+                let spline = spline::Spline::new(*degree, poles, knots);
+                Some((spline.sharpest_bends(), spline.has_corner(1e-9)))
+            }
+            _ => None,
         }
     }
 
@@ -348,11 +398,18 @@ impl PlaneCurve {
                 ),
             PlaneCurve::Circle { centre, radius } => (!(finite(centre) && radius_ok(radius)))
                 .then_some("a circle needs a finite centre and a positive radius"),
+            PlaneCurve::Spline {
+                degree,
+                ref poles,
+                ref knots,
+            } => spline::problem(degree, poles, knots),
         }
     }
 
+    /// The curve as the shim takes it. A spline's raw curve points into its
+    /// poles and knots, so it mustn't outlive `self`.
     pub(crate) fn to_raw(
-        self,
+        &self,
         label: &Option<Label>,
         operation: &'static str,
     ) -> Result<sys::sm_plane_curve, Error> {
@@ -366,8 +423,12 @@ impl PlaneCurve {
             label: label
                 .as_ref()
                 .map_or(Ok(NO_LABEL), |l| l.to_raw(operation))?,
+            degree: 0,
+            poles: std::ptr::null(),
+            pole_count: 0,
+            knots: std::ptr::null(),
         };
-        match self {
+        match *self {
             PlaneCurve::Line { start, end } => {
                 raw.kind = sys::SM_PLANE_LINE as i32;
                 raw.a = start;
@@ -389,6 +450,20 @@ impl PlaneCurve {
                 raw.kind = sys::SM_PLANE_CIRCLE as i32;
                 raw.a = centre;
                 raw.radius = radius;
+            }
+            PlaneCurve::Spline {
+                degree,
+                ref poles,
+                ref knots,
+            } => {
+                raw.kind = sys::SM_PLANE_SPLINE as i32;
+                raw.degree = i32::try_from(degree).map_err(|_| Error::InvalidArgument {
+                    operation,
+                    reason: "a spline's degree must be from 1 to 9",
+                })?;
+                raw.poles = poles.as_ptr().cast();
+                raw.pole_count = poles.len();
+                raw.knots = knots.as_ptr();
             }
         }
         Ok(raw)

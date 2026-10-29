@@ -799,7 +799,10 @@ impl Brep {
     /// A side turned from a straight edge is a plane (an edge square to the
     /// axis), a cylinder (along it) or a cone (at a slant), and one turned
     /// from an arc a sphere when the arc is centred on the axis and a torus
-    /// otherwise.
+    /// otherwise. One turned from a spline is a surface of revolution, which
+    /// reads as [`Surface::Nurbs`](crate::Surface::Nurbs): SMLib holds it as
+    /// the rational B-spline on its own net, exactly, and its (u, v) are the
+    /// net's.
     ///
     /// The solid's faces carry no labels. [`Sweep::faces`] says which is the
     /// start (the face itself), which the end (the face turned by the
@@ -855,12 +858,13 @@ impl Brep {
         unsafe { Sweep::from_raw(OP, out, faces, count) }
     }
 
-    /// Planar faces bounded by closed loops of lines, arcs and circles in
-    /// `frame`'s xy plane (`SmApiCreatePlanarFaces`), for sweeping into
-    /// prisms with [`sweep_face`](Brep::sweep_face).
+    /// Planar faces bounded by closed loops of lines, arcs, circles and
+    /// splines in `frame`'s xy plane (`SmApiCreatePlanarFaces`), for sweeping
+    /// into prisms with [`sweep_face`](Brep::sweep_face).
     ///
     /// Each loop's curves run head to tail, the last back to the first; a
-    /// circle is a loop on its own. Loops mustn't cross or touch each other.
+    /// circle, or a spline whose ends meet, is a loop on its own. Loops
+    /// mustn't cross or touch each other.
     /// An outer loop bounds a face, a loop inside it a hole, and a loop inside
     /// a hole another face, however deep they nest. The result is a sheet, not
     /// a solid: one face per outer loop, with its
@@ -894,9 +898,8 @@ impl Brep {
             if let Some(reason) = curves.iter().find_map(|c| c.curve.problem()) {
                 return invalid(reason);
             }
-            let circle = |c: &BoundaryCurve| matches!(c.curve, PlaneCurve::Circle { .. });
-            if curves.len() > 1 && curves.iter().any(circle) {
-                return invalid("a circle is a loop on its own");
+            if curves.len() > 1 && curves.iter().any(|c| c.curve.closes_alone()) {
+                return invalid("a circle, or a spline whose ends meet, is a loop on its own");
             }
             let ends: Vec<([f64; 2], [f64; 2])> = curves
                 .iter()
@@ -930,31 +933,39 @@ impl Brep {
         Brep::from_raw(OP, out)
     }
 
-    /// A pipe: a circle of `radius` swept along `path`, lines and arcs in
-    /// `frame`'s xy plane, hollow with `inner_radius` when that's given. Each
-    /// curve of the path starts where the last ended and runs its own way
-    /// (an arc's sweep may be negative); a circle is a closed path on its
-    /// own. An open path is capped at both ends, a closed one isn't.
+    /// A pipe: a circle of `radius` swept along `path`, lines, arcs and
+    /// splines in `frame`'s xy plane, hollow with `inner_radius` when that's
+    /// given. Each curve of the path starts where the last ended and runs its
+    /// own way (an arc's sweep may be negative); a circle, or a spline whose
+    /// ends meet, is a closed path on its own. An open path is capped at both
+    /// ends, a closed one isn't.
     ///
     /// Each curve gets a piece: a disc square to it at its start, swept
     /// along a line as [`sweep_face`](Brep::sweep_face) does or turned about
     /// an arc's centre as
     /// [`revolve_face`](Brep::revolve_face) does, so the walls along lines
-    /// are cylinders and along arcs tori. Where curves meet tangentially the
-    /// pieces meet face to face; where they meet at an angle the pipe is
-    /// mitred, both pieces cut at the plane halfway between them. The pieces
-    /// are joined (`SmApiBooleanUnion`), and a hollow pipe is the solid one
-    /// less a solid pipe of `inner_radius`. [`Pipe::faces`] says which face
-    /// is the outer wall, which the inner, which the start and end caps, and
-    /// which path curve each wall was swept along: one outer wall (and one
-    /// inner) per curve.
+    /// are cylinders and along arcs tori, or carried along a spline by
+    /// SMLib's oriented sweep (`SmBSplineSurface::CreateOrientedSweepSurface`,
+    /// a fork patch), the disc square to it all along, its wall a NURBS within
+    /// 1e-5 of the true pipe's. Where curves meet tangentially the pieces meet
+    /// face to face; where they meet at an angle the pipe is mitred, both
+    /// pieces cut at the plane halfway between them. The pieces are joined
+    /// (`SmApiBooleanUnion`), and a hollow pipe is the solid one less a solid
+    /// pipe of `inner_radius`. [`Pipe::faces`] says which face is the outer
+    /// wall, which the inner, which the start and end caps, and which path
+    /// curve each wall was swept along: one outer wall (and one inner) per
+    /// curve.
     ///
-    /// Lines may meet at an angle, up to 179 degrees, but an arc must meet
-    /// the curves either side of it tangentially: a plane can't mitre a
-    /// cylinder against a torus. Refuses those paths, a bend tighter than the
-    /// pipe (an arc whose radius isn't more than `radius`), and a hollow pipe
-    /// along a closed path, whose bore would be sealed inside it (SMLib's
-    /// tessellation winds some of such a cavity's walls the wrong way).
+    /// Lines may meet at an angle, up to 179 degrees, but an arc or a spline
+    /// must meet the curves either side of it tangentially: a plane can't
+    /// mitre a cylinder against a torus, or against a spline's sweep. Refuses
+    /// those paths, a spline that turns a corner inside it (a knot repeated as
+    /// often as its degree, where its direction jumps), a bend tighter than
+    /// the pipe (an arc whose radius isn't more than `radius`, or a spline
+    /// that somewhere bends tighter, found by sampling each knot span and
+    /// refining its tightest point), and a hollow pipe along a closed path,
+    /// whose bore would be sealed inside it (SMLib's tessellation winds some
+    /// of such a cavity's walls the wrong way).
     pub fn pipe(
         _kernel: &Kernel,
         frame: &Frame,
@@ -990,6 +1001,9 @@ impl Brep {
                 bend <= radius
             }
             PlaneCurve::Line { .. } => false,
+            PlaneCurve::Spline { .. } => c
+                .spline_bends()
+                .is_some_and(|([left, right], _)| left.max(right) * radius >= 1.0),
         };
         if path.iter().any(tight) {
             return invalid("a bend's radius must be more than the pipe's");
@@ -1039,10 +1053,11 @@ impl Brep {
         })
     }
 
-    /// A closed `profile` swept along `path`, lines and arcs in `frame`'s xy
-    /// plane taken as [`pipe`](Brep::pipe) takes them: a groove's tool, or a
-    /// bead's. The profile is a loop of lines and arcs (or a circle) in its
-    /// own (x, y), standing square to the path: x runs across it, positive
+    /// A closed `profile` swept along `path`, lines, arcs and splines in
+    /// `frame`'s xy plane taken as [`pipe`](Brep::pipe) takes them: a
+    /// groove's tool, or a bead's. The profile is a loop of lines and arcs
+    /// (or a circle), with no splines, in its own (x, y), standing square to
+    /// the path: x runs across it, positive
     /// to the left (the frame's z cross the path's direction), and y along
     /// the frame's z. So a groove on a face, where the frame is the face's
     /// with z its outward normal, has its profile below y = 0, and a belt
@@ -1051,8 +1066,11 @@ impl Brep {
     ///
     /// It's the pipe's construction with the profile in place of the disc:
     /// a piece per curve, the profile swept along a line as
-    /// [`sweep_face`](Brep::sweep_face) does or turned about an arc's centre
-    /// as [`revolve_face`](Brep::revolve_face) does, met face to face where
+    /// [`sweep_face`](Brep::sweep_face) does, turned about an arc's centre
+    /// as [`revolve_face`](Brep::revolve_face) does, or carried along a
+    /// spline by the oriented sweep, its sides split where the sweep isn't
+    /// smooth and a level side (a floor, a top) merged by the unions with
+    /// the pieces' beside it, met face to face where
     /// curves meet tangentially and mitred where lines meet at an angle (any
     /// profile's two sections match on the plane halfway between them), and
     /// the pieces joined (`SmApiBooleanUnion`). An open path ends at each end
@@ -1064,8 +1082,10 @@ impl Brep {
     /// segment each side was swept from, and which faces are the ends.
     ///
     /// Refuses, besides what [`pipe`](Brep::pipe) refuses of a path, a
-    /// profile that isn't one closed loop, a bend no wider than the profile
-    /// reaches towards its centre, and a round end on a profile that doesn't
+    /// profile that isn't one closed loop or has a spline in it, a bend no
+    /// wider than the profile reaches towards its centre (on a spline, its
+    /// tightest bend to the left against how far the profile reaches left,
+    /// and to the right likewise), and a round end on a profile that doesn't
     /// straddle the path (reach both sides of x = 0).
     pub fn sweep_profile(
         _kernel: &Kernel,
@@ -1088,7 +1108,7 @@ impl Brep {
         if profile.is_empty() {
             return invalid("the profile needs at least one curve");
         }
-        if let Some(reason) = profile.iter().find_map(PlaneCurve::problem) {
+        if let Some(reason) = profile.iter().find_map(profile_problem) {
             return invalid(reason);
         }
         let circle = |c: &PlaneCurve| matches!(c, PlaneCurve::Circle { .. });
@@ -1113,6 +1133,11 @@ impl Brep {
             }
             PlaneCurve::Circle { radius, .. } => max_x >= radius,
             PlaneCurve::Line { .. } => false,
+            // A bend to the left has its centre on the left, where the
+            // profile reaches max_x; one to the right, -min_x.
+            PlaneCurve::Spline { .. } => c
+                .spline_bends()
+                .is_some_and(|([left, right], _)| left * max_x >= 1.0 || right * -min_x >= 1.0),
         };
         if path.iter().any(tight) {
             return invalid(
@@ -1221,7 +1246,7 @@ impl Brep {
         if profile.is_empty() {
             return invalid("the profile needs at least one curve");
         }
-        if let Some(reason) = profile.iter().find_map(PlaneCurve::problem) {
+        if let Some(reason) = profile.iter().find_map(profile_problem) {
             return invalid(reason);
         }
         let next = profile.iter().cycle().skip(1);
@@ -2244,24 +2269,37 @@ fn path_problem(path: &[PlaneCurve]) -> Result<bool, &'static str> {
     if path.len() > 1 && path.iter().any(circle) {
         return Err("a circle is a path on its own");
     }
+    if path.len() > 1 && path.iter().any(PlaneCurve::closes_alone) {
+        return Err("a spline whose ends meet is a path on its own");
+    }
+    if path.iter().any(|c| c.spline_bends().is_some_and(|(_, corner)| corner)) {
+        return Err("a spline in the path must run smoothly along it, with no corner inside");
+    }
     if path
         .windows(2)
         .any(|pair| gap(pair[0].end(), pair[1].start()) > LOOP_GAP)
     {
         return Err("each curve of the path must start where the last ended");
     }
-    // Where each curve meets the next, and the last the first when closed.
-    let closed = path.len() > 1 && gap(path[path.len() - 1].end(), path[0].start()) <= LOOP_GAP;
-    let joints = path.windows(2).map(|pair| (pair[0], pair[1]));
-    let closing = closed.then(|| (path[path.len() - 1], path[0]));
+    // Where each curve meets the next, and the last the first when closed: a
+    // spline that closes on its own meets itself.
+    let last = &path[path.len() - 1];
+    let alone = path.len() == 1 && matches!(last, PlaneCurve::Spline { .. });
+    let closed = (path.len() > 1 || alone) && gap(last.end(), path[0].start()) <= LOOP_GAP;
+    let joints = path.windows(2).map(|pair| (&pair[0], &pair[1]));
+    let closing = closed.then_some((last, &path[0]));
     for (before, after) in joints.chain(closing) {
         let ([x1, y1], [x2, y2]) = (before.end_tangent(), after.start_tangent());
         let turn = (x1 * y2 - y1 * x2).abs().atan2(x1 * x2 + y1 * y2);
         if turn > MAX_PIPE_TURN_DEG.to_radians() {
             return Err("the path turns back on itself");
         }
-        let arc = |c: PlaneCurve| !matches!(c, PlaneCurve::Line { .. });
-        if turn > 1e-9 && (arc(before) || arc(after)) {
+        let curved = |c: &PlaneCurve| !matches!(c, PlaneCurve::Line { .. });
+        let spline = |c: &PlaneCurve| matches!(c, PlaneCurve::Spline { .. });
+        if turn > 1e-9 && (spline(before) || spline(after)) {
+            return Err("a spline in the path must meet the curves either side of it tangentially");
+        }
+        if turn > 1e-9 && (curved(before) || curved(after)) {
             return Err("an arc in the path must meet the curves either side of it tangentially");
         }
     }
@@ -2272,8 +2310,17 @@ fn path_problem(path: &[PlaneCurve]) -> Result<bool, &'static str> {
         }))
 }
 
+/// Why a profile curve can't be swept, if it can't: a profile is lines, arcs
+/// and circles.
+fn profile_problem(curve: &PlaneCurve) -> Option<&'static str> {
+    match curve {
+        PlaneCurve::Spline { .. } => Some("a profile's curves are lines, arcs and circles"),
+        _ => curve.problem(),
+    }
+}
+
 /// The box a loop of lines and arcs lies in: its least and greatest x, then
-/// y.
+/// y. A spline's is its poles', which holds it.
 fn extent(curves: &[PlaneCurve]) -> [f64; 4] {
     let mut extent = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
     let mut take = |[x, y]: [f64; 2]| {
@@ -2296,6 +2343,11 @@ fn extent(curves: &[PlaneCurve]) -> [f64; 4] {
                 sweep_deg,
             } => (centre, radius, start_deg, sweep_deg),
             PlaneCurve::Circle { centre, radius } => (centre, radius, 0.0, 360.0),
+            // A spline lies inside its poles' hull.
+            PlaneCurve::Spline { ref poles, .. } => {
+                poles.iter().for_each(|&pole| take(pole));
+                continue;
+            }
         };
         let (low, high) = (from.min(from + sweep), from.max(from + sweep));
         let at = |deg: f64| {
