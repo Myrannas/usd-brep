@@ -182,7 +182,10 @@ fn a_corner_blend_meets_a_rounded_box_corner_within_hollows_limit() {
             .faces()
             .unwrap()
             .into_iter()
-            .find(|f| matches!(f.surface, Surface::Other { .. }) && f.bounds[0][0] > 79.0 && f.bounds[0][1] > 59.0 && f.bounds[0][2] > 49.0)
+            // SMLib's corner blend: neither the rounds' cylinders nor a
+            // plane, read as NURBS or a surface of its own.
+            .filter(|f| !matches!(f.surface, Surface::Plane { .. } | Surface::Cylinder { .. }))
+            .find(|f| f.bounds[0][0] > 79.0 && f.bounds[0][1] > 59.0 && f.bounds[0][2] > 49.0)
             .unwrap()
             .index;
         let sides: Vec<Side> = solid
