@@ -236,10 +236,12 @@ sm_face_info describe_face(const SmFace* face) {
         describe_placement(info, torus->GetPosition());
         info.radius = torus->GetMajorRadius();
         info.minor_radius = torus->GetMinorRadius();
-    } else if (type == SmBSplineSurface_TYPE || type == SmSurfOfRevolution_TYPE) {
-        // A surface of revolution is a B-spline surface on its own net, which
-        // its (u, v) are (SmSurfOfRevolution.h), so it reads as the NURBS it
-        // is; kernel_type still says what it is.
+    } else if (type == SmBSplineSurface_TYPE || type == SmSurfOfRevolution_TYPE || type == SmSurfOfExtrusion_TYPE) {
+        // A surface of revolution or of extrusion is a B-spline surface on
+        // its own net, which its (u, v) are (SmSurfOfRevolution.h,
+        // SmSurfOfExtrusion.h), so it reads as the NURBS it is; kernel_type
+        // still says what it is. A boolean leaves a spline's swept wall an
+        // extrusion.
         const SmBSplineSurface* nurbs = static_cast<const SmBSplineSurface*>(surface);
         info.kind = SM_SURFACE_NURBS;
         info.degree_u = static_cast<uint32_t>(nurbs->GetDegree(SM_SP_U));

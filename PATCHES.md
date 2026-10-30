@@ -1505,3 +1505,13 @@ now, since a spline holds its poles and knots. No kernel source changes.
   circle) loft into one skin of 8 pieces, which `StitchAndOrient` closes
   into a manifold solid with flat caps; the probe found `StitchIntoSolid`
   doesn't.
+- **Extruded splines read as NURBS too.** A spline's wall swept by
+  `sweep_face` is an `SmBSplineSurface`, but SMLib's booleans leave it an
+  `SmSurfOfExtrusion` (cut from a block, as game-cad's Extrude cuts), which
+  `describe_face` reported as `Surface::Other` 15030. An extrusion is an
+  `SmBSplineSurface` on its own net, as a surface of revolution is, so it
+  reads as `Surface::Nurbs` with that net now (shim only), exact: the net
+  evaluates to the kernel's points and closest points within 1e-13 mm on
+  game-cad's cut D (its `tests/surfaces.rs`). Every surface of extrusion
+  reads so, an ellipse a stretch sweeps along a line (`scale_axes_keeping`
+  with `extrusions`) among them; game-cad's own stretches ask for none.
