@@ -38,15 +38,24 @@ impl Meets {
     }
 }
 
-/// A side of a surface: a rim edge, by its index in the brep's edge list
-/// before any face is taken out, and how the surface meets the kept face
-/// beyond it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A side of a surface: a run of rim edges, by their indices in the brep's
+/// edge list before any face is taken out, in order along it, and how the
+/// surface meets the kept faces beyond them. A fill or a Coons patch joins
+/// a side's edges end to end; the corner blend, the edge blend and the skin
+/// take one edge a side.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Side {
-    /// The rim edge, between a face taken out and a kept one.
-    pub edge: usize,
-    /// How the surface meets the kept face.
+    /// The rim edges, each between a face taken out and a kept one.
+    pub edges: Vec<usize>,
+    /// How the surface meets the kept faces.
     pub meets: Meets,
+}
+
+impl Side {
+    /// A side of one edge.
+    pub fn edge(edge: usize, meets: Meets) -> Side {
+        Side { edges: vec![edge], meets }
+    }
 }
 
 /// The kernel call that makes a surface.
@@ -55,17 +64,18 @@ pub enum Tool {
     /// `SmBSplineSurface::CreateNSidedPatch` through 3 to 8 sides in order
     /// round the loop, a Tangent side's cross-derivatives sampled from the
     /// kept face (`SmTangentField`), fitted with matching parameters: a
-    /// patch a side, meeting in the middle. Sides next to one another on one
-    /// kept face, meeting it alike, are one side.
+    /// patch a corner of the loop, meeting in the middle, each labelled
+    /// with its surface's label, its index raised by the number, from 1, of
+    /// the side whose start it holds.
     Fill,
     /// `SmBSplineSurface::CreateCoonsPatch`, bicubic, through 4 sides in
-    /// order, joined as a fill's: Tangent sides' cross-derivatives as a
-    /// fill's, a Position side's a cubic between the sides beside it, taking
-    /// the corners' twists from their fields so the corners agree.
+    /// order: Tangent sides' cross-derivatives as a fill's, a Position
+    /// side's a cubic between the sides beside it, taking the corners'
+    /// twists from their fields so the corners agree.
     Coons,
-    /// `SmBrep::CreateCornerBlend` from the rim's edgeuses, 3 or 4 sides in
-    /// any order: a bicubic Coons patch, a three-sided one with a point for
-    /// its fourth side.
+    /// `SmBrep::CreateCornerBlend` from the rim's edgeuses, 3 or 4 sides of
+    /// an edge each, in any order, every one Tangent: a bicubic Coons
+    /// patch, a three-sided one with a point for its fourth side.
     Corner,
     /// `SmBrep::CreateEdgeEdgeBlend` between the first two sides: 0 ruled,
     /// 1 G1, 2 G2, 3 G3, both ends alike.
@@ -113,6 +123,10 @@ pub struct RebuildReport {
     pub open_vertex_gap: Option<f64>,
     /// The narrowest gap between edges it left apart.
     pub open_edge_gap: Option<f64>,
+    /// The widest gap it left open, edge to edge, where it could measure
+    /// one, and the rim edge nearest where it's widest, by index in the
+    /// brep rebuilt (see [`OpenGap`]).
+    pub widest_open: Option<OpenGap>,
     /// Faces the surfaces made.
     pub faces_made: u32,
     /// The surface the kernel couldn't make, and what it said.
@@ -134,6 +148,10 @@ impl RebuildReport {
             edge_gap: raw.edge_gap,
             open_vertex_gap: gap(raw.open_vertex_gap),
             open_edge_gap: gap(raw.open_edge_gap),
+            widest_open: (raw.open_edges > 0).then(|| OpenGap {
+                width: gap(raw.open_gap),
+                rim_edge: usize::try_from(raw.open_at).ok(),
+            }),
             faces_made: raw.faces_made,
             failed_surface: usize::try_from(raw.failed_surface)
                 .ok()
@@ -142,6 +160,19 @@ impl RebuildReport {
             stitch_seconds: raw.stitch_seconds,
         }
     }
+}
+
+/// The widest gap a rebuild's stitch left open: how wide, edge to edge,
+/// measured from each open edge's points to the open edges across the gap
+/// (a kept face's to the new faces', and the other way), `None` where there
+/// was nothing across to measure to; and the rim edge nearest where it's
+/// widest, by index in the brep rebuilt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpenGap {
+    /// How wide, where it could be measured.
+    pub width: Option<f64>,
+    /// The rim edge it's at.
+    pub rim_edge: Option<usize>,
 }
 
 /// A rebuilt solid.
@@ -231,13 +262,15 @@ pub enum SurfaceSide {
 
 impl Brep {
     /// Takes the faces at `faces` out of a copy of the solid, builds each
-    /// surface from its sides (rim edges, by index in this brep) and the
-    /// kept faces beyond them, and sews them in: `SmStitch::DoStitching` at
-    /// `stitch_tolerance`, its report saying the narrowest gap it left open,
-    /// or with 0 `SmStitch::StitchIntoSolid`, which widens its tolerance up
-    /// to 1/200 of the part's diagonal and glues whatever it finds there,
-    /// saying only the widest gap it glued. The new solid, or why there
-    /// isn't one; this one is unchanged.
+    /// surface from its sides (runs of rim edges, by index in this brep) and
+    /// the kept faces beyond them, and sews them in with
+    /// `SmStitch::DoStitching` at `stitch_tolerance`, which must be
+    /// positive, leaving anything wider open: its report says how many
+    /// edges, the narrowest gaps and the widest, and the rim edge it's at
+    /// ([`OpenGap`]). Never `SmStitch::StitchIntoSolid`, which widens its
+    /// tolerance up to 1/200 of the part's diagonal and glues a 0.2 mm gap
+    /// shut without a word. The new solid, or why there isn't one; this one
+    /// is unchanged.
     pub fn rebuild_faces(
         &self,
         faces: &[usize],
@@ -253,20 +286,26 @@ impl Brep {
             .iter()
             .map(|&f| u32::try_from(f).map_err(|_| refuse("a face index past u32")))
             .collect::<Result<_, _>>()?;
-        let sides: Vec<Vec<rb::sm_rebuild_side>> = surfaces
-            .iter()
-            .map(|s| {
-                s.sides
-                    .iter()
-                    .map(|side| {
-                        Ok(rb::sm_rebuild_side {
-                            edge: u32::try_from(side.edge).map_err(|_| refuse("an edge index past u32"))?,
-                            meets: side.meets.raw(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, _>>()?;
+        if !(stitch_tolerance.is_finite() && stitch_tolerance > 0.0) {
+            return Err(refuse("the stitch tolerance must be positive"));
+        }
+        let mut sides: Vec<Vec<rb::sm_rebuild_side>> = Vec::with_capacity(surfaces.len());
+        for surface in surfaces {
+            let mut raw = Vec::new();
+            for (n, side) in surface.sides.iter().enumerate() {
+                if side.edges.is_empty() {
+                    return Err(refuse("a side with no edges"));
+                }
+                for &edge in &side.edges {
+                    raw.push(rb::sm_rebuild_side {
+                        edge: u32::try_from(edge).map_err(|_| refuse("an edge index past u32"))?,
+                        side: u32::try_from(n).map_err(|_| refuse("a side past u32"))?,
+                        meets: side.meets.raw(),
+                    });
+                }
+            }
+            sides.push(raw);
+        }
         let mut raw = Vec::with_capacity(surfaces.len());
         for (surface, sides) in surfaces.iter().zip(&sides) {
             let (tool, order) = match surface.tool {

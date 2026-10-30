@@ -69,11 +69,12 @@ struct Owned {
 };
 
 // A rim edge: the edge, and its edgeuse on the kept face, running with the
-// edge's curve.
+// edge's curve, with the side of its surface it's on.
 struct Rim {
     SmEdge* edge = nullptr;
     SmEdgeuse* use = nullptr;
     SmFace* face = nullptr;
+    uint32_t side = 0;
     int32_t meets = SM_MEETS_POSITION;
 };
 
@@ -102,6 +103,7 @@ sm_status rim_of(const SmTArray<SmEdge*>& edges, const std::vector<SmFace*>& rem
     rim.edge = edge;
     rim.use = kept;
     rim.face = kept->GetFace();
+    rim.side = side.side;
     rim.meets = side.meets;
     return SM_SUCCESS;
 }
@@ -207,11 +209,11 @@ sm_status chain(std::vector<Bound>& bounds, double tolerance) {
     return SM_SUCCESS;
 }
 
-// One side of a run of bounds on the same kept face, meeting it the same
-// way, as the ends of the corner part's rounds are each two edges: their
-// curves and trim curves joined end to end, on [0, 1]. The bounds run end
-// to end round their loop already (`chain`).
-sm_status join_runs(std::vector<Bound>& bounds, Owned<SmBSplineCurve>& held) {
+// Each side's bounds joined end to end into one, on [0, 1], as the ends of
+// the corner part's rounds are each two edges: their curves and trim
+// curves. The bounds run end to end round their loop already (`chain`),
+// each side's together.
+sm_status join_sides(std::vector<Bound>& bounds, Owned<SmBSplineCurve>& held) {
     auto joined = [&](SmBSplineCurve* a, SmBSplineCurve* b, SmBSplineCurve*& out) -> sm_status {
         SmTArray<SmBSplineCurve*> pair;
         pair.Add(a);
@@ -223,24 +225,49 @@ sm_status join_runs(std::vector<Bound>& bounds, Owned<SmBSplineCurve>& held) {
         out->EditParameterization(SmExtent1d(0.0, 1.0));
         return SM_SUCCESS;
     };
-    bool merged = true;
-    while (merged && bounds.size() > 2) {
-        merged = false;
-        for (size_t i = 0; i < bounds.size() && bounds.size() > 2; ++i) {
-            const size_t next = (i + 1) % bounds.size();
-            if (bounds[i].rim.face != bounds[next].rim.face || bounds[i].rim.meets != bounds[next].rim.meets) continue;
-            Bound bound = bounds[i];
-            sm_status status = joined(bounds[i].curve, bounds[next].curve, bound.curve);
-            if (status == SM_SUCCESS) status = joined(bounds[i].uv, bounds[next].uv, bound.uv);
-            if (status != SM_SUCCESS) return status;
-            bounds[i] = bound;
-            bounds.erase(bounds.begin() + static_cast<std::ptrdiff_t>(next));
-            if (next == 0) std::rotate(bounds.begin(), bounds.end() - 1, bounds.end());
-            merged = true;
-            break;
+    for (size_t i = 0; i + 1 < bounds.size();) {
+        if (bounds[i].rim.side != bounds[i + 1].rim.side) {
+            ++i;
+            continue;
         }
+        Bound bound = bounds[i];
+        sm_status status = joined(bounds[i].curve, bounds[i + 1].curve, bound.curve);
+        if (status == SM_SUCCESS) status = joined(bounds[i].uv, bounds[i + 1].uv, bound.uv);
+        if (status != SM_SUCCESS) return status;
+        bounds[i] = bound;
+        bounds.erase(bounds.begin() + static_cast<std::ptrdiff_t>(i + 1));
     }
     return SM_SUCCESS;
+}
+
+// Each of a fill's patches' number: from 1, the side whose start lies at
+// one of its corners, the patches being one a corner of the loop.
+std::vector<uint32_t> corner_numbers(const std::vector<Bound>& bounds, const std::vector<SmSurface*>& patches) {
+    std::vector<uint32_t> numbers;
+    for (const SmSurface* patch : patches) {
+        const SmExtent2d domain = patch->GetNaturalUVDomain();
+        const SmExtent1d u = domain.GetUInterval();
+        const SmExtent1d v = domain.GetVInterval();
+        SmPoint3d corners[4];
+        patch->EvaluatePoint(SmPoint2d(u.GetMin(), v.GetMin()), corners[0]);
+        patch->EvaluatePoint(SmPoint2d(u.GetMax(), v.GetMin()), corners[1]);
+        patch->EvaluatePoint(SmPoint2d(u.GetMax(), v.GetMax()), corners[2]);
+        patch->EvaluatePoint(SmPoint2d(u.GetMin(), v.GetMax()), corners[3]);
+        uint32_t best = 0;
+        double nearest = SM_BIG_DOUBLE;
+        for (size_t k = 0; k < bounds.size(); ++k) {
+            const SmPoint3d start = point_at(*bounds[k].curve, 0.0);
+            for (const SmPoint3d& corner : corners) {
+                const double d = corner.DistanceBetween(start);
+                if (d < nearest) {
+                    nearest = d;
+                    best = static_cast<uint32_t>(k + 1);
+                }
+            }
+        }
+        numbers.push_back(best);
+    }
+    return numbers;
 }
 
 // A cross-derivative curve along the bound, compatible with it, from the
@@ -301,7 +328,7 @@ sm_status blend_of(const SmVector3d& from, const SmVector3d& to, const SmVector3
 // Fills the loop with SmBSplineSurface::CreateNSidedPatch, a Tangent side
 // taking its cross-derivatives from the kept face.
 sm_status make_fill(std::vector<Bound>& bounds, double tolerance, double tangent_tol_deg,
-                    std::vector<SmSurface*>& made) {
+                    std::vector<SmSurface*>& made, std::vector<uint32_t>& pieces) {
     const size_t n = bounds.size();
     if (n < 3 || n > 8) return SM_SHIM_ERR_BAD_TOOL;
     Owned<SmBSplineCurve> held;
@@ -329,14 +356,16 @@ sm_status make_fill(std::vector<Bound>& bounds, double tolerance, double tangent
         derivatives[i] = curve_handle(field);
         any = true;
     }
-    for (size_t i = 0; i < n; ++i) {
-    }
     std::vector<sm_surface*> out(n, nullptr);
     size_t count = 0;
     const sm_status status = sm_surface_fill(boundary.data(), any ? derivatives.data() : nullptr, n,
                                              tangent_tol_deg, out.data(), &count);
     if (status != SM_SUCCESS) return status;
-    for (size_t i = 0; i < count; ++i) made.push_back(surface_from(out[i]));
+    std::vector<SmSurface*> patches;
+    for (size_t i = 0; i < count; ++i) patches.push_back(surface_from(out[i]));
+    const std::vector<uint32_t> numbers = corner_numbers(bounds, patches);
+    made.insert(made.end(), patches.begin(), patches.end());
+    pieces.insert(pieces.end(), numbers.begin(), numbers.end());
     return SM_SUCCESS;
 }
 
@@ -550,6 +579,95 @@ bool curvature_across(const SmEdgeuse& use, double t, double& out) {
     return std::isfinite(out);
 }
 
+// The faces an edge's edgeuses lie on.
+std::vector<SmFace*> faces_of(const SmEdge& edge) {
+    SmTArray<SmEdgeuse*> uses;
+    edge.GetEdgeuses(uses);
+    std::vector<SmFace*> faces;
+    for (ULONG i = 0; i < uses.GetSize(); ++i) {
+        if (SmFace* face = uses[i]->GetFace()) faces.push_back(face);
+    }
+    return faces;
+}
+
+SmPoint3d point_on(const SmEdge& edge, double share) {
+    SmPoint3d p;
+    edge.GetCurve()->EvaluatePoint(edge.GetInterval().Evaluate(share), p);
+    return p;
+}
+
+// What the stitch left open, once it has: the widest gap between an open
+// edge's points and the open edges across the gap from it (a kept face's
+// against the new faces', and the other way), and the rim edge of
+// `original`, one bordering a face taken out, nearest where it's widest.
+// Neither DoStitching nor StitchIntoSolid says which edge it left open.
+void widest_open(const SmBrep& stitched, const std::vector<SmFace*>& made_faces, const SmBrep& original,
+                 const SmTArray<SmEdge*>& original_edges, const std::vector<size_t>& removed_indices,
+                 sm_rebuild_report& report) {
+    SmTArray<SmEdge*> edges;
+    stitched.GetEdges(edges);
+    std::vector<SmEdge*> kept_side;
+    std::vector<SmEdge*> made_side;
+    for (ULONG i = 0; i < edges.GetSize(); ++i) {
+        if (!edges[i]->IsLamina()) continue;
+        const std::vector<SmFace*> faces = faces_of(*edges[i]);
+        const bool made = !faces.empty() && std::find(made_faces.begin(), made_faces.end(), faces[0]) != made_faces.end();
+        (made ? made_side : kept_side).push_back(edges[i]);
+    }
+    double widest = -1.0;
+    SmPoint3d at;
+    bool placed = false;
+    auto measure = [&](const std::vector<SmEdge*>& from, const std::vector<SmEdge*>& across) {
+        for (SmEdge* edge : from) {
+            for (double share : kShares) {
+                const SmPoint3d p = point_on(*edge, share);
+                if (!placed) {
+                    at = p;
+                    placed = true;
+                }
+                double nearest = SM_BIG_DOUBLE;
+                for (SmEdge* other : across) {
+                    SmBoolean found = FALSE;
+                    double parameter = 0.0;
+                    double distance = 0.0;
+                    if (other->ClosestPoint(p, found, parameter, distance) == SM_SUCCESS && found) {
+                        nearest = std::min(nearest, distance);
+                    }
+                }
+                if (nearest < SM_BIG_DOUBLE && nearest > widest) {
+                    widest = nearest;
+                    at = p;
+                }
+            }
+        }
+    };
+    measure(kept_side, made_side);
+    measure(made_side, kept_side);
+    report.open_gap = widest;
+    if (!placed) return;
+    // The original's faces by index, to tell its rim edges.
+    SmTArray<SmFace*> original_faces;
+    original.GetFaces(original_faces);
+    std::vector<const SmFace*> taken;
+    for (size_t index : removed_indices) taken.push_back(original_faces[index]);
+    double nearest = SM_BIG_DOUBLE;
+    for (ULONG i = 0; i < original_edges.GetSize(); ++i) {
+        SmEdge* edge = original_edges[i];
+        const std::vector<SmFace*> faces = faces_of(*edge);
+        const size_t out = static_cast<size_t>(std::count_if(faces.begin(), faces.end(), [&](const SmFace* face) {
+            return std::find(taken.begin(), taken.end(), face) != taken.end();
+        }));
+        if (out == 0 || out == faces.size()) continue;
+        SmBoolean found = FALSE;
+        double parameter = 0.0;
+        double distance = 0.0;
+        if (edge->ClosestPoint(at, found, parameter, distance) == SM_SUCCESS && found && distance < nearest) {
+            nearest = distance;
+            report.open_at = static_cast<int64_t>(i);
+        }
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -565,9 +683,23 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
     report->open_edge_gap = -1.0;
     report->failed_surface = -1;
     report->surface_status = SM_SUCCESS;
-    if (face_count == 0 || surface_count == 0 || !std::isfinite(stitch_tolerance)) return SM_ERR_INVALID_INPUT;
+    report->open_gap = -1.0;
+    report->open_at = -1;
+    if (face_count == 0 || surface_count == 0 || !(std::isfinite(stitch_tolerance) && stitch_tolerance > 0.0)) {
+        return SM_ERR_INVALID_INPUT;
+    }
     for (size_t i = 0; i < surface_count; ++i) {
         if (!surfaces[i].sides || surfaces[i].side_count == 0) return SM_SHIM_ERR_NULL_ARGUMENT;
+        // Each side's edges together, the sides counting up from 0.
+        if (surfaces[i].sides[0].side != 0) return SM_SHIM_ERR_BAD_TOOL;
+        for (size_t k = 1; k < surfaces[i].side_count; ++k) {
+            const uint32_t before = surfaces[i].sides[k - 1].side;
+            const uint32_t side = surfaces[i].sides[k].side;
+            if (side != before && side != before + 1) return SM_SHIM_ERR_BAD_TOOL;
+            if (side == before && surfaces[i].sides[k].meets != surfaces[i].sides[k - 1].meets) {
+                return SM_SHIM_ERR_BAD_TOOL;
+            }
+        }
     }
     return guarded([&]() -> sm_status {
         sm_brep* handle = nullptr;
@@ -591,11 +723,13 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
         SmTArray<SmFace*> all_faces;
         copy.GetFaces(all_faces);
         std::vector<SmFace*> removed;
+        std::vector<size_t> removed_indices;
         for (size_t i = 0; i < face_count; ++i) {
             if (faces[i] >= all_faces.GetSize()) return SM_SHIM_ERR_BAD_FACE;
             SmFace* face = all_faces[faces[i]];
             if (std::find(removed.begin(), removed.end(), face) != removed.end()) return SM_SHIM_ERR_BAD_FACE;
             removed.push_back(face);
+            removed_indices.push_back(faces[i]);
         }
 
         SmExtent3d box;
@@ -609,6 +743,9 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
         // Make every surface while the faces are all still there.
         const auto surfaces_start = std::chrono::steady_clock::now();
         std::vector<std::vector<SmSurface*>> made(surface_count);
+        // Each made surface's number, added to its label's index: a fill's
+        // patch's side, else 0.
+        std::vector<std::vector<uint32_t>> pieces(surface_count);
         struct DropMade {
             std::vector<std::vector<SmSurface*>>& made;
             ~DropMade() {
@@ -635,6 +772,8 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
             }
             const double tangent_tol = request.tangent_tol_deg > 0.0 ? request.tangent_tol_deg : 0.01;
             const double fit = request.fit_tolerance > 0.0 ? request.fit_tolerance : approx;
+            // The corner blend, the edge blend and the skin take an edge a side.
+            const bool edge_a_side = request.sides[request.side_count - 1].side + 1 == request.side_count;
             switch (request.tool) {
                 case SM_REBUILD_FILL:
                 case SM_REBUILD_COONS: {
@@ -644,21 +783,22 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
                         status = bound_of(rims[i], fit, held, bounds[i]);
                     }
                     if (status == SM_SUCCESS) status = chain(bounds, loop_gap);
-                    if (status == SM_SUCCESS) status = join_runs(bounds, held);
+                    if (status == SM_SUCCESS) status = join_sides(bounds, held);
                     if (status == SM_SUCCESS) {
-                        status = request.tool == SM_REBUILD_FILL ? make_fill(bounds, fit, tangent_tol, made[s])
-                                                                 : make_coons(bounds, fit, tangent_tol, made[s]);
+                        status = request.tool == SM_REBUILD_FILL
+                                     ? make_fill(bounds, fit, tangent_tol, made[s], pieces[s])
+                                     : make_coons(bounds, fit, tangent_tol, made[s]);
                     }
                     break;
                 }
                 case SM_REBUILD_CORNER:
-                    status = make_corner(copy, rims, fit, tangent_tol, made[s]);
+                    status = edge_a_side ? make_corner(copy, rims, fit, tangent_tol, made[s]) : SM_SHIM_ERR_BAD_TOOL;
                     break;
                 case SM_REBUILD_EDGE_BLEND:
-                    status = make_edge_blend(rims, request.order, made[s]);
+                    status = edge_a_side ? make_edge_blend(rims, request.order, made[s]) : SM_SHIM_ERR_BAD_TOOL;
                     break;
                 case SM_REBUILD_SKIN:
-                    status = make_skin(rims, fit, made[s]);
+                    status = edge_a_side ? make_skin(rims, fit, made[s]) : SM_SHIM_ERR_BAD_TOOL;
                     break;
                 default:
                     status = SM_SHIM_ERR_BAD_TOOL;
@@ -670,6 +810,7 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
                 return status == SM_SHIM_ERR_BAD_TOOL || status == SM_SHIM_ERR_OPEN_LOOP ? status
                                                                                          : SM_SHIM_ERR_SURFACE_FAILED;
             }
+            pieces[s].resize(made[s].size(), 0);
         }
         report->surface_seconds = seconds_since(surfaces_start);
 
@@ -680,6 +821,7 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
         SmTemporaryChangeValue<SmBoolean> editing(copy.m_bEditingEnabled, TRUE);
         SmStatus kernel = copy.RemoveFaces(taken);
         if (kernel != SM_SUCCESS) return status_of(kernel);
+        std::vector<SmFace*> made_faces;
         for (size_t s = 0; s < surface_count; ++s) {
             std::vector<SmSurface*>& list = made[s];
             while (!list.empty()) {
@@ -691,7 +833,10 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
                 kernel = copy.CreateFacesFromSurface(surface, domain, SM_CT_C0, new_faces);
                 if (kernel != SM_SUCCESS) return status_of(kernel);
                 report->faces_made += new_faces.GetSize();
-                status = label_faces(copy, new_faces, surfaces[s].label);
+                for (ULONG i = 0; i < new_faces.GetSize(); ++i) made_faces.push_back(new_faces[i]);
+                sm_label label = surfaces[s].label;
+                label.index += pieces[s][list.size()];
+                status = label_faces(copy, new_faces, label);
                 if (status != SM_SUCCESS) return status;
             }
         }
@@ -700,34 +845,24 @@ sm_status sm_brep_rebuild_faces(const sm_brep* brep, const uint32_t* faces, size
         ULONG lamina = 0;
         double vertex_gap = 0.0;
         double edge_gap = 0.0;
-        if (stitch_tolerance > 0.0) {
-            SmStitchCallback callback;
-            SmStitch stitch(callback, stitch_tolerance, TRUE, FALSE);
-            stitch.m_bFastEdgeCompare = TRUE;
-            stitch.m_bSplitEdgesWithVertices = TRUE;
-            stitch.m_bMakingManifoldSolid = TRUE;
-            double open_vertex = SM_BIG_DOUBLE;
-            double open_edge = SM_BIG_DOUBLE;
-            kernel = stitch.DoStitching(&copy, nullptr, nullptr, glued, lamina, vertex_gap, edge_gap, &open_vertex,
-                                        &open_edge);
-            if (kernel != SM_SUCCESS) return status_of(kernel);
-            report->open_vertex_gap = open_vertex < SM_BIG_DOUBLE ? open_vertex : -1.0;
-            report->open_edge_gap = open_edge < SM_BIG_DOUBLE ? open_edge : -1.0;
-        } else {
-            SmBoolean produced = FALSE;
-            kernel = SmStitch::StitchIntoSolid(&copy, produced, glued, vertex_gap, edge_gap);
-            if (kernel != SM_SUCCESS) return status_of(kernel);
-            SmTArray<SmEdge*> after;
-            copy.GetEdges(after);
-            for (ULONG i = 0; i < after.GetSize(); ++i) {
-                if (after[i]->IsLamina()) ++lamina;
-            }
-        }
+        SmStitchCallback callback;
+        SmStitch stitch(callback, stitch_tolerance, TRUE, FALSE);
+        stitch.m_bFastEdgeCompare = TRUE;
+        stitch.m_bSplitEdgesWithVertices = TRUE;
+        stitch.m_bMakingManifoldSolid = TRUE;
+        double open_vertex = SM_BIG_DOUBLE;
+        double open_edge = SM_BIG_DOUBLE;
+        kernel = stitch.DoStitching(&copy, nullptr, nullptr, glued, lamina, vertex_gap, edge_gap, &open_vertex,
+                                    &open_edge);
+        if (kernel != SM_SUCCESS) return status_of(kernel);
+        report->open_vertex_gap = open_vertex < SM_BIG_DOUBLE ? open_vertex : -1.0;
+        report->open_edge_gap = open_edge < SM_BIG_DOUBLE ? open_edge : -1.0;
         report->stitched = glued;
         report->open_edges = lamina;
         report->vertex_gap = vertex_gap;
         report->edge_gap = edge_gap;
         if (lamina > 0) {
+            widest_open(copy, made_faces, *brep_of(brep), original_edges, removed_indices, *report);
             report->stitch_seconds = seconds_since(stitch_start);
             return SM_SHIM_ERR_LEFT_OPEN;
         }
