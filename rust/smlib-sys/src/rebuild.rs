@@ -1,6 +1,6 @@
 //! Rebuilding faces (`shim/rebuild.h`), written out by hand rather than by
-//! bindgen while it's a spike, so `shim.h` and `bindings.rs` stay as they
-//! are. Keep it in step with `rebuild.h`.
+//! bindgen, so `shim.h` and `bindings.rs` stay as they are. Keep it in step
+//! with `rebuild.h`.
 
 use crate::{sm_brep, sm_label, sm_status, sm_surface};
 
@@ -38,6 +38,7 @@ pub const SM_EDGE_CURVATURE_SAMPLES: usize = 12;
 #[derive(Clone, Copy, Debug)]
 pub struct sm_rebuild_side {
     pub edge: u32,
+    pub side: u32,
     pub meets: i32,
 }
 
@@ -68,6 +69,8 @@ pub struct sm_rebuild_report {
     pub surface_status: sm_status,
     pub surface_seconds: f64,
     pub stitch_seconds: f64,
+    pub open_gap: f64,
+    pub open_at: i64,
 }
 
 #[repr(C)]

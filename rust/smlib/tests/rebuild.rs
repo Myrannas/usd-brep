@@ -2,7 +2,8 @@
 //! call (`Brep::rebuild_faces`): what the Free-form parts spec's Rebuild
 //! needs, from its continuity spike. A rebuilt side asked to be Tangent
 //! meets the face beyond it with no crease, the stitch says how far apart
-//! what it left open is, and the measures that check it read true.
+//! what it left open is and at which rim edge, and the measures that check
+//! it read true.
 //!
 //! As in `cases.rs`, every test sends its kernel work to one shared kernel
 //! thread.
@@ -85,7 +86,7 @@ fn rim(solid: &Brep, round: usize) -> Vec<Side> {
     };
     rim.sort_by_key(|&(_, n)| order(n));
     rim.into_iter()
-        .map(|(edge, n)| Side { edge, meets: if n[0].abs() > 0.99 { Meets::Position } else { Meets::Tangent } })
+        .map(|(edge, n)| Side::edge(edge, if n[0].abs() > 0.99 { Meets::Position } else { Meets::Tangent }))
         .collect()
 }
 
@@ -129,17 +130,97 @@ fn a_coons_patch_closes_a_rounded_edge_tangent_to_both_faces() {
 }
 
 #[test]
-fn a_fill_closes_it_in_a_patch_a_side() {
+fn a_fill_closes_it_in_a_patch_a_corner_each_numbered_by_its_side() {
     on_kernel(|k| {
         let (solid, round) = rounded_edge(k);
-        let surface = RebuildSurface { tool: Tool::Fill, sides: rim(&solid, round), tangent_tol_deg: 0.01, fit_tolerance: 0.0, label: label() };
+        let sides = rim(&solid, round);
+        let surface = RebuildSurface { tool: Tool::Fill, sides: sides.clone(), tangent_tol_deg: 0.01, fit_tolerance: 0.0, label: label() };
         let rebuilt = solid.rebuild_faces(&[round], &[surface], STITCH).unwrap();
         assert!(rebuilt.report.solid);
-        // Four patches meeting in the middle, the rim's edges split where
-        // they meet it.
+        // Four patches meeting in the middle, one a corner of the loop, the
+        // rim's edges split where they meet it.
         assert_eq!(rebuilt.report.faces_made, 4);
         let creases = rim_creases(&rebuilt.brep);
         assert!(creases.iter().filter(|&&c| c < 45.0).all(|&c| c < CREASE_DEG), "{creases:?}");
+        // Each is labelled by the side whose start it holds, 1 to 4.
+        let faces = rebuilt.brep.faces().unwrap();
+        let mut numbers: Vec<u32> = faces.iter().filter_map(|f| f.label.as_ref()).filter(|l| l.feature == REBUILT).map(|l| l.index).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [1, 2, 3, 4]);
+        // Patch 1 holds the corner where the last side ends and the first
+        // starts: where the top meets the far end.
+        let edges = solid.edges().unwrap();
+        let start = |side: &Side| edges[side.edges[0]].samples;
+        let (first, last) = (start(&sides[0]), start(&sides[3]));
+        let shared = [first[0], first[first.len() - 1]]
+            .into_iter()
+            .find(|p| [last[0], last[last.len() - 1]].iter().any(|q| (0..3).all(|i| (p[i] - q[i]).abs() < 1e-6)))
+            .unwrap();
+        let one = faces.iter().find(|f| f.label.as_ref().is_some_and(|l| l.feature == REBUILT && l.index == 1)).unwrap();
+        assert!((0..3).all(|i| one.bounds[0][i] - 1e-6 <= shared[i] && shared[i] <= one.bounds[1][i] + 1e-6), "{shared:?} {:?}", one.bounds);
+    });
+}
+
+#[test]
+fn a_sides_edges_are_joined_into_one_side() {
+    on_kernel(|k| {
+        // The fill's patches split the round's rim edges where they meet
+        // them: rebuilt again, each long side is two edges, one side.
+        let (solid, round) = rounded_edge(k);
+        let surface = RebuildSurface { tool: Tool::Fill, sides: rim(&solid, round), tangent_tol_deg: 0.01, fit_tolerance: 0.0, label: label() };
+        let filled = solid.rebuild_faces(&[round], &[surface], STITCH).unwrap().brep;
+        let faces = filled.faces().unwrap();
+        let patches: Vec<usize> = faces.iter().filter(|f| f.label.as_ref().is_some_and(|l| l.feature == REBUILT)).map(|f| f.index).collect();
+        let normal_of = |f: u32| faces[f as usize].normal.unwrap();
+        let mut rim: Vec<(usize, [f64; 3])> = filled
+            .edges()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.faces.iter().flatten().filter(|&&f| patches.contains(&(f as usize))).count() == 1)
+            .map(|e| (e.index, normal_of(e.faces.iter().flatten().copied().find(|&f| !patches.contains(&(f as usize))).unwrap())))
+            .collect();
+        assert_eq!(rim.len(), 8, "each side split in two");
+        let order = |n: [f64; 3]| match n {
+            n if n[2] > 0.99 => 0,
+            n if n[0] < -0.99 => 1,
+            n if n[1] < -0.99 => 2,
+            _ => 3,
+        };
+        rim.sort_by_key(|&(_, n)| order(n));
+        let edges = filled.edges().unwrap();
+        let mut sides: Vec<Side> = Vec::new();
+        for (edge, n) in rim {
+            let meets = if n[0].abs() > 0.99 { Meets::Position } else { Meets::Tangent };
+            match sides.last_mut() {
+                Some(side) if order(normal_of(edges[side.edges[0]].faces.iter().flatten().copied().find(|&f| !patches.contains(&(f as usize))).unwrap())) == order(n) => side.edges.push(edge),
+                _ => sides.push(Side::edge(edge, meets)),
+            }
+        }
+        assert_eq!(sides.len(), 4);
+        // Each side's edges in order round the loop: first the one that
+        // touches the side before.
+        let ends = |e: usize| [edges[e].samples[0], edges[e].samples[edges[e].samples.len() - 1]];
+        let touch = |a: usize, b: usize| ends(a).iter().any(|p| ends(b).iter().any(|q| (0..3).all(|i| (p[i] - q[i]).abs() < 1e-6)));
+        for n in 0..4 {
+            let before = sides[(n + 3) % 4].edges.clone();
+            let side = &mut sides[n];
+            if side.edges.len() == 2 && !before.iter().any(|&b| touch(side.edges[0], b)) {
+                side.edges.swap(0, 1);
+            }
+        }
+        let surface = RebuildSurface { tool: Tool::Coons, sides, tangent_tol_deg: 1e-4, fit_tolerance: 0.0, label: label() };
+        let rebuilt = filled.rebuild_faces(&patches, &[surface], STITCH).unwrap();
+        assert!(rebuilt.report.solid);
+        assert_eq!(rebuilt.report.faces_made, 1);
+    });
+}
+
+#[test]
+fn a_stitch_must_have_a_tolerance() {
+    on_kernel(|k| {
+        let (solid, round) = rounded_edge(k);
+        let surface = RebuildSurface { tool: Tool::Coons, sides: rim(&solid, round), tangent_tol_deg: 1e-4, fit_tolerance: 0.0, label: label() };
+        assert!(solid.rebuild_faces(&[round], &[surface], 0.0).is_err());
     });
 }
 
@@ -157,11 +238,13 @@ fn an_edge_blend_between_two_sides_leaves_its_ends_open_and_says_how_far() {
         assert_eq!(failure.report.open_edges, 4);
         let gap = failure.report.open_edge_gap.unwrap();
         assert!((0.1..0.3).contains(&gap), "{gap}");
-        // StitchIntoSolid glues it shut, widening its tolerance, and says
-        // only how wide what it glued was.
-        let glued = solid.rebuild_faces(&[round], &[surface], 0.0).unwrap();
-        assert!(glued.report.solid);
-        assert!(glued.report.edge_gap.max(glued.report.vertex_gap) > 0.1, "{:?}", glued.report);
+        // Its widest is the arc's middle, off one of the ends' faces: the
+        // walk says how wide and which rim edge, a Position side's.
+        let widest = failure.report.widest_open.unwrap();
+        let width = widest.width.unwrap();
+        assert!((gap..1.0).contains(&width), "{width}");
+        let ends: Vec<usize> = rim(&solid, round).into_iter().filter(|s| s.meets == Meets::Position).flat_map(|s| s.edges).collect();
+        assert!(ends.contains(&widest.rim_edge.unwrap()), "{widest:?} {ends:?}");
     });
 }
 
@@ -193,7 +276,7 @@ fn a_corner_blend_meets_a_rounded_box_corner_within_hollows_limit() {
             .unwrap()
             .into_iter()
             .filter(|e| e.faces.contains(&Some(corner as u32)))
-            .map(|e| Side { edge: e.index, meets: Meets::Tangent })
+            .map(|e| Side::edge(e.index, Meets::Tangent))
             .collect();
         assert_eq!(sides.len(), 4);
         // Fitted to the brep's tolerance, the rounds' arcs leave it a hair

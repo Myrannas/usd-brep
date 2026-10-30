@@ -4,8 +4,8 @@
  * shim. Also the measures that check how the surfaces meet: the normal
  * curvature across each edge, and surfaces carried on past their edges.
  *
- * Kept apart from shim.h while it's a spike: its declarations are written
- * out by hand in smlib-sys's `rebuild` module rather than by bindgen. */
+ * Kept apart from shim.h: its declarations are written out by hand in
+ * smlib-sys's `rebuild` module rather than by bindgen. */
 
 #ifndef SMLIB_SHIM_REBUILD_H
 #define SMLIB_SHIM_REBUILD_H
@@ -18,9 +18,9 @@ extern "C" {
 
 static const sm_status SM_SHIM_ERR_NOT_RIM = 2101;        /* a side's edge isn't between a face taken out and a kept one */
 static const sm_status SM_SHIM_ERR_OPEN_LOOP = 2102;      /* a surface's sides don't run end to end round a loop */
-static const sm_status SM_SHIM_ERR_BAD_TOOL = 2103;       /* a tool, a side count or an order the tool can't take */
+static const sm_status SM_SHIM_ERR_BAD_TOOL = 2103;       /* a tool, a side count, a side's edges or an order the tool can't take */
 static const sm_status SM_SHIM_ERR_SURFACE_FAILED = 2104; /* the kernel couldn't make a surface; the report says which */
-static const sm_status SM_SHIM_ERR_LEFT_OPEN = 2105;      /* the stitch left edges open; the report says how far apart */
+static const sm_status SM_SHIM_ERR_LEFT_OPEN = 2105;      /* the stitch left edges open; the report says how far apart, and where */
 static const sm_status SM_SHIM_ERR_NOT_SOLID = 2106;      /* the stitched result isn't a manifold solid with a volume */
 
 /* The kernel call that makes a surface. */
@@ -28,26 +28,27 @@ enum {
     /* SmBSplineSurface::CreateNSidedPatch through 3 to 8 sides in order
      * round the loop, a Tangent side's cross-derivative curve sampled from
      * the kept face beyond it (SmTangentField, fitted with matching
-     * parameters to tangent_tol_deg). It makes a patch a side, which meet
-     * one another in the middle. Sides next to one another on the same
-     * kept face, meeting it alike, are one side: their curves joined. */
+     * parameters to tangent_tol_deg). It makes a patch a corner of the
+     * loop, the patches meeting one another in the middle, each labelled
+     * with the side whose start it holds (sm_rebuild_surface's label). */
     SM_REBUILD_FILL = 0,
     /* SmBSplineSurface::CreateCoonsPatch, bicubic, through 4 sides in
-     * order, joined as a fill's are: a Tangent side's cross-derivative as a
+     * order: a Tangent side's cross-derivative as a
      * fill's, a Position side's a cubic from the side before it to the side
      * after, leaving each corner at the twist the field beside it has
      * there, so the patch's corners agree. */
     SM_REBUILD_COONS = 1,
-    /* SmBrep::CreateCornerBlend from the rim's edgeuses, 3 or 4 sides, any
-     * order: a bicubic Coons patch (with a point for a fourth side) whose
-     * cross-tangents SmTangentField fits to tangent_tol_deg. Every side
-     * Tangent but a 4-sided one's fourth, which may be Position. */
+    /* SmBrep::CreateCornerBlend from the rim's edgeuses, 3 or 4 sides of an
+     * edge each, any order: a bicubic Coons patch (with a point for a
+     * fourth side) whose cross-tangents SmTangentField fits to
+     * tangent_tol_deg. Every side Tangent: a Position side is
+     * SM_ERR_NULL_POINTER. */
     SM_REBUILD_CORNER = 2,
-    /* SmBrep::CreateEdgeEdgeBlend between sides[0] and sides[1], `order`
+    /* SmBrep::CreateEdgeEdgeBlend between two sides of an edge each, `order`
      * 0 ruled, 1 G1, 2 G2, 3 G3, both ends alike. */
     SM_REBUILD_EDGE_BLEND = 3,
-    /* SmBSplineSurface::CreateSkinnedSurface through sides[0] and
-     * sides[1], cubic, a Tangent end taking its cross-derivatives from a
+    /* SmBSplineSurface::CreateSkinnedSurface through two sides of an edge
+     * each, cubic, a Tangent end taking its cross-derivatives from a
      * derivative surface of the kept face beyond it
      * (SmDerivSurfDefinition, towards the other side), G1 at most. */
     SM_REBUILD_SKIN = 4
@@ -56,21 +57,26 @@ enum {
 /* How a side meets the face beyond it. */
 enum { SM_MEETS_POSITION = 0, SM_MEETS_TANGENT = 1, SM_MEETS_CURVATURE = 2 };
 
+/* One edge of a surface's side. A surface's edges are listed in order
+ * round its loop, each side's together and in order along it; a fill or a
+ * Coons patch joins a side's edges end to end into one curve. */
 typedef struct sm_rebuild_side {
-    uint32_t edge; /* a rim edge, by its index in the brep given, before any face is taken out */
-    int32_t meets;
+    uint32_t edge;  /* a rim edge, by its index in the brep given, before any face is taken out */
+    uint32_t side;  /* the side it's on, counting from 0 in order round the loop */
+    int32_t meets;  /* how the side meets the kept faces beyond it, alike on each of its edges */
 } sm_rebuild_side;
 
 typedef struct sm_rebuild_surface {
     int32_t tool;
-    const sm_rebuild_side *sides;
-    size_t side_count;
+    const sm_rebuild_side *sides; /* its sides' edges */
+    size_t side_count;            /* how many edges */
     int32_t order;          /* an edge blend's: 0 to 3 */
     double tangent_tol_deg; /* how near a fill, Coons patch or corner blend fits its cross-tangents; <= 0 for 0.01 */
     double fit_tolerance;   /* how near, in mm, a rational edge's non-rational fit stays to it, for a fill, Coons
                              * patch, corner blend or skin; <= 0 for the larger of the brep's tolerance and 1e-7 of
                              * its diagonal */
-    sm_label label;         /* for every face the surface makes; present 0 for none */
+    sm_label label;         /* for every face the surface makes, a fill's patch's index raised by the number,
+                             * from 1, of the side whose start it holds; present 0 for none */
 } sm_rebuild_surface;
 
 /* What a rebuild did, filled in whether it succeeds or not. */
@@ -87,22 +93,28 @@ typedef struct sm_rebuild_report {
     sm_status surface_status; /* what it said */
     double surface_seconds;   /* making the surfaces */
     double stitch_seconds;    /* taking the faces out, adding the surfaces and stitching */
+    double open_gap;          /* the widest gap the stitch left open, edge to edge, -1 for none or one it can't
+                               * measure: each open edge's points against the open edges across the gap from it
+                               * (a kept face's against the new faces', and the other way) */
+    int64_t open_at;          /* the rim edge, by index in the brep given, nearest where that gap is widest; -1
+                               * for none */
 } sm_rebuild_report;
 
 /* Takes the faces at the given indices out of a copy of brep, makes each
  * surface from the rim's edges and the kept faces beyond them, adds those
  * as faces labelled with their labels (a face a surface, split only where
- * it isn't C0), and stitches the lot into a solid (SmStitch::DoStitching at
- * stitch_tolerance, splitting an edge where another's vertex lies on it, as
- * a fill's patches' do on the rim; or with stitch_tolerance <= 0
- * SmStitch::StitchIntoSolid, which widens its tolerance up to 1/200 of the
- * part's diagonal and glues what it finds there, reporting only the widest
- * gap it glued), then orients it. The surfaces are made before any face
- * goes, from the kept faces' edgeuses. *out is the new solid; brep is
- * unchanged. On any failure *out is NULL and no open body is returned:
- * SM_SHIM_ERR_LEFT_OPEN or SM_SHIM_ERR_NOT_SOLID with the report saying
- * what the stitch did, SM_SHIM_ERR_SURFACE_FAILED with the surface and its
- * status. report may not be NULL. */
+ * it isn't C0), and stitches the lot into a solid with
+ * SmStitch::DoStitching at stitch_tolerance, which must be positive,
+ * splitting an edge where another's vertex lies on it, as a fill's
+ * patches' do on the rim, and leaving anything wider open; then orients it.
+ * Never SmStitch::StitchIntoSolid, which widens its tolerance up to 1/200
+ * of the part's diagonal and glues what it finds there without a word. The
+ * surfaces are made before any face goes, from the kept faces' edgeuses.
+ * *out is the new solid; brep is unchanged. On any failure *out is NULL
+ * and no open body is returned: SM_SHIM_ERR_LEFT_OPEN with the report
+ * saying how many edges the stitch left open, the widest gap and the rim
+ * edge it's at; SM_SHIM_ERR_NOT_SOLID; or SM_SHIM_ERR_SURFACE_FAILED with
+ * the surface and its status. report may not be NULL. */
 sm_status sm_brep_rebuild_faces(const sm_brep *brep, const uint32_t *faces, size_t face_count,
                                 const sm_rebuild_surface *surfaces, size_t surface_count, double stitch_tolerance,
                                 sm_brep **out, sm_rebuild_report *report);

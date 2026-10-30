@@ -1315,7 +1315,8 @@ in `rust/smlib/tests/rebuild.rs` and game-cad's
   and stitches them back in, all in one call, so no open body reaches
   Rust. `RemoveFaces` needs `m_bEditingEnabled`, which the call sets while
   it runs. Each side is a rim edge and how it meets the kept face:
-  Position, Tangent or Curvature.
+  Position, Tangent or Curvature (since Rebuild faces, a run of rim edges;
+  below).
 - **Its tools.** `Fill`, `CreateNSidedPatch` through 3 to 8 sides, a patch
   a side; `Coons`, `CreateCoonsPatch`, bicubic, four sides; `Corner`,
   `SmBrep::CreateCornerBlend` from the rim's edgeuses, three or four
@@ -1346,8 +1347,9 @@ in `rust/smlib/tests/rebuild.rs` and game-cad's
 - **Sides on one face are joined.** The free-form corner part's corner
   rim is six edges, each round's end two where its fill's patches met, so
   a fill or Coons patch joins a run of sides on one kept face, meeting it
-  alike, into one (`CreateByJoining`). The corner blend can't: it takes
-  one edgeuse a side.
+  alike, into one (`CreateByJoining`); since Rebuild faces, the edges the
+  caller puts on one side (below). The corner blend can't: it takes one
+  edgeuse a side.
 - **The stitch.** `SmStitch::DoStitching` at the tolerance given, edges
   split at another's vertex (a fill's patches split the rim's edges), its
   narrowest unstitched vertex and edge gaps reported: what it left open,
@@ -1355,7 +1357,8 @@ in `rust/smlib/tests/rebuild.rs` and game-cad's
   tolerance from a tenth of the brep's to 1/200 of the diagonal and glues
   what it finds, reporting only the widest gap glued: an edge blend whose
   ends stop 0.196 mm off the faces beside them came back a "solid" with a
-  0.2 mm gap glued shut. Neither names the edge it left open.
+  0.2 mm gap glued shut. Neither names the edge it left open. (Since
+  Rebuild faces only `DoStitching`, and the shim names the edge; below.)
 - **Edge blends and skins leave their ends open.** Between two rim runs
   their ends' cross sections aren't the gap's other sides, so a round's
   ends stay off the faces at its ends: 0.196 mm on a block's rounded edge
@@ -1372,6 +1375,36 @@ in `rust/smlib/tests/rebuild.rs` and game-cad's
   Ruled (`SM_CT_G1R`). The dome's NURBS carried 20 mm on meets itself
   within 1e-11 mm and 8.5e-7°, Smooth and Natural keeping its curvature
   across; a plane and a cylinder extend as themselves.
+
+## Notes from Rebuild faces (no patch needed)
+
+The shim's `rebuild.cpp` bound for real, for game-cad's free-form step 4, the
+Rebuild feature; `rust/smlib/tests/rebuild.rs` checks it, and game-cad's
+`crates/smlib-backend/tests/rebuild.rs` builds it.
+
+- **A side is a run of edges.** `sm_rebuild_side` takes each edge with the
+  side it's on (`side`, from 0 round the loop), a surface's edges listed in
+  loop order, each side's together. A fill or Coons patch joins a side's
+  edges end to end (`join_sides`, `CreateByJoining`) where the spike joined
+  any run on one kept face meeting it alike; the corner blend, the edge
+  blend and the skin take an edge a side (`SM_SHIM_ERR_BAD_TOOL`
+  otherwise). Rust's `Side` is `{ edges, meets }`. The caller orders the
+  edges: the shim's `chain` only turns each to run on from the one before.
+- **A fill's patches are numbered.** `CreateNSidedPatch` makes a patch a
+  corner of the loop, not a side (on a block's rounded edge, each long
+  side is split where two patches meet it, 12 edges glued). Each patch's
+  label index is raised by the number, from 1, of the side whose start lies
+  at one of its corners, so a Rebuild names them by side.
+- **Only `DoStitching`.** `stitch_tolerance` must be positive; the
+  `StitchIntoSolid` path is gone, since it glued a 0.2 mm gap shut without
+  a word. When the stitch leaves edges open, the shim walks them
+  (`widest_open`): each open edge's twelve `edge_creases` points against
+  the open edges across the gap (a kept face's against the new faces', and
+  the other way, by `SmEdge::ClosestPoint`), the widest of those its
+  `open_gap`, and the rim edge of the brep given nearest where it's widest
+  its `open_at` (`RebuildReport::widest_open`, an `OpenGap`). The edge
+  blend between a rounded edge's two long sides leaves its ends open: the
+  widest is 0.2 to 1 mm, at one of the ends' rim edges.
 
 ## Notes from the 1.0.1 merge
 
