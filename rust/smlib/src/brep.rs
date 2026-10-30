@@ -557,9 +557,9 @@ impl Brep {
     /// circle the scale stretches becomes an ellipse where the images of its
     /// axes stay square. With `extrusions`, a cylinder stretched across its
     /// axis becomes an ellipse swept along a line (`SmSurfOfExtrusion`, which
-    /// [`Surface`](crate::Surface) reports as `Other`); without, a NURBS, as
-    /// is every other surface the scale distorts (spheres and tori among
-    /// them).
+    /// [`Surface`](crate::Surface) reports as the `Nurbs` it is); without, a
+    /// NURBS of its own, as is every other surface the scale distorts
+    /// (spheres and tori among them).
     ///
     /// Each new surface and curve keeps the old one's parameters and lies
     /// where the scale takes the old one, so faces keep their (u, v) domains

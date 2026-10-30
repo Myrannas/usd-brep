@@ -577,10 +577,10 @@ fn a_stretch_across_the_cylinders_keeps_the_planes() {
             assert!(stretched.is_manifold().unwrap());
             assert_eq!(now.iter().filter(|&&kind| kind == "plane").count(), planes);
             // Stretched cylinders are exact ellipses swept along a line, or
-            // NURBS; the cone and the ball are NURBS.
-            let swept = now.iter().filter(|&&kind| kind == "other").count();
-            assert_eq!(swept, if extrusions { cylinders } else { 0 }, "{report:?}");
-            assert_eq!(report.faces_extruded as usize, swept);
+            // NURBS, and read as NURBS either way; the cone and the ball are
+            // NURBS.
+            assert!(now.iter().all(|&kind| kind != "other"), "{now:?}");
+            assert_eq!(report.faces_extruded as usize, if extrusions { cylinders } else { 0 }, "{report:?}");
             assert_eq!(report.faces_kept as usize, planes);
             assert!(report.curves_stretched > 0, "{report:?}");
             assert_eq!(face_labels(&after), face_labels(&faces));
