@@ -26,6 +26,7 @@ from `v1.0.0` (`c9c5979`).
 | `e98c8d9` | `SmOffsetGeometryCreation.cpp` | Found offsetting a lofted tank's skin in: `ExtendTrimEdges` finds a non-lamina edge's other UV curve by dropping the curve lifted on one side onto the other side's extended surface. For a seam both sides are one surface, and onto the far extension of an inward offset, which folds where the extended surface runs through its axis, the drop landed 120 mm away at 5 mm in and the solid came back open. | When both uses of the edge lie on one face and its two original UV curves are one curve moved (checked at five points), the other side's is this side's extended curve moved likewise (`sm_SeamPartner`); otherwise it drops as before. |
 | `838fd7b` | `SmSurface.cpp` | Found rebuilding faces (the continuity spike): `SmSurface::CreateBlendSurface`, under `SmBrep::CreateEdgeEdgeBlend`, ignores the statuses of sampling its two curves and making its cross sections, and skins whatever it has. | Check each step's status, and that both curves' samples and the cross sections agree in number; a failure is `SM_ERR`. |
 | `771389b` | `SmBSplineSurfaceNLib.cpp` | Found rebuilding faces: `CreateSkinnedSurface` with two rails finds their cross sections' parameters again when synchronising their knots moves a rail's domain, rail 2's at `[lNumSections + i]`; NLib takes one set for both, and `CreateBlendSurface` passes one a section, so rail 2's read and wrote past the array. An edge blend between the free-form dome and a wall crashed the process (`EXC_BAD_ACCESS`). | Find rail 2's again only when the set holds them apart. |
+| `654710c` | `SmBSplineSurface.h`, `SmBSplineSurfaceNLib.cpp` | Found lofting along guides: `SmBSplineSurface::CreateGordonSurface` intersects its curves and reparameterises them piecewise linearly to match (`N_ReparmCrvsIsectPt` with `NL_LINEAR`), which leaves a knot as often as the degree, and a crease, along every crossing curve. | Add `SmBSplineSurface::CreateGordonSurfaceAt`, which takes the curves' crossing parameters and hands NLib's `N_CreateGordonSrf` the curves as they are, made compatible within each family, so curves reparameterised smoothly beforehand (the shim's `FreeSurface::network`) keep their continuity. Only adds a method. |
 
 Dropped at the 1.0.1 merge: `a9a7a28` and `0afdfdb`, which mated a local
 operation's and a solid offset's edges in the original brep's order
@@ -53,7 +54,7 @@ shim's merges pass (`Brep::merge_faces`, `merge_faces_keeping`); every
 merge inside the kernel, the fillets' and booleans' among them, is as it
 was.
 The torus patches change only `SmTorus::IsNurbSurfaceTorus`, which only the
-shim calls. Patch `23281a6` only adds a method. The blend patch `838fd7b`
+shim calls. Patches `23281a6` and `654710c` only add methods. The blend patch `838fd7b`
 changes only what a failed sample returns, and `771389b` only a skin with
 two rails whose second rail's domain synchronising moves, which read past
 its array before: both reach the kernel's own edge blends (its offsets'
@@ -1548,3 +1549,53 @@ now, since a spline holds its poles and knots. No kernel source changes.
   game-cad's cut D (its `tests/surfaces.rs`). Every surface of extrusion
   reads so, an ellipse a stretch sweeps along a line (`scale_axes_keeping`
   with `extrusions`) among them; game-cad's own stretches ask for none.
+
+## Notes from Loft (patch `654710c`)
+
+game-cad's Loft skins sections in order (`FreeSurface::loft`), or with
+guides makes a network through them, and caps and stitches it as the probe
+did. Its sections and guides reach the kernel as exact curves: a sketch's
+lines, arcs and splines, and edges and curves the kernel made, read back.
+
+- **A curve's net** (`Curve::net`, `sm_curve_net`) is its degree, poles,
+  weights and knots, as `Curve::from_net` takes them, so an edge's curve
+  (`Curve::of_edge`) or a run joined from several can be kept as plain data
+  and lofted later exactly.
+- **`smlib::nurbs`** works on those nets in Rust: evaluation and first
+  derivative, reversal, a linear reparameterisation, knot insertion (Piegl
+  and Tiller's A5.1) and splitting, a degree raised exactly (the poles
+  solved for at the Greville abscissae of the raised knots, a space that
+  holds the curve; banded elimination without pivoting, the collocation
+  matrix being totally positive), pieces joined end to end (raised to one
+  degree, their weights scaled to meet, each join a knot as often as the
+  degree), where a curve turns a corner, and a smooth non-rational cubic fit
+  of any function of the parameter within a micron, C0 at corners and C1
+  where the curve's own spans meet. Arcs are exact rational quadratics, a
+  span to each quarter turn.
+- **The compatibility step for networks** (`FreeSurface::network`, the
+  module's notes): each crossing where the two curves come nearest (the
+  nearest of 128 by 128 samples, then Gauss and Newton), refused past the
+  gap asked (`NetworkError::Misses`, by how far); each guide turned to run
+  from the first section to the last and trimmed to them; closed sections
+  each started where the first guide crosses them, that guide closing the
+  network again at the far end; open sections given an edge through their
+  ends where no guide runs; the shared parameters the crossings' means;
+  each curve reparameterised by a monotone cubic (Fritsch and Carlson)
+  through its own crossings to the shared ones and refitted. The kernel's
+  `CreateGordonSurface` does the same piecewise linearly, which creases the
+  surface between sections along every guide, since each section's speed
+  jumps by its own ratio there; `CreateGordonSurfaceAt` takes the curves as
+  they are. NLib's Gordon takes each crossing as the middle of its two
+  points, so a gap within the one asked is closed there.
+- Cases (`tests/network.rs`): a duct from r 20 through r 30 to r 20 pulled
+  along one guide and along a guide each side, through its sections and
+  guides within 1e-3 mm and capped into a closed solid; a guide 8 µm off
+  closed and one 1.4 mm off refused by 1.4; three open arcs with a guide
+  across their tops rising between them, its edges on the arcs' ends, and
+  the guide reversed; a rectangle to a circle along a rail, split at the
+  rectangle's corners and capped into a solid.
+- Limits: closed sections with two guides or more meet at the first guide
+  only in position (the guides' blend across u isn't periodic), so a slight
+  crease may run along it where the guides pull unevenly; each crossing is
+  where the curves come nearest, so a guide that touches a section twice
+  takes the nearer.

@@ -250,6 +250,36 @@ sm_status sm_curve_shape(const sm_curve* curve, int32_t* degree, size_t* poles, 
     });
 }
 
+sm_status sm_curve_net(const sm_curve* curve, sm_vec3* poles, double* weights, double* knots) {
+    if (!curve || !poles || !knots) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&]() -> sm_status {
+        const SmBSplineCurve* bspline = dynamic_cast<const SmBSplineCurve*>(curve_of(curve));
+        if (!bspline) return SM_ERR_INVALID_INPUT;
+        const ULONG count = bspline->GetNumberControlPoints();
+        for (ULONG i = 0; i < count; ++i) {
+            SmPoint3d pole;
+            double weight = 1.0;
+            const SmStatus got = bspline->GetControlPoint(SM_CP_EUCLIDIAN_RATIONAL, i, pole, weight);
+            if (got != SM_SUCCESS) return status_of(got);
+            put(&poles[i], pole);
+            if (weights) weights[i] = bspline->IsRational() ? weight : 1.0;
+        }
+        SmTArray<double> unique;
+        SmTArray<ULONG> multiplicities;
+        const SmStatus got = bspline->GetKnots(unique, &multiplicities);
+        if (got != SM_SUCCESS) return status_of(got);
+        const size_t wanted = count + bspline->GetDegree() + 1;
+        size_t at = 0;
+        for (ULONG i = 0; i < unique.GetSize(); ++i) {
+            for (ULONG m = 0; m < multiplicities[i]; ++m) {
+                if (at == wanted) return SM_ERR;
+                knots[at++] = unique[i];
+            }
+        }
+        return at == wanted ? SM_SUCCESS : SM_ERR;
+    });
+}
+
 void sm_curve_free(sm_curve* curve) { delete curve_of(curve); }
 
 sm_status sm_surface_create(int32_t degree_u, int32_t degree_v, const sm_vec3* poles, size_t count_u, size_t count_v,
@@ -337,6 +367,31 @@ sm_status sm_surface_gordon(const sm_curve* const* u, size_t u_count, const sm_c
         if (copied != SM_SUCCESS) return copied;
         SmBSplineSurface* surface = nullptr;
         const SmStatus status = SmBSplineSurface::CreateGordonSurface(context(), u_curves, v_curves, surface);
+        if (status != SM_SUCCESS || !surface) return status != SM_SUCCESS ? status_of(status) : SM_ERR;
+        *out = surface_handle(surface);
+        return SM_SUCCESS;
+    });
+}
+
+sm_status sm_surface_gordon_at(const sm_curve* const* u, const double* u_at, size_t u_count, const sm_curve* const* v,
+                               const double* v_at, size_t v_count, int32_t degree_u, int32_t degree_v,
+                               sm_surface** out) {
+    if (!u || !u_at || !v || !v_at || !out) return SM_SHIM_ERR_NULL_ARGUMENT;
+    if (u_count < 2 || v_count < 2 || degree_u < 1 || degree_v < 1) return SM_ERR_INVALID_INPUT;
+    return guarded([&]() -> sm_status {
+        Owned<SmBSplineCurve> held;
+        SmTArray<SmBSplineCurve*> u_curves, v_curves;
+        sm_status copied = bsplines(u, u_count, held, u_curves);
+        if (copied != SM_SUCCESS) return copied;
+        copied = bsplines(v, v_count, held, v_curves);
+        if (copied != SM_SUCCESS) return copied;
+        SmTArray<double> u_params, v_params;
+        for (size_t i = 0; i < u_count; ++i) u_params.Add(u_at[i]);
+        for (size_t i = 0; i < v_count; ++i) v_params.Add(v_at[i]);
+        SmBSplineSurface* surface = nullptr;
+        const SmStatus status = SmBSplineSurface::CreateGordonSurfaceAt(
+            context(), u_curves, u_params, v_curves, v_params, static_cast<ULONG>(degree_u),
+            static_cast<ULONG>(degree_v), surface);
         if (status != SM_SUCCESS || !surface) return status != SM_SUCCESS ? status_of(status) : SM_ERR;
         *out = surface_handle(surface);
         return SM_SUCCESS;

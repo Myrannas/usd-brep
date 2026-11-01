@@ -55,6 +55,8 @@ mod kernel;
 mod label;
 mod mesh;
 mod motion;
+mod network;
+pub mod nurbs;
 mod pipe;
 mod rebuild;
 mod shell;
@@ -76,6 +78,7 @@ pub use imprint::{Imprint, ImprintEdge};
 pub use kernel::Kernel;
 pub use label::{Label, LabelMatch, MAX_ROLE_LEN};
 pub use mesh::{Edge, Face, Mesh, Surface, TessellationParams};
+pub use network::{Network, NetworkError};
 pub use motion::{Moved, MovedFace, RigidMotion, Turn};
 pub use pipe::{PathEnd, Pipe, PipeFace, ProfileFace, ProfileSweep};
 pub use rebuild::{

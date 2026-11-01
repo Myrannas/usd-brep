@@ -13,6 +13,7 @@ use crate::brep::Brep;
 use crate::error::Error;
 use crate::kernel::Kernel;
 use crate::label::Label;
+use crate::nurbs::CurveNet;
 
 fn vec3([x, y, z]: [f64; 3]) -> sys::sm_vec3 {
     sys::sm_vec3 { x, y, z }
@@ -233,6 +234,40 @@ impl Curve {
         Ok(self.evaluate(a + (b - a) * s)?.0)
     }
 
+    /// Its whole net, as [`Curve::from_net`] takes it: degree, poles,
+    /// weights for a rational curve, and knots (`sm_curve_net`). So a curve
+    /// the kernel made, an edge's ([`Curve::of_edge`]) among them, can be
+    /// kept as plain data and worked on exactly.
+    pub fn net(&self) -> Result<CurveNet, Error> {
+        const OP: &str = "sm_curve_net";
+        let shape = self.shape()?;
+        let mut poles = vec![vec3([0.0; 3]); shape.poles];
+        let mut weights = vec![1.0; shape.poles];
+        let mut knots = vec![0.0; shape.poles + shape.degree as usize + 1];
+        // SAFETY: self is live on the kernel thread; the buffers are sized as
+        // `shape` says.
+        let status = unsafe {
+            sys::sm_curve_net(
+                self.raw.as_ptr(),
+                poles.as_mut_ptr(),
+                weights.as_mut_ptr(),
+                knots.as_mut_ptr(),
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(CurveNet {
+            degree: shape.degree,
+            poles: poles.into_iter().map(array).collect(),
+            weights: shape.rational.then_some(weights),
+            knots,
+        })
+    }
+
+    /// A curve of `net` ([`Curve::nurbs`]).
+    pub fn from_net(kernel: &Kernel, net: &CurveNet) -> Result<Curve, Error> {
+        Curve::nurbs(kernel, net.degree, &net.poles, net.weights.as_deref(), &net.knots)
+    }
+
     /// Degree, poles and weights, for a NURBS.
     pub fn shape(&self) -> Result<CurveShape, Error> {
         let (mut degree, mut poles, mut rational) = (0, 0, 0);
@@ -248,7 +283,7 @@ impl Curve {
         })
     }
 
-    fn as_raw(&self) -> *const sys::sm_curve {
+    pub(crate) fn as_raw(&self) -> *const sys::sm_curve {
         self.raw.as_ptr()
     }
 }
