@@ -643,6 +643,27 @@ impl Sheets {
         Ok(faces)
     }
 
+    /// [`add`](Sheets::add), but split only where the surface turns a corner
+    /// (C0), so a surface whose spans meet smoothly but only C1, as a
+    /// circle's quarters or a refitted curve's joins do, stays one face
+    /// (`sm_brep_add_surface_at_corners`).
+    pub fn add_at_corners(&mut self, surface: &FreeSurface, label: Option<&Label>) -> Result<usize, Error> {
+        const OP: &str = "SmBrep::CreateFacesFromSurface";
+        let raw = label.map(|l| l.to_raw(OP)).transpose()?;
+        let mut faces = 0;
+        // SAFETY: as in `add`.
+        let status = unsafe {
+            sys::sm_brep_add_surface_at_corners(
+                self.brep.as_raw(),
+                surface.raw.as_ptr(),
+                raw.as_ref().map_or(ptr::null(), |r| r as *const _),
+                &mut faces,
+            )
+        };
+        Error::check(OP, status)?;
+        Ok(faces)
+    }
+
     /// Adds a planar face bounded by the closed loop of curves, labelled.
     pub fn add_planar(&mut self, loop_: &[&Curve], label: Option<&Label>) -> Result<(), Error> {
         const OP: &str = "SmBrep::CreatePlanarFacesWith3DCurves";

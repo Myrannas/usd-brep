@@ -1165,6 +1165,10 @@ sm_status sm_brep_create_empty(sm_brep **out);
  * it's only C0 (SmBrep::CreateFacesFromSurface), each piece labelled with
  * label if it's not NULL; faces says how many it made. */
 sm_status sm_brep_add_surface(sm_brep *brep, const sm_surface *surface, const sm_label *label, size_t *faces);
+/* As sm_brep_add_surface, but split only where the surface turns a corner
+ * (C0), so one whose spans meet smoothly, C1 as a circle's quarters or a
+ * refitted curve's joins are, stays one face. */
+sm_status sm_brep_add_surface_at_corners(sm_brep *brep, const sm_surface *surface, const sm_label *label, size_t *faces);
 /* Adds a planar face bounded by a closed loop of curves
  * (SmBrep::CreatePlanarFacesWith3DCurves), labelled with label if it's not
  * NULL. */

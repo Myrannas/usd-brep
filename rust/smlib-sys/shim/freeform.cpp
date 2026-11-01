@@ -599,19 +599,34 @@ sm_status sm_brep_create_empty(sm_brep** out) {
     });
 }
 
+namespace {
+
+// Adds the surface on its whole domain as faces, split at knots of
+// continuity `split` or less, labelled.
+sm_status add_surface(sm_brep* brep, const sm_surface* surface, const sm_label* label, SmContinuityType split,
+                      size_t* faces) {
+    SmSurface* copy = nullptr;
+    SmStatus status = surface_of(surface)->Copy(context(), copy);
+    if (status != SM_SUCCESS || !copy) return status != SM_SUCCESS ? status_of(status) : SM_ERR;
+    const SmExtent2d domain = copy->GetNaturalUVDomain();
+    SmTArray<SmFace*> made;
+    status = brep_of(brep)->CreateFacesFromSurface(copy, domain, split, made);
+    if (status != SM_SUCCESS) return status_of(status);
+    *faces = made.GetSize();
+    return label_faces(*brep_of(brep), made, label);
+}
+
+}  // namespace
+
+sm_status sm_brep_add_surface_at_corners(sm_brep* brep, const sm_surface* surface, const sm_label* label,
+                                         size_t* faces) {
+    if (!brep || !surface || !faces) return SM_SHIM_ERR_NULL_ARGUMENT;
+    return guarded([&]() -> sm_status { return add_surface(brep, surface, label, SM_CT_C0, faces); });
+}
+
 sm_status sm_brep_add_surface(sm_brep* brep, const sm_surface* surface, const sm_label* label, size_t* faces) {
     if (!brep || !surface || !faces) return SM_SHIM_ERR_NULL_ARGUMENT;
-    return guarded([&]() -> sm_status {
-        SmSurface* copy = nullptr;
-        SmStatus status = surface_of(surface)->Copy(context(), copy);
-        if (status != SM_SUCCESS || !copy) return status != SM_SUCCESS ? status_of(status) : SM_ERR;
-        const SmExtent2d domain = copy->GetNaturalUVDomain();
-        SmTArray<SmFace*> made;
-        status = brep_of(brep)->CreateFacesFromSurface(copy, domain, SM_CT_C1, made);
-        if (status != SM_SUCCESS) return status_of(status);
-        *faces = made.GetSize();
-        return label_faces(*brep_of(brep), made, label);
-    });
+    return guarded([&]() -> sm_status { return add_surface(brep, surface, label, SM_CT_C1, faces); });
 }
 
 sm_status sm_brep_add_planar_face(sm_brep* brep, const sm_curve* const* loop, size_t count, const sm_label* label) {
