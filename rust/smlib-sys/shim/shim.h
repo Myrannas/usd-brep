@@ -1092,6 +1092,10 @@ sm_status sm_curve_interval(const sm_curve *curve, double *min, double *max);
 sm_status sm_curve_evaluate(const sm_curve *curve, double t, sm_vec3 *point, sm_vec3 *derivative);
 /* Degree, pole count and whether it's rational, for an SmBSplineCurve. */
 sm_status sm_curve_shape(const sm_curve *curve, int32_t *degree, size_t *poles, int32_t *rational);
+/* The curve's net, as sm_curve_shape sizes it: its poles in Euclidean
+ * coordinates, their weights, all 1 for a non-rational one (weights may be
+ * NULL), and its whole knot vector, poles + degree + 1 knots. */
+sm_status sm_curve_net(const sm_curve *curve, sm_vec3 *poles, double *weights, double *knots);
 void sm_curve_free(sm_curve *curve);
 
 /* A NURBS surface from count_u * count_v poles, u-major (pole (i, j) at
@@ -1108,6 +1112,16 @@ sm_status sm_surface_loft(const sm_curve *const *sections, size_t count, int32_t
  * (SmBSplineSurface::CreateGordonSurface). */
 sm_status sm_surface_gordon(const sm_curve *const *u, size_t u_count, const sm_curve *const *v, size_t v_count,
                             sm_surface **out);
+/* A Gordon surface through non-rational u curves and v curves that already
+ * cross at the parameters given: u curve i at u = v_at[j] meets v curve j at
+ * v = u_at[i], each family on one parameter range, both rising; of degree
+ * degree_u across the v curves and degree_v across the u curves, each at
+ * most its family's count less one
+ * (SmBSplineSurface::CreateGordonSurfaceAt, which neither intersects nor
+ * reparameterises them). */
+sm_status sm_surface_gordon_at(const sm_curve *const *u, const double *u_at, size_t u_count, const sm_curve *const *v,
+                               const double *v_at, size_t v_count, int32_t degree_u, int32_t degree_v,
+                               sm_surface **out);
 /* A Coons patch on four boundary curves, in order round it, each running
  * on from the last's end; with derivatives (four cross-boundary derivative
  * curves, into the patch, compatible with their boundaries), a bicubic one
@@ -1151,6 +1165,10 @@ sm_status sm_brep_create_empty(sm_brep **out);
  * it's only C0 (SmBrep::CreateFacesFromSurface), each piece labelled with
  * label if it's not NULL; faces says how many it made. */
 sm_status sm_brep_add_surface(sm_brep *brep, const sm_surface *surface, const sm_label *label, size_t *faces);
+/* As sm_brep_add_surface, but split only where the surface turns a corner
+ * (C0), so one whose spans meet smoothly, C1 as a circle's quarters or a
+ * refitted curve's joins are, stays one face. */
+sm_status sm_brep_add_surface_at_corners(sm_brep *brep, const sm_surface *surface, const sm_label *label, size_t *faces);
 /* Adds a planar face bounded by a closed loop of curves
  * (SmBrep::CreatePlanarFacesWith3DCurves), labelled with label if it's not
  * NULL. */
