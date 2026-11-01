@@ -541,6 +541,25 @@ public:
       SmBSplineSurface               *& rpNewSurf         // out:            
     );
 
+    // A Gordon surface through u curves and v curves that already cross at
+    // the parameters given: u curve i at u = crVCurvesAt[j] meets v curve j
+    // at v = crUCurvesAt[i], each crossing taken as the middle of the two
+    // points. Unlike CreateGordonSurface it neither intersects the curves
+    // nor reparameterises them, so curves made compatible elsewhere keep
+    // their parameterisation, and the surface its continuity across them.
+    // The curves are non-rational and each family on one parameter range.
+    static SmStatus CreateGordonSurfaceAt
+    (
+      const SmContext                 & crContext,        // in :
+      const SmTArray<SmBSplineCurve*> & crUCurves,        // in : curves along u, in rising v
+      const SmTArray<double>          & crUCurvesAt,      // in : the v of each u curve, rising
+      const SmTArray<SmBSplineCurve*> & crVCurves,        // in : curves along v, in rising u
+      const SmTArray<double>          & crVCurvesAt,      // in : the u of each v curve, rising
+      ULONG                             lDegreeU,         // in : degree across the v curves, at most their count less 1
+      ULONG                             lDegreeV,         // in : degree across the u curves, at most their count less 1
+      SmBSplineSurface               *& rpNewSurf         // out:
+    );
+
   virtual SmStatus CreateIsoParametricCurve
   (
     const SmContext  & crContext,               // in : context for created objects                                                                  

@@ -25,6 +25,8 @@
 #include <atomic>
 #endif
 
+#include <vector>
+
 #ifdef SM_DEBUG_CODE
  #include <SmEdge.h>
  #include <SmFace.h>
@@ -2808,6 +2810,87 @@ SmBoolean bDebugMe3 = FALSE;
   return SM_SUCCESS;
 
 } // end SmBSplineSurface::CreateGordonSurface
+
+/*******************************************************************//**
+PURPOSE: This routine creates a Gordon surface through u curves and v
+    curves that already cross at the parameters given.
+NOTES:
+    CreateGordonSurface finds where its curves cross and reparameterises
+    them piecewise linearly to match, which leaves full-multiplicity knots
+    and a crease along every crossing curve. A caller that makes its curves
+    cross at matching parameters itself (fitting them smoothly) passes them
+    here: they're copied into NLib, made compatible within each family
+    (knot insertion, exact) and handed to N_CreateGordonSrf with their
+    parameters as they are.
+***********************************************************************/
+SmStatus SmBSplineSurface::CreateGordonSurfaceAt
+  (const SmContext                 & crContext,   // in
+   const SmTArray<SmBSplineCurve*> & crUCurves,   // in
+   const SmTArray<double>          & crUCurvesAt, // in
+   const SmTArray<SmBSplineCurve*> & crVCurves,   // in
+   const SmTArray<double>          & crVCurvesAt, // in
+   ULONG                             lDegreeU,    // in
+   ULONG                             lDegreeV,    // in
+   SmBSplineSurface               *& rpNewSurf)   // out
+{
+  ULONG lUCount = crUCurves.GetSize();
+  ULONG lVCount = crVCurves.GetSize();
+#define MAX_CURVES 640
+  if ( lUCount < 2 || lVCount < 2 || lUCount > MAX_CURVES || lVCount > MAX_CURVES
+    || crUCurvesAt.GetSize() != lUCount || crVCurvesAt.GetSize() != lVCount
+    || lDegreeU < 1 || lDegreeU >= lVCount || lDegreeV < 1 || lDegreeV >= lUCount )
+    { SER( SM_ERR_INVALID_INPUT ); }
+
+  NL_STACKS nlStacks;
+  SmNLibStackHandler sSH(&nlStacks);
+
+  NL_CURVE *nlCurU[ MAX_CURVES ];
+  NL_CURVE *nlCurV[ MAX_CURVES ];
+#undef  MAX_CURVES
+
+  ULONG ii;
+  for ( ii = 0; ii < lUCount; ii++ )
+  {
+    if ( crUCurves[ii] == NULL || crUCurves[ii]->IsRational() )
+      { SER( SM_ERR_INVALID_INPUT ); }
+    if ( ii > 0 && crUCurvesAt[ii] <= crUCurvesAt[ii-1] )
+      { SER( SM_ERR_INVALID_INPUT ); }
+    crUCurves[ii]->GetOrCreateGwNurbPointer();
+    nlCurU[ii] = sm_CreateNlibCurve( crUCurves[ii], nlStacks );
+    if ( nlCurU[ii] == NULL )
+      { SER( SM_ERR ); }
+  }
+  for ( ii = 0; ii < lVCount; ii++ )
+  {
+    if ( crVCurves[ii] == NULL || crVCurves[ii]->IsRational() )
+      { SER( SM_ERR_INVALID_INPUT ); }
+    if ( ii > 0 && crVCurvesAt[ii] <= crVCurvesAt[ii-1] )
+      { SER( SM_ERR_INVALID_INPUT ); }
+    crVCurves[ii]->GetOrCreateGwNurbPointer();
+    nlCurV[ii] = sm_CreateNlibCurve( crVCurves[ii], nlStacks );
+    if ( nlCurV[ii] == NULL )
+      { SER( SM_ERR ); }
+  }
+
+  NL_SER( N_CrvsMakeCompatible( nlCurU, lUCount-1, &nlStacks ));
+  NL_SER( N_CrvsMakeCompatible( nlCurV, lVCount-1, &nlStacks ));
+
+  std::vector<NL_PARAMETER> uAt( lVCount ), vAt( lUCount );
+  for ( ii = 0; ii < lVCount; ii++ ) { uAt[ii] = crVCurvesAt[ii]; }
+  for ( ii = 0; ii < lUCount; ii++ ) { vAt[ii] = crUCurvesAt[ii]; }
+
+  NL_SURFACE sur;
+  N_SrfInitArrays(&sur);
+
+  NL_DEGREE udeg = (NL_DEGREE)lDegreeU, vdeg = (NL_DEGREE)lDegreeV;
+  NL_SER( N_CreateGordonSrf( nlCurU, vAt.data(), lUCount-1,
+                             nlCurV, uAt.data(), lVCount-1,
+                             udeg, vdeg, udeg, vdeg, NL_YES, &sur, &nlStacks, &nlStacks ));
+
+  rpNewSurf = new (crContext) SmBSplineSurface((gw_SURFACE *)&sur) ;
+  return SM_SUCCESS;
+
+} // end SmBSplineSurface::CreateGordonSurfaceAt
 
 /*******************************************************************//**
 PURPOSE: This routine creates a surface from a boundary given as
